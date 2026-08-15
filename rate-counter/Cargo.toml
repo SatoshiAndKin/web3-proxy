@@ -5,4 +5,4 @@ authors = ["Bryan Stitt <bryan@llamanodes.com>"]
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.34.0", features = ["time"] }
+tokio = { version = "1.53.1", features = ["time"] }
