@@ -2,11 +2,11 @@
 
 Web3_proxy is a fast load-balancing proxy for web3 (Ethereum or similar) JSON-RPC servers.
 
-**Under construction!** Please note that the code is currently under active development. If you wish to run the proxy yourself, please send us a message on Discord, and we can explain things that aren't documented yet. Most RPC methods are currently supported, though filters will be added soon. Additionally, more tests are always needed.
+**Under construction!** Please note that the code is currently under active development. If you wish to run the proxy yourself, please send me a public cast on [Farcaster](https://farcaster.xyz/flashprofits.eth) (not a DM, I barely check those).
 
-Signed transactions `(eth_sendRawTransaction)` are sent in parallel to the configured private RPCs (NeoC, Eden, BloxRoute, Flashbots, etc.).
+Signed transactions `(eth_sendRawTransaction)` are sent in parallel to the configured private RPCs (Flashbots, etc.).
 
-All other requests are sent to an RPC server that is currently on the latest block (LlamaNodes, Alchemy, Moralis, Rivet, your node, or one of many other providers). If multiple servers are in sync, we prioritize servers based on their `active_requests` and request latency. Please keep in mind that this means that the fastest server is most likely to serve requests, while slower servers are unlikely to ever receive any requests.
+All other requests are sent to an RPC server that is currently on the latest block (Alchemy, your own node, or one of many other providers). If multiple servers are in sync, we prioritize servers based on their `active_requests` and request latency. Please keep in mind that this means that the fastest server is most likely to serve requests, while slower servers are unlikely to ever receive any requests.
 
 Each server has different limits that can be configured. The `soft_limit` is the number of parallel active requests where a server starts to slow down, while the `hard_limit` is where a server starts giving rate limits or other errors.
 

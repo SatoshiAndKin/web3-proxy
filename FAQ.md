@@ -2,7 +2,7 @@
 
 ## Q) My wallet sits on "sending transaction" a lot longer than on other services.
 
-We send your transactions to multiple private relays to get them mined without exposing them to sandwich attacks.
+We send your transactions to multiple private relays to get them mined without exposing them to sandwich attacks. But private relays can take longer to mine transactions.
 
 We have plans to return after the first successful response, but that won't get your transaction confirmed any faster.
 
