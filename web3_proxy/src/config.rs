@@ -63,13 +63,6 @@ pub struct AppConfig {
     /// percentage to increase eth_estimateGas results. 100 == 100%
     pub gas_increase_percent: Option<U256>,
 
-    /// Optional kafka brokers
-    /// Used for optional Kafka request logging.
-    pub kafka_urls: Option<String>,
-
-    #[serde_inline_default("ssl".to_string())]
-    pub kafka_protocol: String,
-
     /// do not serve any requests if the best known block is behind the best known block by more than this many blocks.
     pub max_head_block_lag: Option<U64>,
 

@@ -70,9 +70,6 @@ pub struct App {
     pub frontend_port: Arc<AtomicU16>,
     /// Concurrent request limits for public IP addresses.
     pub ip_semaphores: Cache<IpAddr, Arc<Semaphore>>,
-    /// Optional producer for detailed Kafka request logging.
-    #[cfg(feature = "rdkafka")]
-    pub kafka_producer: Option<rdkafka::producer::FutureProducer>,
     /// Send private requests (like eth_sendRawTransaction) to all these servers
     pub protected_rpcs: Arc<Web3Rpcs>,
     pub prometheus_port: Arc<AtomicU16>,
@@ -129,31 +126,6 @@ impl App {
         // TODO: is FuturesUnordered what we need? I want to return when the first one returns
         let important_background_handles: FuturesUnordered<Web3ProxyJoinHandle<()>> =
             FuturesUnordered::new();
-
-        // Connect to Kafka when detailed request logging is configured.
-
-        #[cfg(feature = "rdkafka")]
-        let mut kafka_producer: Option<rdkafka::producer::FutureProducer> = None;
-
-        #[cfg(feature = "rdkafka")]
-        if let Some(kafka_brokers) = top_config.app.kafka_urls.clone() {
-            info!("Connecting to kafka");
-
-            let security_protocol = &top_config.app.kafka_protocol;
-
-            match rdkafka::ClientConfig::new()
-                .set("bootstrap.servers", kafka_brokers)
-                .set("message.timeout.ms", "5000")
-                .set("security.protocol", security_protocol)
-                .create()
-            {
-                Ok(k) => {
-                    // TODO: create our topic
-                    kafka_producer = Some(k)
-                }
-                Err(err) => error!("Failed connecting to kafka. This will not retry. {:?}", err),
-            }
-        }
 
         // make a http shared client
         // TODO: can we configure the connection pool? should we?
@@ -243,8 +215,6 @@ impl App {
             http_client,
             internal_provider: Default::default(),
             ip_semaphores,
-            #[cfg(feature = "rdkafka")]
-            kafka_producer,
             pending_txid_firehose: deduped_txid_firehose,
             protected_rpcs: private_rpcs,
             prometheus_port: prometheus_port.clone(),

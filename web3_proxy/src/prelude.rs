@@ -23,6 +23,3 @@ pub use tokio;
 pub use toml;
 pub use tracing;
 pub use url;
-
-#[cfg(feature = "rdkafka")]
-pub use rdkafka;

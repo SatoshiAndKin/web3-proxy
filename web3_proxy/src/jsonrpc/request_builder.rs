@@ -25,12 +25,6 @@ use std::{
 };
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
-#[cfg(feature = "rdkafka")]
-use {
-    crate::{jsonrpc, kafka::KafkaDebugLogger},
-    tracing::warn,
-};
-
 #[derive(Derivative)]
 #[derivative(Default)]
 pub struct RequestBuilder {
@@ -208,14 +202,6 @@ pub struct ValidatedRequest {
     #[derivative(Default(value = "Instant::now()"))]
     pub start_instant: Instant,
 
-    #[cfg(feature = "rdkafka")]
-    /// ProxyMode::Debug logs requests and responses with Kafka
-    /// TODO: maybe this shouldn't be determined by ProxyMode. A request param should probably enable this
-    pub kafka_debug_logger: Option<Arc<KafkaDebugLogger>>,
-
-    #[cfg(not(feature = "rdkafka"))]
-    pub kafka_debug_logger: Option<()>,
-
     /// How long to spend waiting for an rpc that can serve this request
     pub connect_timeout: Duration,
     /// How long to spend waiting for an rpc to respond to this request
@@ -284,7 +270,6 @@ impl ValidatedRequest {
         authorization: Arc<Authorization>,
         chain_id: u64,
         head_block: Option<BlockHeader>,
-        #[cfg(feature = "rdkafka")] kafka_debug_logger: Option<Arc<KafkaDebugLogger>>,
         max_wait: Option<Duration>,
         permit: Option<OwnedSemaphorePermit>,
         mut request: RequestOrMethod,
@@ -292,17 +277,6 @@ impl ValidatedRequest {
     ) -> Web3ProxyResult<Arc<Self>> {
         let start_instant = Instant::now();
 
-        // Log the original parameters before block normalization changes them.
-        #[cfg(feature = "rdkafka")]
-        if let Some(ref kafka_debug_logger) = kafka_debug_logger {
-            // TODO: channels might be more ergonomic than spawned futures
-            // spawned things run in parallel easier but generally need more Arcs
-            kafka_debug_logger.log_debug_request(&request);
-        }
-        #[cfg(not(feature = "rdkafka"))]
-        let kafka_debug_logger = None;
-
-        // Normalize block parameters after Kafka logs the original request.
         let request_blocks = if head_block.is_none() {
             RequestBlocks::None
         } else {
@@ -330,7 +304,6 @@ impl ValidatedRequest {
             connect_timeout,
             expire_timeout,
             head_block: head_block.clone(),
-            kafka_debug_logger,
             inner: request,
             permit,
             start_instant,
@@ -350,19 +323,6 @@ impl ValidatedRequest {
         head_block: Option<BlockHeader>,
         request_id: Option<String>,
     ) -> Web3ProxyResult<Arc<Self>> {
-        #[cfg(feature = "rdkafka")]
-        let kafka_debug_logger = if matches!(authorization.checks.proxy_mode, ProxyMode::Debug) {
-            KafkaDebugLogger::try_new(
-                app,
-                authorization.clone(),
-                head_block.as_ref().map(|x| x.number()),
-                "web3_proxy:rpc",
-                request_id.as_deref(),
-            )
-        } else {
-            None
-        };
-
         let chain_id = app.config.chain_id;
 
         Self::new_with_options(
@@ -370,8 +330,6 @@ impl ValidatedRequest {
             authorization,
             chain_id,
             head_block,
-            #[cfg(feature = "rdkafka")]
-            kafka_debug_logger,
             max_wait,
             permit,
             request,
@@ -411,8 +369,6 @@ impl ValidatedRequest {
                 authorization,
                 0,
                 head_block,
-                #[cfg(feature = "rdkafka")]
-                None,
                 max_wait,
                 None,
                 request.into(),
@@ -517,20 +473,6 @@ impl ValidatedRequest {
             response_lock.response_millis = response_millis;
 
             response_lock.response_timestamp = now;
-        }
-
-        #[cfg(feature = "rdkafka")]
-        if let Some(kafka_debug_logger) = self.kafka_debug_logger.as_ref() {
-            if let ResponseOrBytes::Response(response) = response {
-                match response {
-                    jsonrpc::SingleResponse::Parsed(response) => {
-                        kafka_debug_logger.log_debug_response(response);
-                    }
-                    jsonrpc::SingleResponse::Stream(_) => {
-                        warn!("need to handle streaming response debug logging");
-                    }
-                }
-            }
         }
     }
 

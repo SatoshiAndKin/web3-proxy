@@ -12,10 +12,8 @@ Each server has different limits that can be configured. The `soft_limit` is the
 
 ## Quick development
 
-1. `brew install librdkafka` or `sudo apt-get install librdkafka-dev`
-2. Run `docker-compose up -d` to start the optional Kafka service. See `docker-compose.yml` for details.
-3. Copy `./config/example.toml` to `./config/development.toml` and change settings to match your setup.
-4. Run `cargo` commands:
+1. Copy `./config/example.toml` to `./config/development.toml` and change settings to match your setup.
+2. Run `cargo` commands:
 
 ```
 $ cargo run --release -- --help

@@ -539,7 +539,7 @@ impl Web3Rpcs {
         let proxy_mode = web3_request.proxy_mode();
 
         match proxy_mode {
-            ProxyMode::Debug | ProxyMode::Best => self.request_with_metadata(web3_request).await,
+            ProxyMode::Best => self.request_with_metadata(web3_request).await,
             ProxyMode::Fastest(_x) => todo!("Fastest"),
             ProxyMode::Quorum(_x, _y) => todo!("Quorum"),
             ProxyMode::Versus => todo!("Versus"),

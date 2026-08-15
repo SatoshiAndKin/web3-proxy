@@ -331,7 +331,6 @@ These are not yet ordered. There might be duplicates. We might not actually need
     - will probably want a tool for calculating a safe value for this. too low and we could kill our performance
 - [ ] rename "concurrent" requests to "parallel" requests
 - [ ] setting request limits to None is broken. it does maxu64 and then internal deferred rate limiter counts try to *99/100
-- [ ] if kafka fails to connect at the start, automatically reconnect
 - [ ] during shutdown, mark the proxy unhealthy and send unsubscribe responses for any open websocket subscriptions
 - [ ] setting request limits to None is broken. it does maxu64 and then internal deferred rate limiter counts overflows when it does to `x*99/100`
 - [ ] during shutdown, send unsubscribe responses for any open websocket subscriptions

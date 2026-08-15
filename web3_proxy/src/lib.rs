@@ -13,6 +13,3 @@ pub mod prelude;
 pub mod prometheus;
 pub mod rpcs;
 pub mod test_utils;
-
-#[cfg(feature = "rdkafka")]
-pub mod kafka;

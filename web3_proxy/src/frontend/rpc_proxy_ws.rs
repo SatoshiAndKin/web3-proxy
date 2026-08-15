@@ -41,9 +41,6 @@ pub enum ProxyMode {
     Quorum(usize, usize),
     /// send to all servers for benchmarking. return the fastest non-error response
     Versus,
-    /// send all requests and responses to kafka
-    /// TODO: should this be seperate from best/fastest/versus?
-    Debug,
 }
 
 /// Public entrypoint for WebSocket JSON-RPC requests.
