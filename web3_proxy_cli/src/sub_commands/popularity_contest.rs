@@ -1,6 +1,5 @@
 use prettytable::{row, Table};
-use std::{cmp::Reverse, str::FromStr};
-use web3_proxy::prelude::alloy::primitives::U64;
+use std::cmp::Reverse;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::ordered_float::OrderedFloat;
@@ -31,6 +30,14 @@ struct BackendRpcData<'a> {
     peak_latency_ms: f64,
     tier: u64,
     weighted_latency_ms: f64,
+}
+
+fn head_block_number(conn: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    conn.get("head_block")
+        .and_then(|x| x.get("block"))
+        .and_then(|x| x.get("number"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or_default()
 }
 
 impl PopularityContestSubCommand {
@@ -89,13 +96,7 @@ impl PopularityContestSubCommand {
                 .and_then(|x| x.as_u64())
                 .unwrap_or_default();
 
-            let head_block = conn
-                .get("head_block")
-                .and_then(|x| x.get("block"))
-                .and_then(|x| x.get("number"))
-                .and_then(|x| U64::from_str(x.as_str().unwrap()).ok())
-                .map(|x| x.to::<u64>())
-                .unwrap_or_default();
+            let head_block = head_block_number(conn);
 
             highest_block = highest_block.max(head_block);
 
@@ -204,5 +205,20 @@ impl PopularityContestSubCommand {
         table.printstd();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::head_block_number;
+    use web3_proxy::prelude::serde_json::json;
+
+    #[test]
+    fn head_block_number_requires_a_u64_status_field() {
+        let numeric = json!({"head_block": {"block": {"number": 18_173_997}}});
+        let legacy_quantity = json!({"head_block": {"block": {"number": "0x1154fad"}}});
+
+        assert_eq!(head_block_number(numeric.as_object().unwrap()), 18_173_997);
+        assert_eq!(head_block_number(legacy_quantity.as_object().unwrap()), 0);
     }
 }
