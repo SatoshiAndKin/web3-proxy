@@ -6464,7 +6464,6 @@ dependencies = [
  "itertools 0.15.0",
  "latency",
  "listenfd",
- "mimalloc",
  "moka",
  "nanorand",
  "num",
@@ -6500,6 +6499,7 @@ version = "1.43.100"
 dependencies = [
  "console-subscriber",
  "env_logger",
+ "mimalloc",
  "parking_lot",
  "prettytable",
  "serde",
