@@ -266,7 +266,7 @@ impl Web3ProxyError {
                 )
             }
             Self::BadResponse(err) => {
-                // TODO: think about this one more. ankr gives us this because ethers fails to parse responses without an id
+                // TODO: think about this one more. Some upstreams send responses without an id.
                 debug!(?err, "BAD_RESPONSE: {}", err);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

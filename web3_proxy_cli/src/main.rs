@@ -94,9 +94,8 @@ fn main() -> anyhow::Result<()> {
             Ok(true) => {
                 vec![
                     "info",
-                    "ethers=debug",
-                    "ethers_providers::rpc=off",
-                    "ethers_providers=debug",
+                    "alloy_provider=debug",
+                    "alloy_transport=debug",
                     "web3_proxy::rpcs::blockchain=info",
                     "web3_proxy::rpcs::request=debug",
                     "web3_proxy=trace",
@@ -106,9 +105,8 @@ fn main() -> anyhow::Result<()> {
             _ => {
                 vec![
                     "info",
-                    "ethers=debug",
-                    "ethers_providers::rpc=off",
-                    "ethers_providers=error",
+                    "alloy_provider=error",
+                    "alloy_transport=error",
                     "web3_proxy::rpcs::consensus=info",
                     "web3_proxy=debug",
                     "web3_proxy_cli=debug",

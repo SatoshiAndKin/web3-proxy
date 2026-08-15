@@ -1,8 +1,9 @@
-/// subscribe to a websocket rpc
-use std::time::Duration;
+//! Subscribe to blocks from a WebSocket RPC endpoint.
+
+use web3_proxy::prelude::alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use web3_proxy::prelude::anyhow;
-use web3_proxy::prelude::ethers::prelude::*;
 use web3_proxy::prelude::fdlimit;
+use web3_proxy::prelude::futures::StreamExt;
 use web3_proxy::prelude::tokio;
 
 #[tokio::main]
@@ -17,17 +18,16 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Subscribing to blocks from {}", url);
 
-    let provider = Ws::connect(url).await?;
+    let provider: RootProvider = ProviderBuilder::default()
+        .connect_ws(WsConnect::new(url))
+        .await?;
 
-    let provider = Provider::new(provider).interval(Duration::from_secs(1));
-
-    let mut stream = provider.subscribe_blocks().await?;
-    while let Some(block) = stream.next().await {
+    let subscription = provider.subscribe_blocks().await?;
+    let mut stream = subscription.into_stream();
+    while let Some(header) = stream.next().await {
         println!(
             "{:?} = Ts: {:?}, block number: {}",
-            block.hash.unwrap(),
-            block.timestamp,
-            block.number.unwrap(),
+            header.hash, header.timestamp, header.number,
         );
     }
 

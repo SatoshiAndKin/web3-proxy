@@ -1,10 +1,11 @@
 use super::{SentrydErrorBuilder, SentrydResult};
 use tracing::{debug, warn};
 use web3_proxy::jsonrpc::JsonRpcErrorData;
+use web3_proxy::prelude::alloy_primitives::B256;
+use web3_proxy::prelude::alloy_rpc_types_eth::Block;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::anyhow::{anyhow, Context};
 use web3_proxy::prelude::chrono::{DateTime, Utc};
-use web3_proxy::prelude::ethers::types::{Block, TxHash, H256};
 use web3_proxy::prelude::futures::{stream::FuturesUnordered, StreamExt};
 use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::serde::{Deserialize, Serialize};
@@ -25,15 +26,15 @@ struct JsonRpcResponse<V> {
 struct AbbreviatedBlock {
     pub num: u64,
     pub time: DateTime<Utc>,
-    pub hash: H256,
+    pub hash: B256,
 }
 
-impl From<Block<TxHash>> for AbbreviatedBlock {
-    fn from(x: Block<TxHash>) -> Self {
+impl From<Block> for AbbreviatedBlock {
+    fn from(x: Block) -> Self {
         Self {
-            num: x.number.unwrap().as_u64(),
-            hash: x.hash.unwrap(),
-            time: x.time().unwrap(),
+            num: x.number(),
+            hash: x.header.hash,
+            time: DateTime::from_timestamp(x.header.timestamp as i64, 0).unwrap(),
         }
     }
 }
@@ -75,7 +76,7 @@ pub async fn main(
         .context(format!("failed parsing body from {}", rpc))
         .map_err(|x| error_builder.build(x))?;
 
-    let a: JsonRpcResponse<Block<TxHash>> = serde_json::from_str(&body)
+    let a: JsonRpcResponse<Block> = serde_json::from_str(&body)
         .context(format!("body: {}", body))
         .context(format!("failed parsing json from {}", rpc))
         .map_err(|x| error_builder.build(x))?;
@@ -93,7 +94,7 @@ pub async fn main(
     };
 
     // check the parent because b and c might not be as fast as a
-    let parent_hash = a.parent_hash;
+    let parent_hash = a.header.parent_hash;
 
     let rpc_block = check_rpc(parent_hash, client.clone(), rpc.to_string())
         .await
@@ -201,7 +202,7 @@ pub async fn main(
 
 // i don't think we need a whole provider. a simple http request is easiest
 async fn check_rpc(
-    block_hash: H256,
+    block_hash: B256,
     client: reqwest::Client,
     rpc: String,
 ) -> anyhow::Result<AbbreviatedBlock> {
@@ -231,7 +232,7 @@ async fn check_rpc(
         .await
         .context(format!("failed parsing body from {}", rpc))?;
 
-    let response_json: JsonRpcResponse<Block<TxHash>> = serde_json::from_str(&body)
+    let response_json: JsonRpcResponse<Block> = serde_json::from_str(&body)
         .context(format!("body: {}", body))
         .context(format!("failed parsing json from {}", rpc))?;
 

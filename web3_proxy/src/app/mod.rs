@@ -402,7 +402,6 @@ impl App {
         requests: Vec<SingleRequest>,
         request_id: Option<String>,
     ) -> Web3ProxyResult<(Vec<jsonrpc::ParsedResponse>, Vec<Arc<Web3Rpc>>)> {
-        // TODO: we should probably change ethers-rs to support this directly. they pushed this off to v2 though
         let num_requests = requests.len();
 
         if num_requests == 0 {
@@ -677,7 +676,7 @@ impl App {
                 let mut response_lock = web3_request.response.lock();
 
                 // TODO: i really don't like this logic here. it should be inside add_error_response
-                // TODO: what if this is an ethers wrapped error? those should have already been handled, but our error types are too broad
+                // TODO: provider errors should have already been handled, but our error types are too broad
                 response_lock.error_response = true;
                 response_lock.user_error_response = false;
 

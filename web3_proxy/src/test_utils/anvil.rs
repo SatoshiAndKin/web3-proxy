@@ -2,10 +2,8 @@
 // TODO: option to subscribe to another anvil and copy blocks
 
 use crate::rpcs::provider::{connect_http, AlloyHttpProvider};
-use ethers::{
-    signers::LocalWallet,
-    utils::{Anvil, AnvilInstance},
-};
+use alloy_node_bindings::{Anvil, AnvilInstance};
+use alloy_signer_local::PrivateKeySigner;
 use tracing::info;
 
 /// on drop, the anvil instance will be shut down
@@ -43,7 +41,7 @@ impl TestAnvil {
         Self::new(None, Some(fork_rpc)).await
     }
 
-    pub fn wallet(&self, id: usize) -> LocalWallet {
+    pub fn wallet(&self, id: usize) -> PrivateKeySigner {
         self.instance.keys()[id].clone().into()
     }
 }

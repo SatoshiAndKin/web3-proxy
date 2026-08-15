@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::{thread, time::Duration};
 use web3_proxy::config::{AppConfig, TopConfig, Web3RpcConfig};
 use web3_proxy::prelude::anyhow;
-use web3_proxy::prelude::ethers::providers::{Http, Provider};
 use web3_proxy::prelude::hashbrown::HashMap;
 use web3_proxy::prelude::serde_json::json;
 use web3_proxy::prelude::tokio::{
@@ -12,11 +11,14 @@ use web3_proxy::prelude::tokio::{
     sync::broadcast::{self, error::SendError},
     time::{sleep, Instant},
 };
+use web3_proxy::prelude::url::Url;
+use web3_proxy::rpcs::provider::{connect_http, AlloyHttpProvider};
 use web3_proxy::test_utils::TestAnvil;
 
 pub struct TestApp {
     pub proxy_handle: Option<thread::JoinHandle<anyhow::Result<()>>>,
-    pub proxy_provider: Provider<Http>,
+    pub proxy_provider: AlloyHttpProvider,
+    pub proxy_url: Url,
     shutdown_sender: broadcast::Sender<()>,
 }
 
@@ -83,12 +85,15 @@ impl TestApp {
             sleep(Duration::from_millis(10)).await;
         }
 
-        let endpoint = format!("http://127.0.0.1:{}", frontend_port.load(Ordering::SeqCst));
-        let proxy_provider = Provider::<Http>::try_from(endpoint).unwrap();
+        let proxy_url: Url = format!("http://127.0.0.1:{}", frontend_port.load(Ordering::SeqCst))
+            .parse()
+            .unwrap();
+        let proxy_provider = connect_http(proxy_url.clone()).unwrap();
 
         Self {
             proxy_handle: Some(proxy_handle),
             proxy_provider,
+            proxy_url,
             shutdown_sender,
         }
     }

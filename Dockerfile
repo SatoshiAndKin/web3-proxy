@@ -215,7 +215,7 @@ CMD [ "--config", "/web3-proxy.toml", "proxyd" ]
 ENV PATH "/root/.cargo/bin:${PATH}"
 
 # TODO: lower log level when done with prototyping
-ENV RUST_LOG "warn,ethers_providers::rpc=off,web3_proxy=debug,web3_proxy::rpcs::consensus=info,web3_proxy_cli=debug"
+ENV RUST_LOG "warn,alloy_transport=error,web3_proxy=debug,web3_proxy::rpcs::consensus=info,web3_proxy_cli=debug"
 
 # we copy something from build_tests just so that docker actually builds it
 COPY --link --from=rust_flamegraph /root/.cargo/bin/* /root/.cargo/bin/

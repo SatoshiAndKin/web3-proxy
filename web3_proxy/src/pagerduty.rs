@@ -9,7 +9,7 @@ use std::{
     panic::PanicHookInfo,
 };
 use time::OffsetDateTime;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 /*
 
@@ -75,12 +75,6 @@ pub fn panic_handler(
 
     // TODO: try to send to sentry and then put the sentry link into the page
     let details = format!("{:#?}\n{:#?}", panic_info, backtrace);
-
-    if summary.starts_with("panicked at 'WS Server panic") {
-        // the ethers-rs library panics when websockets disconnect. this isn't a panic we care about reporting
-        debug!("Underlying library {}", details);
-        return;
-    }
 
     let class = Some("panic".to_string());
 

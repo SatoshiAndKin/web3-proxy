@@ -34,7 +34,7 @@ These are roughly in order of completition
   - they stop processing new blocks. i'm guessing 2 blocks arrive at the same time, but i thought our locks would handle that
   - even after removing a bunch of the locks, the deadlock still happens. i can't reliably reproduce. i just let it run for awhile and it happens.
   - running gdb shows the thread at tokio tungstenite thread is spinning near 100% cpu and none of the rest of the program is proceeding
-  - fixed by https://github.com/gakonst/ethers-rs/pull/1287
+  - fixed by an upstream WebSocket transport patch
 - [x] when sending with private relays, brownie's tx.wait can think the transaction was dropped. smarter retry on eth_getTransactionByHash and eth_getTransactionReceipt (maybe only if we sent the transaction ourselves)
 - [x] if web3 proxy gets an http error back, retry another node
 - [x] endpoint for health checks. if no synced servers, give a 502 error
@@ -344,7 +344,7 @@ These are not yet ordered. There might be duplicates. We might not actually need
     - it should be the min of total_sum_soft_limit (from only non-lagged servers) and min_sum_soft_limit
     - otherwise it won't track anything and will just give errors.
     - but if web3 proxy has just started, we should give some time otherwise we will thundering herd the first server that responds
-- [ ] connection pool for websockets. use tokio-tungstenite directly. no need for ethers providers since serde_json is enough for us
+- [ ] connection pool for websockets. use tokio-tungstenite directly. serde_json is enough for our raw requests
     - this should also get us closer to being able to do our own streaming json parser where we can 
 - [ ] figure out if "could not get block from params" is a problem worth logging
     - maybe it was an ots request?
@@ -549,7 +549,7 @@ in another repo: event subscriber
 - [ ] use pin instead of arc for a bunch of things?
   - https://fasterthanli.me/articles/pin-and-suffering
 - [ ] calculate archive depth automatically based on block_data_limits 
-- `[2023-04-11T05:40:33Z ERROR ethers_providers::rpc::transports::ws::backend] Failed to deserialize message e=invalid type: null, expected u64 at line 1 column 26`
+- `[2023-04-11T05:40:33Z ERROR websocket backend] Failed to deserialize message e=invalid type: null, expected u64 at line 1 column 26`
   - "Post http://127.0.0.1:8544: net/http: request canceled (Client.Timeout exceeded while awaiting headers)"
   - probably need to have a max count on how long we wait for a response
 - [ ] do we need lto = true? is that the default on release?

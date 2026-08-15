@@ -8,7 +8,7 @@ services:
     # rust's tokio crate expects a SIGINT https://tokio.rs/tokio/topics/shutdown
     stop_signal: SIGINT
     environment:
-      RUST_LOG: "info,ethers_providers::rpc=off,web3_proxy=info"
+      RUST_LOG: "info,alloy_transport=error,web3_proxy=info"
     volumes:
       - /etc/ssl/certs/:/etc/ssl/certs/:ro
       - /usr/local/share/ca-certificates/:/usr/local/share/ca-certificates/:ro

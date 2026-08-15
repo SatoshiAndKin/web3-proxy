@@ -2,10 +2,11 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{info, warn};
+use web3_proxy::prelude::alloy_primitives::U64;
+use web3_proxy::prelude::alloy_rpc_types_eth::Block;
 use web3_proxy::prelude::anyhow::{self, Context};
 use web3_proxy::prelude::argh::{self, FromArgs};
-use web3_proxy::prelude::chrono::Utc;
-use web3_proxy::prelude::ethers::types::{Block, TxHash, U64};
+use web3_proxy::prelude::chrono::{DateTime, Utc};
 use web3_proxy::prelude::fdlimit;
 use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::reqwest::Client;
@@ -147,14 +148,14 @@ async fn get_chain_id(rpc: &str, client: &reqwest::Client) -> anyhow::Result<u64
         .await
         .context("failed parsing chain id")?
         .result
-        .as_u64();
+        .to::<u64>();
 
     Ok(check_result)
 }
 
 #[derive(Deserialize)]
 struct JsonRpcBlockResult {
-    result: Block<TxHash>,
+    result: Block,
 }
 
 async fn main_loop(
@@ -196,13 +197,13 @@ async fn main_loop(
         .context("parsing compare block")?
         .result;
 
-    let check_number = check_block.number.context("no check block number")?;
-    let compare_number = compare_block.number.context("no compare block number")?;
+    let check_number = check_block.number();
+    let compare_number = compare_block.number();
 
     if check_number < compare_number {
         let diff_number = compare_number - check_number;
 
-        let diff_time = compare_block.timestamp - check_block.timestamp;
+        let diff_time = compare_block.header.timestamp - check_block.header.timestamp;
 
         return Err(anyhow::anyhow!(
             "behind by {} blocks ({} < {}). behind by {} seconds",
@@ -215,7 +216,8 @@ async fn main_loop(
 
     // TODO: check more. like that the hashes are on the same chain
 
-    let check_time = check_block.time().context("parsing check time")?;
+    let check_time = DateTime::from_timestamp(check_block.header.timestamp as i64, 0)
+        .context("parsing check time")?;
 
     let now = Utc::now();
 
