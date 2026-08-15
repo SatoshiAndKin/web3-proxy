@@ -12,7 +12,6 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use axum_client_ip::RightmostXForwardedFor as ClientIp;
 use axum_macros::debug_handler;
@@ -21,7 +20,7 @@ use http::HeaderMap;
 use moka::future::Cache;
 use once_cell::sync::Lazy;
 use serde::{ser::SerializeStruct, Serialize};
-use serde_json::json;
+use sonic_rs::{json, Value};
 use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 
@@ -42,7 +41,7 @@ pub async fn debug_request(
 ) -> impl IntoResponse {
     let (_, _, status) = _status(app).await;
 
-    let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+    let status: Value = sonic_rs::from_slice(&status).unwrap();
 
     let headers: HashMap<_, _> = headers
         .into_iter()
@@ -69,7 +68,7 @@ pub async fn debug_request(
         "headers": headers,
     });
 
-    Json(x)
+    crate::jsonrpc::response::json_response(StatusCode::OK, &x)
 }
 
 /// Health check page for load balancers to use.

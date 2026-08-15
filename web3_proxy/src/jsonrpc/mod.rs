@@ -26,7 +26,7 @@ mod tests {
     #[test]
     fn deserialize_response() {
         let json = r#"{"jsonrpc":"2.0","id":null,"result":100}"#;
-        let obj: ParsedResponse = serde_json::from_str(json).unwrap();
+        let obj: ParsedResponse = sonic_rs::from_str(json).unwrap();
         assert!(matches!(obj.payload, ResponsePayload::Success { .. }));
     }
 
@@ -36,10 +36,10 @@ mod tests {
             jsonrpc: "2.0".into(),
             id: Default::default(),
             payload: ResponsePayload::Success {
-                result: serde_json::value::RawValue::from_string("100".to_string()).unwrap(),
+                result: sonic_rs::from_str::<sonic_rs::OwnedLazyValue>("100").unwrap(),
             },
         };
-        let json = serde_json::to_string(&obj).unwrap();
+        let json = sonic_rs::to_string(&obj).unwrap();
         assert_eq!(json, r#"{"jsonrpc":"2.0","id":null,"result":100}"#);
     }
 
@@ -48,14 +48,14 @@ mod tests {
         let input = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
 
         // test deserializing it directly to a single request object
-        let output: SingleRequest = serde_json::from_str(input).unwrap();
+        let output: SingleRequest = sonic_rs::from_str(input).unwrap();
 
-        assert_eq!(output.id.to_string(), "1");
+        assert_eq!(sonic_rs::to_string(&output.id).unwrap(), "1");
         assert_eq!(output.method, "eth_blockNumber");
         assert_eq!(output.params.to_string(), "[]");
 
         // test deserializing it into an enum
-        let output: JsonRpcRequestEnum = serde_json::from_str(input).unwrap();
+        let output: JsonRpcRequestEnum = sonic_rs::from_str(input).unwrap();
 
         assert!(matches!(output, JsonRpcRequestEnum::Single(_)));
     }
@@ -65,22 +65,22 @@ mod tests {
         let input = r#"[{"jsonrpc":"2.0","method":"eth_getCode","params":["0x5ba1e12693dc8f9c48aad8770482f4739beed696","0xe0e6a4"],"id":27},{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":["0x5ba1e12693dc8f9c48aad8770482f4739beed696","0xe0e6a4"],"id":28},{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x5ba1e12693dc8f9c48aad8770482f4739beed696","0xe0e6a4"],"id":29}]"#;
 
         // test deserializing it directly to a batch of request objects
-        let output: Vec<SingleRequest> = serde_json::from_str(input).unwrap();
+        let output: Vec<SingleRequest> = sonic_rs::from_str(input).unwrap();
 
         assert_eq!(output.len(), 3);
 
-        assert_eq!(output[0].id.to_string(), "27");
+        assert_eq!(sonic_rs::to_string(&output[0].id).unwrap(), "27");
         assert_eq!(output[0].method, "eth_getCode");
         assert_eq!(
             output[0].params.to_string(),
             r#"["0x5ba1e12693dc8f9c48aad8770482f4739beed696","0xe0e6a4"]"#
         );
 
-        assert_eq!(output[1].id.to_string(), "28");
-        assert_eq!(output[2].id.to_string(), "29");
+        assert_eq!(sonic_rs::to_string(&output[1].id).unwrap(), "28");
+        assert_eq!(sonic_rs::to_string(&output[2].id).unwrap(), "29");
 
         // test deserializing it into an enum
-        let output: JsonRpcRequestEnum = serde_json::from_str(input).unwrap();
+        let output: JsonRpcRequestEnum = sonic_rs::from_str(input).unwrap();
 
         assert!(matches!(output, JsonRpcRequestEnum::Batch(_)));
     }

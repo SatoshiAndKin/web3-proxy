@@ -24,7 +24,7 @@ use nanorand::Rng;
 use parking_lot::RwLock;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
-use serde_json::json;
+use sonic_rs::json;
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::fmt;

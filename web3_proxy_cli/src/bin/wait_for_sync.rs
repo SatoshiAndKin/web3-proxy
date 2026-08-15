@@ -9,9 +9,9 @@ use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::chrono::{DateTime, Utc};
 use web3_proxy::prelude::fdlimit;
 use web3_proxy::prelude::reqwest;
-use web3_proxy::prelude::reqwest::Client;
-use web3_proxy::prelude::serde::Deserialize;
-use web3_proxy::prelude::serde_json::json;
+use web3_proxy::prelude::reqwest::{header, Client};
+use web3_proxy::prelude::serde::{de::DeserializeOwned, Deserialize, Serialize};
+use web3_proxy::prelude::sonic_rs::{self, json};
 use web3_proxy::prelude::tokio;
 use web3_proxy::prelude::tokio::time::sleep;
 use web3_proxy::prelude::tokio::time::Duration;
@@ -128,6 +128,23 @@ struct JsonRpcChainIdResult {
     result: U64,
 }
 
+async fn post_json<T, V>(client: &Client, rpc: &str, request: &V) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+    V: Serialize + ?Sized,
+{
+    let body = sonic_rs::to_vec(request)?;
+    let response = client
+        .post(rpc)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?;
+    let body = response.bytes().await?;
+
+    Ok(sonic_rs::from_slice(&body)?)
+}
+
 async fn get_chain_id(rpc: &str, client: &reqwest::Client) -> anyhow::Result<u64> {
     // empty params aren't required by the spec, but some rpc providers require them
     let get_chain_id_request = json!({
@@ -138,17 +155,11 @@ async fn get_chain_id(rpc: &str, client: &reqwest::Client) -> anyhow::Result<u64
     });
 
     // TODO: loop until chain id is found?
-    let check_result = client
-        .post(rpc)
-        .json(&get_chain_id_request)
-        .send()
+    let check_result: JsonRpcChainIdResult = post_json(client, rpc, &get_chain_id_request)
         .await
-        .context("failed querying chain id")?
-        .json::<JsonRpcChainIdResult>()
-        .await
-        .context("failed parsing chain id")?
-        .result
-        .to::<u64>();
+        .context("failed querying chain id")?;
+
+    let check_result = check_result.result.to::<u64>();
 
     Ok(check_result)
 }
@@ -175,27 +186,16 @@ async fn main_loop(
         ],
     });
 
-    let check_block = client
-        .post(check_url)
-        .json(&get_block_number_request)
-        .send()
+    let check_block: JsonRpcBlockResult = post_json(client, check_url, &get_block_number_request)
         .await
-        .context("querying check block")?
-        .json::<JsonRpcBlockResult>()
-        .await
-        .context("parsing check block")?
-        .result;
+        .context("querying check block")?;
+    let check_block = check_block.result;
 
-    let compare_block = client
-        .post(compare_url)
-        .json(&get_block_number_request)
-        .send()
-        .await
-        .context("querying compare block")?
-        .json::<JsonRpcBlockResult>()
-        .await
-        .context("parsing compare block")?
-        .result;
+    let compare_block: JsonRpcBlockResult =
+        post_json(client, compare_url, &get_block_number_request)
+            .await
+            .context("querying compare block")?;
+    let compare_block = compare_block.result;
 
     let check_number = check_block.number();
     let compare_number = compare_block.number();

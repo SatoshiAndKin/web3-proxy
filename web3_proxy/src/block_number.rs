@@ -10,7 +10,7 @@ use alloy::rpc::types::BlockNumberOrTag;
 use anyhow::Context;
 use derive_more::From;
 use serde::Serialize;
-use serde_json::json;
+use sonic_rs::{json, JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value};
 use tracing::{error, trace, warn};
 
 pub fn block_number_to_u64(block_num: BlockNumberOrTag, latest_block: U64) -> (U64, bool) {
@@ -66,7 +66,7 @@ impl From<&BlockHeader> for BlockNumAndHash {
 /// modify params to always have a block hash and not "latest"
 /// TODO: it would be nice to replace "latest" with the hash, but not all methods support that
 pub async fn clean_block_number<'a>(
-    params: &'a mut serde_json::Value,
+    params: &'a mut Value,
     block_param_id: usize,
     head_block: &'a BlockHeader,
     app: Option<&'a App>,
@@ -96,9 +96,9 @@ pub async fn clean_block_number<'a>(
 
                 let (block, change) = if let Some(obj) = x.as_object_mut() {
                     // it might be a Map like `{"blockHash": String("0xa5626dc20d3a0a209b1de85521717a3e859698de8ce98bca1b16822b7501f74b")}`
-                    if let Some(block_hash) = obj.get("blockHash").cloned() {
+                    if let Some(block_hash) = obj.get(&"blockHash").cloned() {
                         let block_hash: B256 =
-                            serde_json::from_value(block_hash).context("decoding blockHash")?;
+                            sonic_rs::from_value(&block_hash).context("decoding blockHash")?;
 
                         if block_hash == *head_block.hash() {
                             (head_block.into(), false)
@@ -127,13 +127,11 @@ pub async fn clean_block_number<'a>(
                     // TODO: move this to a helper function?
                     let (block_num, changed) = if let Some(block_num) = x.as_u64() {
                         (U64::from(block_num), false)
-                    } else if let Ok(block_num) = serde_json::from_value::<U64>(x.to_owned()) {
+                    } else if let Ok(block_num) = sonic_rs::from_value::<U64>(x) {
                         (block_num, false)
-                    } else if let Ok(block_number) =
-                        serde_json::from_value::<BlockNumberOrTag>(x.to_owned())
-                    {
+                    } else if let Ok(block_number) = sonic_rs::from_value::<BlockNumberOrTag>(x) {
                         block_number_to_u64(block_number, head_block.number())
-                    } else if let Ok(block_hash) = serde_json::from_value::<B256>(x.clone()) {
+                    } else if let Ok(block_hash) = sonic_rs::from_value::<B256>(x) {
                         if block_hash == *head_block.hash() {
                             (head_block.number(), false)
                         } else if let Some(app) = app {
@@ -317,7 +315,7 @@ impl RequestBlocks {
 
         let head_block = head_block.expect("head_block was just checked above");
 
-        if matches!(params, serde_json::Value::Null) {
+        if params.is_null() {
             // Route a request without parameters against the current head.
             return Ok(Self::Point {
                 block_needed: head_block.into(),
@@ -363,13 +361,13 @@ impl RequestBlocks {
                         Web3ProxyError::BadRequest("invalid format. params not object".into())
                     })?;
 
-                if obj.contains_key("blockHash") {
+                if obj.contains_key(&"blockHash") {
                     Ok(Self::None)
                 } else {
-                    let from_block = if let Some(x) = obj.get_mut("fromBlock") {
+                    let from_block = if let Some(x) = obj.get_mut(&"fromBlock") {
                         // TODO: use .take instead of clone
                         // what if its a hash?
-                        let block_num: BlockNumberOrTag = serde_json::from_value(x.clone())?;
+                        let block_num: BlockNumberOrTag = sonic_rs::from_value(x)?;
 
                         let (block_num, _change) =
                             block_number_to_u64(block_num, head_block.number());
@@ -384,10 +382,10 @@ impl RequestBlocks {
                         BlockNumOrHash::Num(U64::ZERO)
                     };
 
-                    let to_block = if let Some(x) = obj.get_mut("toBlock") {
+                    let to_block = if let Some(x) = obj.get_mut(&"toBlock") {
                         // TODO: use .take instead of clone
                         // what if its a hash?
-                        let block_num: BlockNumberOrTag = serde_json::from_value(x.clone())?;
+                        let block_num: BlockNumberOrTag = sonic_rs::from_value(x)?;
 
                         // sometimes people request `from_block=head+1, to_block="latest"`. latest becomes head and then theres a problem
                         // TODO: delay here until the app has this block?
@@ -506,7 +504,7 @@ mod test {
     };
     use alloy::primitives::{B256, U64};
     use alloy::rpc::types::Block;
-    use serde_json::json;
+    use sonic_rs::{json, JsonValueTrait};
     use std::sync::Arc;
 
     fn block(number: u64) -> Block {

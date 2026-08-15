@@ -5,10 +5,12 @@ use super::request_id::RequestId;
 use super::rpc_proxy_ws::ProxyMode;
 use crate::errors::{RequestForError, Web3ProxyError};
 use crate::{app::App, jsonrpc::JsonRpcRequestEnum};
-use axum::extract::rejection::JsonRejection;
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::State;
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
+use axum::Extension;
 use axum_client_ip::RightmostXForwardedFor as ClientIp;
 use axum_macros::debug_handler;
 use itertools::Itertools;
@@ -21,8 +23,10 @@ pub async fn proxy_web3_rpc(
     State(app): State<Arc<App>>,
     ClientIp(ip): ClientIp,
     Extension(RequestId(request_id)): Extension<RequestId>,
-    payload: Result<Json<JsonRpcRequestEnum>, JsonRejection>,
+    headers: HeaderMap,
+    payload: Result<Bytes, BytesRejection>,
 ) -> Result<Response, Response> {
+    let payload = parse_payload(&headers, payload);
     proxy(app, &ip, payload, ProxyMode::Best, request_id).await
 }
 
@@ -31,8 +35,10 @@ pub async fn fastest_proxy_web3_rpc(
     State(app): State<Arc<App>>,
     ClientIp(ip): ClientIp,
     Extension(RequestId(request_id)): Extension<RequestId>,
-    payload: Result<Json<JsonRpcRequestEnum>, JsonRejection>,
+    headers: HeaderMap,
+    payload: Result<Bytes, BytesRejection>,
 ) -> Result<Response, Response> {
+    let payload = parse_payload(&headers, payload);
     proxy(app, &ip, payload, ProxyMode::Fastest(0), request_id).await
 }
 
@@ -41,23 +47,54 @@ pub async fn versus_proxy_web3_rpc(
     State(app): State<Arc<App>>,
     ClientIp(ip): ClientIp,
     Extension(RequestId(request_id)): Extension<RequestId>,
-    payload: Result<Json<JsonRpcRequestEnum>, JsonRejection>,
+    headers: HeaderMap,
+    payload: Result<Bytes, BytesRejection>,
 ) -> Result<Response, Response> {
+    let payload = parse_payload(&headers, payload);
     proxy(app, &ip, payload, ProxyMode::Versus, request_id).await
+}
+
+fn parse_payload(
+    headers: &HeaderMap,
+    payload: Result<Bytes, BytesRejection>,
+) -> Result<JsonRpcRequestEnum, Web3ProxyError> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    let valid_content_type = content_type.is_some_and(|value| {
+        value.split_once('/').is_some_and(|(kind, subtype)| {
+            kind.eq_ignore_ascii_case("application")
+                && (subtype.eq_ignore_ascii_case("json")
+                    || subtype
+                        .get(subtype.len().saturating_sub(5)..)
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json")))
+        })
+    });
+
+    if !valid_content_type {
+        return Err(Web3ProxyError::JsonRequestBody(
+            "expected an application/json content type".into(),
+        ));
+    }
+
+    let payload = payload.map_err(|error| {
+        Web3ProxyError::JsonRequestBody(format!("unable to read request body: {error}").into())
+    })?;
+
+    sonic_rs::from_slice(&payload).map_err(Web3ProxyError::JsonRequest)
 }
 
 async fn proxy(
     app: Arc<App>,
     ip: &IpAddr,
-    payload: Result<Json<JsonRpcRequestEnum>, JsonRejection>,
+    payload: Result<JsonRpcRequestEnum, Web3ProxyError>,
     proxy_mode: ProxyMode,
     request_id: String,
 ) -> Result<Response, Response> {
-    let payload = payload
-        .map_err(|error| {
-            Web3ProxyError::from(error).into_response_with_id(None, None::<RequestForError>)
-        })?
-        .0;
+    let payload =
+        payload.map_err(|error| error.into_response_with_id(None, None::<RequestForError>))?;
 
     let first_id = payload.first_id();
     let authorization = ip_is_authorized(&app, ip, proxy_mode)

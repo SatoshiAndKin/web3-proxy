@@ -8,7 +8,7 @@ use alloy::rpc::types::Block;
 use moka::future::Cache;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
-use serde_json::json;
+use sonic_rs::json;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::Duration;

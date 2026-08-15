@@ -16,7 +16,7 @@ use chrono::Utc;
 use derivative::Derivative;
 use parking_lot::Mutex;
 use serde::{ser::SerializeStruct, Serialize};
-use serde_json::{json, value::RawValue};
+use sonic_rs::{json, OwnedLazyValue};
 use std::time::Duration;
 use std::{borrow::Cow, sync::Arc};
 use std::{
@@ -221,7 +221,7 @@ impl Display for ValidatedRequest {
             f,
             "{}({})",
             self.inner.method(),
-            serde_json::to_string(self.inner.params()).expect("this should always serialize")
+            sonic_rs::to_string(self.inner.params()).expect("this should always serialize")
         )
     }
 }
@@ -386,7 +386,7 @@ impl ValidatedRequest {
     }
 
     #[inline]
-    pub fn id(&self) -> Box<RawValue> {
+    pub fn id(&self) -> OwnedLazyValue {
         self.inner.id()
     }
 

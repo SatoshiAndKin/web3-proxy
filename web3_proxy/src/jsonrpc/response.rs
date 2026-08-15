@@ -2,17 +2,25 @@ use super::JsonRpcErrorData;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::jsonrpc::ValidatedRequest;
 use axum::body::Body;
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
 use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
 use serde::{de, Deserialize, Serialize};
-use serde_json::value::{to_raw_value, RawValue};
+use sonic_rs::{JsonValueTrait, OwnedLazyValue, Value};
 use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+pub(crate) fn json_response<T>(status: StatusCode, value: &T) -> axum::response::Response
+where
+    T: Serialize,
+{
+    let body = sonic_rs::to_vec(value).expect("JSON response values must serialize");
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
 
 /// A JSON-RPC result or error without a request ID.
 #[derive(Clone, Debug)]
@@ -45,34 +53,36 @@ impl<T> ResponseData<Option<T>> {
     }
 }
 
-impl ResponseData<Arc<RawValue>> {
+impl ResponseData<Arc<OwnedLazyValue>> {
     pub fn is_null(&self) -> bool {
-        matches!(self, Self::Result { value, .. } if value.get() == "null")
+        matches!(self, Self::Result { value, .. } if value.is_null())
     }
 }
 
-impl From<serde_json::Value> for ResponseData<Arc<RawValue>> {
-    fn from(value: serde_json::Value) -> Self {
-        to_raw_value(&value)
+impl From<Value> for ResponseData<Arc<OwnedLazyValue>> {
+    fn from(value: Value) -> Self {
+        sonic_rs::to_lazyvalue(&value)
             .expect("JSON values must serialize")
             .into()
     }
 }
 
-impl From<Arc<RawValue>> for ResponseData<Arc<RawValue>> {
-    fn from(value: Arc<RawValue>) -> Self {
-        let num_bytes = value.get().len() as u64;
+impl From<Arc<OwnedLazyValue>> for ResponseData<Arc<OwnedLazyValue>> {
+    fn from(value: Arc<OwnedLazyValue>) -> Self {
+        let num_bytes = sonic_rs::to_string(&value)
+            .expect("JSON values must serialize")
+            .len() as u64;
         Self::Result { value, num_bytes }
     }
 }
 
-impl From<Box<RawValue>> for ResponseData<Arc<RawValue>> {
-    fn from(value: Box<RawValue>) -> Self {
-        Arc::<RawValue>::from(value).into()
+impl From<OwnedLazyValue> for ResponseData<Arc<OwnedLazyValue>> {
+    fn from(value: OwnedLazyValue) -> Self {
+        Arc::new(value).into()
     }
 }
 
-impl TryFrom<Web3ProxyResult<SingleResponse>> for ResponseData<Arc<RawValue>> {
+impl TryFrom<Web3ProxyResult<SingleResponse>> for ResponseData<Arc<OwnedLazyValue>> {
     type Error = Web3ProxyError;
 
     fn try_from(response: Web3ProxyResult<SingleResponse>) -> Result<Self, Self::Error> {
@@ -88,7 +98,7 @@ impl TryFrom<Web3ProxyResult<SingleResponse>> for ResponseData<Arc<RawValue>> {
 
 impl<T> From<JsonRpcErrorData> for ResponseData<T> {
     fn from(error_data: JsonRpcErrorData) -> Self {
-        let num_bytes = serde_json::to_string(&error_data)
+        let num_bytes = sonic_rs::to_string(&error_data)
             .expect("JSON-RPC errors must serialize")
             .len() as u64;
         Self::RpcError {
@@ -105,26 +115,26 @@ pub trait JsonRpcResultData =
 /// TODO: borrow values to avoid allocs if possible
 /// TODO: reduce overlap with `SingleResponse`.
 #[derive(Debug, Serialize)]
-pub struct ParsedResponse<T = Arc<RawValue>> {
+pub struct ParsedResponse<T = Arc<OwnedLazyValue>> {
     pub jsonrpc: Cow<'static, str>,
-    pub id: Box<RawValue>,
+    pub id: OwnedLazyValue,
     #[serde(flatten)]
     pub payload: ResponsePayload<T>,
 }
 
 impl ParsedResponse {
     #[inline]
-    pub fn from_value(value: serde_json::Value, id: Box<RawValue>) -> Self {
-        let result = serde_json::value::to_raw_value(&value)
+    pub fn from_value(value: Value, id: OwnedLazyValue) -> Self {
+        let result = sonic_rs::to_lazyvalue(&value)
             .expect("this should not fail")
             .into();
         Self::from_result(result, id)
     }
 }
 
-impl ParsedResponse<Arc<RawValue>> {
+impl ParsedResponse<Arc<OwnedLazyValue>> {
     #[inline]
-    pub fn from_response_data(data: ResponseData<Arc<RawValue>>, id: Box<RawValue>) -> Self {
+    pub fn from_response_data(data: ResponseData<Arc<OwnedLazyValue>>, id: OwnedLazyValue) -> Self {
         match data {
             ResponseData::RpcError { error_data, .. } => Self::from_error(error_data, id),
             ResponseData::Result { value, .. } => Self::from_result(value, id),
@@ -134,7 +144,7 @@ impl ParsedResponse<Arc<RawValue>> {
 
 impl<T> ParsedResponse<T> {
     #[inline]
-    pub fn from_result(result: T, id: Box<RawValue>) -> Self {
+    pub fn from_result(result: T, id: OwnedLazyValue) -> Self {
         Self {
             jsonrpc: "2.0".into(),
             id,
@@ -143,7 +153,7 @@ impl<T> ParsedResponse<T> {
     }
 
     #[inline]
-    pub fn from_error(error: JsonRpcErrorData, id: Box<RawValue>) -> Self {
+    pub fn from_error(error: JsonRpcErrorData, id: OwnedLazyValue) -> Self {
         Self {
             jsonrpc: "2.0".into(),
             id,
@@ -222,7 +232,7 @@ where
                                 return Err(de::Error::duplicate_field("id"));
                             }
 
-                            let value: Box<RawValue> = map.next_value()?;
+                            let value: OwnedLazyValue = map.next_value()?;
                             id = Some(value);
                         }
                         "result" => {
@@ -304,7 +314,7 @@ impl<T> StreamResponse<T> {
         let mut buffer = BytesMut::with_capacity(self.buffer.len());
         buffer.extend(self.buffer);
         buffer.extend(self.response.bytes().await?);
-        let parsed = serde_json::from_slice(&buffer)?;
+        let parsed = sonic_rs::from_slice(&buffer)?;
         Ok(parsed)
     }
 }
@@ -326,7 +336,7 @@ impl<T> IntoResponse for StreamResponse<T> {
 }
 
 #[derive(Debug)]
-pub enum SingleResponse<T = Arc<RawValue>> {
+pub enum SingleResponse<T = Arc<OwnedLazyValue>> {
     /// TODO: save the size here so we don't have to serialize again
     /// TODO: before doing that, make sure we don't swap back and forth between parsed and stream and single and forwarded and end up serializing too many times
     /// TODO: save the size here so repeated serialization is not necessary.
@@ -393,8 +403,8 @@ where
         }
     }
 
-    fn from_bytes(buf: Bytes) -> Result<Self, serde_json::Error> {
-        let val = serde_json::from_slice(&buf)?;
+    fn from_bytes(buf: Bytes) -> Result<Self, sonic_rs::Error> {
+        let val = sonic_rs::from_slice(&buf)?;
         Ok(Self::Parsed(val))
     }
 
@@ -408,14 +418,14 @@ where
 
     pub fn num_bytes(&self) -> u64 {
         match self {
-            Self::Parsed(response) => serde_json::to_string(response)
+            Self::Parsed(response) => sonic_rs::to_string(response)
                 .expect("this should always serialize")
                 .len() as u64,
             Self::Stream(response) => response.num_bytes.unwrap_or(0),
         }
     }
 
-    pub fn set_id(&mut self, id: Box<RawValue>) {
+    pub fn set_id(&mut self, id: OwnedLazyValue) {
         match self {
             SingleResponse::Parsed(x, ..) => {
                 x.id = id;
@@ -439,28 +449,28 @@ where
 {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Parsed(resp, ..) => Json(resp).into_response(),
+            Self::Parsed(resp, ..) => json_response(StatusCode::OK, &resp),
             Self::Stream(resp, ..) => resp.into_response(),
         }
     }
 }
 
 #[derive(Debug)]
-pub enum Response<T = Arc<RawValue>> {
+pub enum Response<T = Arc<OwnedLazyValue>> {
     Single(SingleResponse<T>),
     Batch(Vec<ParsedResponse<T>>),
 }
 
-impl Response<Arc<RawValue>> {
+impl Response<Arc<OwnedLazyValue>> {
     pub async fn to_json_string(self) -> Web3ProxyResult<String> {
         let x = match self {
             Self::Single(resp) => {
                 // TODO: handle streaming differently?
                 let parsed = resp.parsed().await?;
 
-                serde_json::to_string(&parsed)
+                sonic_rs::to_string(&parsed)
             }
-            Self::Batch(resps) => serde_json::to_string(&resps),
+            Self::Batch(resps) => sonic_rs::to_string(&resps),
         };
 
         let x = x.expect("to_string should always work");
@@ -482,7 +492,7 @@ where
     fn into_response(self) -> axum::response::Response {
         match self {
             Self::Single(resp) => resp.into_response(),
-            Self::Batch(resps) => Json(resps).into_response(),
+            Self::Batch(resps) => json_response(StatusCode::OK, &resps),
         }
     }
 }

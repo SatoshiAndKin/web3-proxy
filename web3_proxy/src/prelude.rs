@@ -16,7 +16,7 @@ pub use sentry;
 pub use sentry_tracing;
 pub use serde;
 pub use serde_inline_default;
-pub use serde_json;
+pub use sonic_rs;
 pub use tokio;
 pub use toml;
 pub use tracing;

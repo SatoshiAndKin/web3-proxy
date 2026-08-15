@@ -10,7 +10,7 @@ use axum::extract::ws::Message;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
 use futures::stream::StreamExt;
-use serde_json::json;
+use sonic_rs::{json, JsonValueTrait};
 use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -98,7 +98,7 @@ impl App {
                                     },
                                 });
 
-                                let response_str = serde_json::to_string(&response_json)
+                                let response_str = sonic_rs::to_string(&response_json)
                                     .expect("this should always be valid json");
 
                                 let response_bytes = response_str.len() as u64;
@@ -178,7 +178,7 @@ impl App {
                                             },
                                         });
 
-                                        let response_str = serde_json::to_string(&response_json)
+                                        let response_str = sonic_rs::to_string(&response_json)
                                             .expect("this should always be valid json");
 
                                         let response_bytes = response_str.len() as u64;

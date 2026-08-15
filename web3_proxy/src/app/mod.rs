@@ -21,8 +21,7 @@ use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use hashbrown::HashSet;
 use moka::future::{Cache, CacheBuilder};
-use serde_json::json;
-use serde_json::value::RawValue;
+use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, OwnedLazyValue};
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -357,7 +356,10 @@ impl App {
 
         // TODO: error handling?
         match response.parsed().await?.payload {
-            jsonrpc::ResponsePayload::Success { result } => Ok(serde_json::from_str(result.get())?),
+            jsonrpc::ResponsePayload::Success { result } => {
+                let result = sonic_rs::to_value(result.as_ref())?;
+                Ok(sonic_rs::from_value(&result)?)
+            }
             jsonrpc::ResponsePayload::Error { error } => {
                 Err(Web3ProxyError::JsonRpcErrorData(error))
             }
@@ -457,12 +459,12 @@ impl App {
 
     /// try to send transactions to the best available rpcs with protected/private mempools
     /// if no protected rpcs are configured (and protected_only is false), then public rpcs are used instead
-    /// TODO: should this return a B256 instead of an Arc<RawValue>?
+    /// TODO: should this return a B256 instead of an Arc<OwnedLazyValue>?
     async fn try_send_protected(
         self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
         protected_only: bool,
-    ) -> Web3ProxyResult<ResponseData<Arc<RawValue>>> {
+    ) -> Web3ProxyResult<ResponseData<Arc<OwnedLazyValue>>> {
         // decode the transaction
         let params = web3_request
             .inner
@@ -546,7 +548,7 @@ impl App {
         if let ResponseData::Result { value, .. } = &response {
             // no idea how we got an array here, but lets force this to just the txid
             // TODO: think about this more
-            if value.get().starts_with('[') {
+            if value.is_array() {
                 let backend_rpcs = web3_request.backend_rpcs_used();
 
                 let backend_rpcs = backend_rpcs
@@ -700,7 +702,7 @@ impl App {
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse> {
         // TODO: serve net_version without querying the backend
-        // TODO: don't force RawValue
+        // TODO: don't force OwnedLazyValue
         let response: jsonrpc::SingleResponse = match web3_request.inner.method() {
             // lots of commands are blocked
             method @ ("db_getHex"
@@ -793,11 +795,11 @@ impl App {
             | "eth_getUserOperationReceipt"
             | "eth_supportedEntryPoints"
             | "web3_bundlerVersion" => self.bundler_4337_rpcs
-                        .try_proxy_connection::<Arc<RawValue>>(
+                        .try_proxy_connection::<Arc<OwnedLazyValue>>(
                             web3_request,
                         )
                         .await?,
-            "eth_accounts" => jsonrpc::ParsedResponse::from_value(serde_json::Value::Array(vec![]), web3_request.id()).into(),
+            "eth_accounts" => jsonrpc::ParsedResponse::from_value(json!([]), web3_request.id()).into(),
             "eth_blockNumber" => {
                 match web3_request.head_block.clone().or(self.balanced_rpcs.head_block()) {
                     Some(head_block) => jsonrpc::ParsedResponse::from_value(json!(head_block.number()), web3_request.id()).into(),
@@ -854,7 +856,7 @@ impl App {
 
                 let mut result = self
                     .balanced_rpcs
-                    .try_proxy_connection::<Arc<RawValue>>(
+                    .try_proxy_connection::<Arc<OwnedLazyValue>>(
                         web3_request,
                     )
                     .await;
@@ -868,14 +870,12 @@ impl App {
                 // TODO: this feels fragile. how should we do this better/
                 let try_archive = match &result {
                     Ok(SingleResponse::Parsed(x)) => {
-                        let x = x.result().map(|x| json!(x));
-
-                        match x {
-                            Some(serde_json::Value::Null) => true,
-                            Some(serde_json::Value::Array(x)) => x.is_empty(),
-                            Some(serde_json::Value::String(x)) => x.is_empty(),
+                        match x.result().map(AsRef::as_ref) {
+                            Some(value) if value.is_null() => true,
+                            Some(value) if value.as_array().is_some_and(|x| x.is_empty()) => true,
+                            Some(value) if value.as_str().is_some_and(str::is_empty) => true,
                             None => true,
-                            _ => false,
+                            Some(_) => false,
                         }
                     },
                     Ok(SingleResponse::Stream(..)) => unimplemented!(),
@@ -897,7 +897,7 @@ impl App {
 
                     self
                         .balanced_rpcs
-                        .try_proxy_connection::<Arc<RawValue>>(
+                        .try_proxy_connection::<Arc<OwnedLazyValue>>(
                             web3_request,
                         )
                         .await?
@@ -910,7 +910,7 @@ impl App {
             }
             // TODO: eth_gasPrice that does awesome magic to predict the future
             "eth_hashrate" => jsonrpc::ParsedResponse::from_value(json!(U64::ZERO), web3_request.id()).into(),
-            "eth_mining" => jsonrpc::ParsedResponse::from_value(serde_json::Value::Bool(false), web3_request.id()).into(),
+            "eth_mining" => jsonrpc::ParsedResponse::from_value(json!(false), web3_request.id()).into(),
             "eth_sendRawTransaction" => {
                 // TODO: eth_sendPrivateTransaction that only sends private and never to balanced. it has different params though
                 let x = self
@@ -924,7 +924,7 @@ impl App {
                 // no stats on this. its cheap
                 // TODO: return a real response if all backends are syncing or if no servers in sync
                 // TODO: const
-                jsonrpc::ParsedResponse::from_value(serde_json::Value::Bool(false), web3_request.id()).into()
+                jsonrpc::ParsedResponse::from_value(json!(false), web3_request.id()).into()
             }
             "eth_subscribe" => jsonrpc::ParsedResponse::from_error(JsonRpcErrorData {
                 message: "notifications not supported. eth_subscribe is only available over a websocket".into(),
@@ -939,22 +939,22 @@ impl App {
             "net_listening" => {
                 // TODO: only true if there are some backends on balanced_rpcs?
                 // TODO: const
-                jsonrpc::ParsedResponse::from_value(serde_json::Value::Bool(true), web3_request.id()).into()
+                jsonrpc::ParsedResponse::from_value(json!(true), web3_request.id()).into()
             }
             "net_peerCount" =>
                 jsonrpc::ParsedResponse::from_value(json!(U64::from(self.balanced_rpcs.num_synced_rpcs())), web3_request.id()).into()
             ,
             "web3_clientVersion" =>
-                jsonrpc::ParsedResponse::from_value(serde_json::Value::String(APP_USER_AGENT.to_string()), web3_request.id()).into()
+                jsonrpc::ParsedResponse::from_value(json!(APP_USER_AGENT), web3_request.id()).into()
             ,
             "web3_sha3" => {
                 // returns Keccak-256 (not the standardized SHA3-256) of the given data.
                 // TODO: timeout
-                match &web3_request.inner.params() {
-                    serde_json::Value::Array(params) => {
+                match web3_request.inner.params().as_array() {
+                    Some(params) => {
                         // TODO: make a struct and use serde conversion to clean this up
                         if params.len() != 1
-                            || !params.first().map(|x| x.is_string()).unwrap_or(false)
+                            || !params.first().map(|x| x.is_str()).unwrap_or(false)
                         {
                             // TODO: what error code?
                             // TODO: use Web3ProxyError::BadRequest
@@ -987,7 +987,7 @@ impl App {
                             jsonrpc::ParsedResponse::from_value(json!(hash), web3_request.id()).into()
                         }
                     }
-                    _ => {
+                    None => {
                         // TODO: this needs the correct error code in the response
                         // TODO: Web3ProxyError::BadRequest instead?
                         jsonrpc::ParsedResponse::from_error(JsonRpcErrorData {
@@ -1018,7 +1018,7 @@ impl App {
                 let mut response = timeout_at(
                     web3_request.expire_at(),
                     self.balanced_rpcs
-                        .try_proxy_connection::<Arc<RawValue>>(web3_request),
+                        .try_proxy_connection::<Arc<OwnedLazyValue>>(web3_request),
                 )
                 .await??;
 

@@ -41,7 +41,7 @@ These are roughly in order of completition
 - [x] rpc errors propagate too far. one subscription failing ends the app. isolate the providers more (might already be fixed)
 - [x] incoming rate limiting (by ip)
 - [x] automatically route to archive server when necessary
-  - originally, no processing was done to params; they were just serde_json::RawValue. this is probably fastest, but we need to look for "latest" and count elements, so we have to use serde_json::Value
+  - originally, no processing was done to params; they were raw JSON. this is probably fastest, but we need to look for "latest" and count elements, so we have to use sonic_rs::Value
   - when getting the next server, filtering on "archive" isn't going to work well. need to check inner instead
 - [x] if the requested block is ahead of the best block, return without querying any backend servers
 - [x] http servers should check block at the very start
@@ -340,7 +340,7 @@ These are not yet ordered. There might be duplicates. We might not actually need
     - it should be the min of total_sum_soft_limit (from only non-lagged servers) and min_sum_soft_limit
     - otherwise it won't track anything and will just give errors.
     - but if web3 proxy has just started, we should give some time otherwise we will thundering herd the first server that responds
-- [ ] connection pool for websockets. use tokio-tungstenite directly. serde_json is enough for our raw requests
+- [ ] connection pool for websockets. use tokio-tungstenite directly. sonic_rs is enough for our raw requests
     - this should also get us closer to being able to do our own streaming json parser where we can 
 - [ ] figure out if "could not get block from params" is a problem worth logging
     - maybe it was an ots request?
@@ -526,7 +526,7 @@ in another repo: event subscriber
 - [ ] how should we handle reverting transactions? they won't confirm for a while after we send them
 - [ ] Wrapping extractors in Result makes them optional and gives you the reason the extraction failed
 - [ ] need a status page for your wallet's rpc. show head block information with age
-- [ ] replace serde_json::Value with https://lib.rs/crates/ijson (more memory efficient)
+- [ ] replace sonic_rs::Value with https://lib.rs/crates/ijson (more memory efficient)
 - [ ] failsafe. if no blocks or transactions in some time, warn and reset the connection
 - [ ] having tons of worker threads can actually make us slower if they keep waking to steal work from eachother. need benchmarks
 - [ ] change the wrk data to log requests and errors to a file

@@ -7,7 +7,7 @@ use web3_proxy::prelude::alloy::network::TxSignerSync;
 use web3_proxy::prelude::alloy::primitives::{Address, Bytes, TxKind, B256, U256, U64};
 use web3_proxy::prelude::alloy::providers::{Provider, RootProvider};
 use web3_proxy::prelude::alloy::rpc::types::{Block, Log, Transaction};
-use web3_proxy::prelude::reqwest::{self, StatusCode};
+use web3_proxy::prelude::reqwest::{self, header, StatusCode};
 use web3_proxy::prelude::serde::{de::DeserializeOwned, Serialize};
 use web3_proxy::prelude::tokio::{self, task::yield_now, time::sleep};
 use web3_proxy::rpcs::blockchain::ArcBlock;
@@ -58,7 +58,10 @@ async fn it_starts_and_stops() {
     let client = reqwest::Client::new();
     let removed_key_route = client
         .post(format!("{}rpc/removed-key", proxy_url))
-        .json(&json!({"jsonrpc": "2.0", "method": "eth_chainId", "id": 1}))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            sonic_rs::to_vec(&json!({"jsonrpc": "2.0", "method": "eth_chainId", "id": 1})).unwrap(),
+        )
         .send()
         .await
         .unwrap();

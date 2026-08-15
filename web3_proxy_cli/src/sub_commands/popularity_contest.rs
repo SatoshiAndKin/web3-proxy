@@ -4,7 +4,7 @@ use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::ordered_float::OrderedFloat;
 use web3_proxy::prelude::reqwest;
-use web3_proxy::prelude::serde_json;
+use web3_proxy::prelude::sonic_rs::{self, JsonContainerTrait, JsonValueTrait, Object, Value};
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// show what nodes are used most often
@@ -32,8 +32,8 @@ struct BackendRpcData<'a> {
     weighted_latency_ms: f64,
 }
 
-fn head_block_number(conn: &serde_json::Map<String, serde_json::Value>) -> u64 {
-    conn.get("head_block")
+fn head_block_number(conn: &Object) -> u64 {
+    conn.get(&"head_block")
         .and_then(|x| x.get("block"))
         .and_then(|x| x.get("number"))
         .and_then(|x| x.as_u64())
@@ -42,19 +42,18 @@ fn head_block_number(conn: &serde_json::Map<String, serde_json::Value>) -> u64 {
 
 impl PopularityContestSubCommand {
     pub async fn main(self) -> anyhow::Result<()> {
-        let x: serde_json::Value = reqwest::get(format!("{}/status", self.rpc))
-            .await?
-            .json()
-            .await?;
+        let response = reqwest::get(format!("{}/status", self.rpc)).await?;
+        let body = response.bytes().await?;
+        let x: Value = sonic_rs::from_slice(&body)?;
 
         let conns = x
             .as_object()
             .unwrap()
-            .get("balanced_rpcs")
+            .get(&"balanced_rpcs")
             .unwrap()
             .as_object()
             .unwrap()
-            .get("conns")
+            .get(&"conns")
             .unwrap()
             .as_array()
             .unwrap();
@@ -67,32 +66,32 @@ impl PopularityContestSubCommand {
             let conn = conn.as_object().unwrap();
 
             let name = conn
-                .get("display_name")
-                .unwrap_or_else(|| conn.get("name").unwrap())
+                .get(&"display_name")
+                .unwrap_or_else(|| conn.get(&"name").unwrap())
                 .as_str()
                 .unwrap_or("unknown");
 
-            let tier = conn.get("tier").unwrap().as_u64().unwrap();
+            let tier = conn.get(&"tier").unwrap().as_u64().unwrap();
 
-            let backup = conn.get("backup").unwrap().as_bool().unwrap();
+            let backup = conn.get(&"backup").unwrap().as_bool().unwrap();
 
             let block_data_limit = conn
-                .get("block_data_limit")
+                .get(&"block_data_limit")
                 .and_then(|x| x.as_u64())
                 .unwrap_or(u64::MAX);
 
             let internal_requests = conn
-                .get("internal_requests")
+                .get(&"internal_requests")
                 .and_then(|x| x.as_u64())
                 .unwrap_or_default();
 
             let external_requests = conn
-                .get("external_requests")
+                .get(&"external_requests")
                 .and_then(|x| x.as_u64())
                 .unwrap_or_default();
 
             let active_requests = conn
-                .get("active_requests")
+                .get(&"active_requests")
                 .and_then(|x| x.as_u64())
                 .unwrap_or_default();
 
@@ -102,22 +101,22 @@ impl PopularityContestSubCommand {
 
             // TODO: this was moved to an async lock and so serialize can't fetch it
             let head_delay_ms = conn
-                .get("head_delay_ms")
+                .get(&"head_delay_ms")
                 .and_then(|x| x.as_f64())
                 .unwrap_or_default();
 
             let median_latency_ms = conn
-                .get("median_latency_ms")
+                .get(&"median_latency_ms")
                 .and_then(|x| x.as_f64())
                 .unwrap_or_default();
 
             let peak_latency_ms = conn
-                .get("peak_latency_ms")
+                .get(&"peak_latency_ms")
                 .and_then(|x| x.as_f64())
                 .unwrap_or_default();
 
             let weighted_latency_ms = conn
-                .get("weighted_latency_ms")
+                .get(&"weighted_latency_ms")
                 .and_then(|x| x.as_f64())
                 .unwrap_or_default();
 
@@ -211,7 +210,7 @@ impl PopularityContestSubCommand {
 #[cfg(test)]
 mod tests {
     use super::head_block_number;
-    use web3_proxy::prelude::serde_json::json;
+    use web3_proxy::prelude::sonic_rs::{json, JsonContainerTrait};
 
     #[test]
     fn head_block_number_requires_a_u64_status_field() {

@@ -8,14 +8,15 @@ use web3_proxy::prelude::anyhow::{anyhow, Context};
 use web3_proxy::prelude::chrono::{DateTime, Utc};
 use web3_proxy::prelude::futures::{stream::FuturesUnordered, StreamExt};
 use web3_proxy::prelude::reqwest;
+use web3_proxy::prelude::reqwest::header;
 use web3_proxy::prelude::serde::{Deserialize, Serialize};
-use web3_proxy::prelude::serde_json::json;
+use web3_proxy::prelude::sonic_rs::{self, json};
 use web3_proxy::prelude::tokio;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRpcResponse<V> {
     // pub jsonrpc: String,
-    // pub id: Box<RawValue>,
+    // pub id: OwnedLazyValue,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<V>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,10 +55,14 @@ pub async fn main(
         "method": "eth_getBlockByNumber",
         "params": ["latest", false],
     });
+    let block_by_number_request = sonic_rs::to_vec(&block_by_number_request)
+        .context("failed serializing block request")
+        .map_err(|x| error_builder.build(x))?;
 
     let a = client
         .post(&rpc)
-        .json(&block_by_number_request)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(block_by_number_request)
         .send()
         .await
         .context(format!("error querying block from {}", rpc))
@@ -76,7 +81,7 @@ pub async fn main(
         .context(format!("failed parsing body from {}", rpc))
         .map_err(|x| error_builder.build(x))?;
 
-    let a: JsonRpcResponse<Block> = serde_json::from_str(&body)
+    let a: JsonRpcResponse<Block> = sonic_rs::from_str(&body)
         .context(format!("body: {}", body))
         .context(format!("failed parsing json from {}", rpc))
         .map_err(|x| error_builder.build(x))?;
@@ -215,7 +220,8 @@ async fn check_rpc(
 
     let response = client
         .post(&rpc)
-        .json(&block_by_hash_request)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(sonic_rs::to_vec(&block_by_hash_request)?)
         .send()
         .await
         .context(format!("awaiting response from {}", rpc))?;
@@ -232,7 +238,7 @@ async fn check_rpc(
         .await
         .context(format!("failed parsing body from {}", rpc))?;
 
-    let response_json: JsonRpcResponse<Block> = serde_json::from_str(&body)
+    let response_json: JsonRpcResponse<Block> = sonic_rs::from_str(&body)
         .context(format!("body: {}", body))
         .context(format!("failed parsing json from {}", rpc))?;
 

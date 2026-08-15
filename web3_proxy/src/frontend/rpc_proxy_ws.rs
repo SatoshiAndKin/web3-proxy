@@ -20,7 +20,7 @@ use futures::{
     stream::{SplitSink, SplitStream, StreamExt},
 };
 use hashbrown::HashMap;
-use serde_json::json;
+use sonic_rs::{json, JsonValueTrait};
 use std::net::IpAddr;
 use std::str::from_utf8;
 use std::sync::atomic::AtomicU64;
@@ -152,7 +152,8 @@ async fn websocket_proxy_web3_rpc(
                     {
                         let mut x = subscriptions.write().await;
 
-                        let key: U64 = serde_json::from_str(subscription_id.get()).unwrap();
+                        let subscription_id = sonic_rs::to_value(subscription_id.as_ref()).unwrap();
+                        let key: U64 = sonic_rs::from_value(&subscription_id).unwrap();
 
                         x.insert(key, handle);
                     }
@@ -184,7 +185,7 @@ async fn websocket_proxy_web3_rpc(
                 .unwrap_or_else(|| web3_request.inner.params())
                 .clone();
 
-            let subscription_id: U64 = match serde_json::from_value::<U64>(maybe_id) {
+            let subscription_id: U64 = match sonic_rs::from_value::<U64>(&maybe_id) {
                 Ok(x) => x,
                 Err(err) => {
                     return Err(Web3ProxyError::BadRequest(
@@ -234,7 +235,7 @@ async fn handle_socket_payload(
     let (authorization, semaphore) = authorization.check_again(app).await?;
 
     // TODO: handle batched requests
-    let (response_id, response) = match serde_json::from_str::<SingleRequest>(payload) {
+    let (response_id, response) = match sonic_rs::from_str::<SingleRequest>(payload) {
         Ok(json_request) => {
             let request_id = json_request.id.clone();
 
@@ -261,7 +262,7 @@ async fn handle_socket_payload(
 
             let response = ParsedResponse::from_response_data(response_data, response_id);
 
-            serde_json::to_string(&response).expect("to_string should always work here")
+            sonic_rs::to_string(&response).expect("to_string should always work here")
         }
     };
 
@@ -398,13 +399,15 @@ async fn write_web3_socket(
 
 #[cfg(test)]
 mod test {
+    use sonic_rs::{OwnedLazyValue, Value};
+
     #[test]
     fn nulls_and_defaults() {
-        let x = serde_json::Value::Null;
-        let x = serde_json::to_string(&x).unwrap();
+        let x = Value::default();
+        let x = sonic_rs::to_string(&x).unwrap();
 
-        let y: Box<serde_json::value::RawValue> = Default::default();
-        let y = serde_json::to_string(&y).unwrap();
+        let y = OwnedLazyValue::default();
+        let y = sonic_rs::to_string(&y).unwrap();
 
         assert_eq!(x, y);
     }

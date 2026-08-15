@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 pub type BlockAndRpc = (Option<BlockHeader>, Arc<Web3Rpc>);
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TopConfig {
     pub app: AppConfig,
     pub balanced_rpcs: HashMap<String, Web3RpcConfig>,
@@ -26,7 +26,7 @@ pub struct TopConfig {
     pub bundler_4337_rpcs: HashMap<String, Web3RpcConfig>,
     /// unknown config options get put here
     #[serde(flatten, default = "HashMap::default")]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: HashMap<String, toml::Value>,
 }
 
 impl TopConfig {
@@ -46,7 +46,7 @@ impl TopConfig {
 /// shared configuration between Web3Rpcs
 // TODO: no String, only &str
 #[serde_inline_default]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct AppConfig {
     /// erigon defaults to pruning beyond 90,000 blocks
     #[serde_inline_default(90_000u64)]
@@ -103,12 +103,12 @@ pub struct AppConfig {
 
     /// unknown config options get put here
     #[serde(flatten, default = "HashMap::default")]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: HashMap<String, toml::Value>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        serde_json::from_str("{}").unwrap()
+        sonic_rs::from_str("{}").unwrap()
     }
 }
 
@@ -222,7 +222,7 @@ impl From<BlockDataLimit> for AtomicU64 {
 
 /// Configuration for a backend web3 RPC server
 #[serde_inline_default]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Web3RpcConfig {
     /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
     #[serde(default = "Default::default")]
@@ -250,12 +250,12 @@ pub struct Web3RpcConfig {
     pub ws_url: Option<String>,
     /// unknown config options get put here
     #[serde(flatten, default = "HashMap::default")]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: HashMap<String, toml::Value>,
 }
 
 impl Default for Web3RpcConfig {
     fn default() -> Self {
-        serde_json::from_str("{}").unwrap()
+        sonic_rs::from_str("{}").unwrap()
     }
 }
 
@@ -297,12 +297,12 @@ impl Web3RpcConfig {
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, Web3RpcConfig};
-    use serde_json::json;
+    use sonic_rs::json;
 
     #[test]
     fn expected_app_defaults() {
         // a is from serde
-        let a: AppConfig = serde_json::from_value(json!({
+        let a: AppConfig = sonic_rs::from_value(&json!({
             "chain_id": 1,
         }))
         .unwrap();
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn expected_rpc_defaults() {
-        let a: Web3RpcConfig = serde_json::from_str("{}").unwrap();
+        let a: Web3RpcConfig = sonic_rs::from_str("{}").unwrap();
 
         assert_eq!(a.soft_limit, 1);
 

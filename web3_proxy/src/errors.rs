@@ -8,20 +8,17 @@ use crate::jsonrpc::{
 use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::one::Web3Rpc;
 use alloy::primitives::{B256, U64};
-use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::Message;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use derive_more::{Display, Error, From};
 use http::header::InvalidHeaderValue;
 use http::uri::InvalidUri;
 use reqwest::header::ToStrError;
 use serde::Serialize;
-use serde_json::json;
-use serde_json::value::RawValue;
+use sonic_rs::{json, OwnedLazyValue, Value};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +76,11 @@ pub enum Web3ProxyError {
     InvalidHeaderValue(InvalidHeaderValue),
     Io(std::io::Error),
     JoinError(JoinError),
-    JsonRejection(JsonRejection),
+    #[from(ignore)]
+    JsonRequest(sonic_rs::Error),
+    #[error(ignore)]
+    #[from(ignore)]
+    JsonRequestBody(Cow<'static, str>),
     #[display("{:?}", _0)]
     #[error(ignore)]
     JsonRpcErrorData(JsonRpcErrorData),
@@ -127,13 +128,13 @@ pub enum Web3ProxyError {
     },
     Reqwest(reqwest::Error),
     SemaphoreAcquireError(AcquireError),
-    SerdeJson(serde_json::Error),
+    Sonic(sonic_rs::Error),
     /// simple way to return an error message to the user and an anyhow to our logs
     #[display("{}, {}, {:?}", _0, _1, _2)]
-    StatusCode(StatusCode, Cow<'static, str>, Option<serde_json::Value>),
+    StatusCode(StatusCode, Cow<'static, str>, Option<Value>),
     #[display("streaming response")]
     #[error(ignore)]
-    StreamResponse(StreamResponse<Arc<RawValue>>),
+    StreamResponse(StreamResponse<Arc<OwnedLazyValue>>),
     /// TODO: what should be attached to the timout?
     #[display("{:?}", _0)]
     #[error(ignore)]
@@ -177,7 +178,7 @@ pub enum RequestForError<'a> {
 impl Web3ProxyError {
     pub fn as_json_response_parts<'a, R>(
         &self,
-        id: Box<RawValue>,
+        id: OwnedLazyValue,
         request_for_error: Option<R>,
     ) -> (StatusCode, jsonrpc::SingleResponse)
     where
@@ -194,7 +195,7 @@ impl Web3ProxyError {
     pub fn as_response_parts<'a, R>(
         &self,
         request_for_error: Option<R>,
-    ) -> (StatusCode, ResponseData<Arc<RawValue>>)
+    ) -> (StatusCode, ResponseData<Arc<OwnedLazyValue>>)
     where
         R: Into<RequestForError<'a>>,
     {
@@ -450,19 +451,13 @@ impl Web3ProxyError {
                     },
                 )
             }
-            Self::JsonRejection(err) => {
-                trace!(?err, "JsonRejection");
+            Self::JsonRequest(err) => {
+                trace!(?err, "invalid JSON request");
 
-                let (message, code): (&str, _) = match &err {
-                    JsonRejection::JsonDataError(_) => ("Invalid Request", -32600),
-                    JsonRejection::JsonSyntaxError(_) => ("Parse error", -32700),
-                    JsonRejection::MissingJsonContentType(_) => ("Invalid Request", -32600),
-                    JsonRejection::BytesRejection(_) => ("Invalid Request", -32600),
-                    x => {
-                        warn!(?x, "what? isn't that all of them?");
-                        // TODO: what code should this be?
-                        ("Parse error", -32700)
-                    }
+                let (message, code) = if err.is_syntax() || err.is_eof() {
+                    ("Parse error", -32700)
+                } else {
+                    ("Invalid Request", -32600)
                 };
 
                 // TODO: i feel like this should be a 401, but the spec seems to say its a 200
@@ -474,6 +469,20 @@ impl Web3ProxyError {
                         data: Some(json!({
                             "request": request_for_error,
                             "err": err.to_string(),
+                        })),
+                    },
+                )
+            }
+            Self::JsonRequestBody(err) => {
+                trace!(%err, "invalid JSON request body");
+                (
+                    StatusCode::OK,
+                    JsonRpcErrorData {
+                        message: "Invalid Request".into(),
+                        code: -32600,
+                        data: Some(json!({
+                            "request": request_for_error,
+                            "err": err,
                         })),
                     },
                 )
@@ -703,8 +712,8 @@ impl Web3ProxyError {
                     },
                 )
             }
-            Self::SerdeJson(err) => {
-                trace!(?err, "serde json");
+            Self::Sonic(err) => {
+                trace!(?err, "sonic json");
                 (
                     StatusCode::BAD_REQUEST,
                     JsonRpcErrorData {
@@ -850,7 +859,7 @@ impl Web3ProxyError {
 
     pub fn into_response_with_id<'a, R>(
         self,
-        id: Option<Box<RawValue>>,
+        id: Option<OwnedLazyValue>,
         request_for_error: Option<R>,
     ) -> Response
     where
@@ -862,7 +871,7 @@ impl Web3ProxyError {
 
         let response = ParsedResponse::from_response_data(response_data, id);
 
-        (status_code, Json(response)).into_response()
+        jsonrpc::response::json_response(status_code, &response)
     }
 }
 
@@ -902,7 +911,7 @@ where
 impl Web3ProxyError {
     pub fn into_message<'a, R>(
         self,
-        id: Option<Box<RawValue>>,
+        id: Option<OwnedLazyValue>,
         request_for_error: Option<R>,
     ) -> Message
     where
@@ -914,7 +923,7 @@ impl Web3ProxyError {
 
         let err = ParsedResponse::from_response_data(err, id);
 
-        let msg = serde_json::to_string(&err).expect("errors should always serialize to json");
+        let msg = sonic_rs::to_string(&err).expect("errors should always serialize to json");
 
         // TODO: what about a binary message?
         Message::Text(msg.into())

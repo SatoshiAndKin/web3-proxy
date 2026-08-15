@@ -6,10 +6,10 @@ use crate::errors::{RequestForError, Web3ProxyError, Web3ProxyResult};
 use crate::jsonrpc::{self, SingleRequest};
 use derive_more::From;
 use serde::Serialize;
-use serde_json::value::RawValue;
+use sonic_rs::{OwnedLazyValue, Value};
 use std::borrow::Cow;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
@@ -40,7 +40,7 @@ pub enum RequestOrMethod {
 }
 
 impl RequestOrMethod {
-    pub fn id(&self) -> Box<RawValue> {
+    pub fn id(&self) -> OwnedLazyValue {
         match self {
             Self::Request(request) => request.id.clone(),
             Self::Method(_, _) | Self::None => Default::default(),
@@ -55,10 +55,12 @@ impl RequestOrMethod {
         }
     }
 
-    pub fn params(&self) -> &serde_json::Value {
+    pub fn params(&self) -> &Value {
+        static NULL: OnceLock<Value> = OnceLock::new();
+
         match self {
             Self::Request(request) => &request.params,
-            Self::Method(..) | Self::None => &serde_json::Value::Null,
+            Self::Method(..) | Self::None => NULL.get_or_init(Value::default),
         }
     }
 
@@ -80,7 +82,7 @@ impl RequestOrMethod {
 
 #[derive(From)]
 pub enum ResponseOrBytes<'a> {
-    Json(&'a serde_json::Value),
+    Json(&'a Value),
     Response(&'a jsonrpc::SingleResponse),
     Error(&'a Web3ProxyError),
     Bytes(u64),
@@ -89,7 +91,7 @@ pub enum ResponseOrBytes<'a> {
 impl ResponseOrBytes<'_> {
     pub fn num_bytes(&self) -> u64 {
         match self {
-            Self::Json(value) => serde_json::to_string(value)
+            Self::Json(value) => sonic_rs::to_string(value)
                 .expect("JSON values must serialize")
                 .len() as u64,
             Self::Response(response) => response.num_bytes(),

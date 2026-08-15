@@ -146,7 +146,7 @@ impl OpenRequestHandle {
 
             ipc_stream.writable().await?;
 
-            let x = serde_json::to_vec(request)?;
+            let x = sonic_rs::to_vec(request)?;
 
             let _ = ipc_stream.write(&x).await?;
 
@@ -156,7 +156,7 @@ impl OpenRequestHandle {
 
             let n = ipc_stream.try_read(&mut buf)?;
 
-            let x: ParsedResponse<R> = serde_json::from_slice(&buf[..n])?;
+            let x: ParsedResponse<R> = sonic_rs::from_slice(&buf[..n])?;
 
             Ok(x.into())
         } else if let (Some(url), Some(ref client)) =
@@ -169,7 +169,11 @@ impl OpenRequestHandle {
                 .jsonrpc_request()
                 .context("there should always be a request here")?;
 
-            let mut request_builder = client.post(url).json(request);
+            let body = sonic_rs::to_vec(request)?;
+            let mut request_builder = client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
             if request.method == "eth_sendRawTransaction" {
                 if let Some(ref request_id) = self.web3_request.request_id {
                     let mut headers = reqwest::header::HeaderMap::with_capacity(1);
@@ -197,9 +201,15 @@ impl OpenRequestHandle {
             // use the websocket provider if no other provider is available
             let method = self.web3_request.inner.method();
             let params = self.web3_request.inner.params();
+            let params = sonic_rs::to_string(params)?;
+            let params =
+                serde_json::value::RawValue::from_string(params).map_err(anyhow::Error::from)?;
 
-            let response = match p.raw_request(method.to_string().into(), params).await {
-                Ok(x) => jsonrpc::ParsedResponse::from_result(x, self.web3_request.id()),
+            let response = match p.raw_request_dyn(method.to_string().into(), &params).await {
+                Ok(value) => {
+                    let value = sonic_rs::from_str::<R>(value.get())?;
+                    jsonrpc::ParsedResponse::from_result(value, self.web3_request.id())
+                }
                 Err(transport_error) => match JsonRpcErrorData::try_from(&transport_error) {
                     Ok(x) => jsonrpc::ParsedResponse::from_error(x, self.web3_request.id()),
                     Err(err) => {

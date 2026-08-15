@@ -8,7 +8,7 @@ use derive_more::From;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
-use serde_json::value::RawValue;
+use sonic_rs::{OwnedLazyValue, Value};
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
@@ -23,22 +23,18 @@ pub struct SingleRequest {
     pub jsonrpc: Cow<'static, str>,
     /// id could be a stricter type, but many rpcs do things against the spec
     /// TODO: this gets cloned into the response object often. would an Arc be better? That has its own overhead and these are short strings
-    pub id: Box<RawValue>,
+    pub id: OwnedLazyValue,
     pub method: Cow<'static, str>,
-    #[serde_inline_default(serde_json::Value::Null)]
-    pub params: serde_json::Value,
+    #[serde_inline_default(Value::default())]
+    pub params: Value,
 }
 
 impl SingleRequest {
     // TODO: Web3ProxyResult? can this even fail?
-    pub fn new(
-        id: LooseId,
-        method: Cow<'static, str>,
-        params: serde_json::Value,
-    ) -> anyhow::Result<Self> {
+    pub fn new(id: LooseId, method: Cow<'static, str>, params: Value) -> anyhow::Result<Self> {
         let x = Self {
             jsonrpc: "2.0".into(),
-            id: id.to_raw_value(),
+            id: id.into_lazy_value(),
             method,
             params,
         };
@@ -48,7 +44,7 @@ impl SingleRequest {
 
     /// TODO: not sure how to do this without wasting a ton of allocations
     pub fn num_bytes(&self) -> usize {
-        serde_json::to_string(self)
+        sonic_rs::to_string(self)
             .expect("this should always be valid json")
             .len()
     }
@@ -80,7 +76,7 @@ pub enum JsonRpcRequestEnum {
 }
 
 impl JsonRpcRequestEnum {
-    pub fn first_id(&self) -> Option<Box<RawValue>> {
+    pub fn first_id(&self) -> Option<OwnedLazyValue> {
         match self {
             Self::Batch(x) => x.first().map(|x| x.id.clone()),
             Self::Single(x) => Some(x.id.clone()),
@@ -88,7 +84,7 @@ impl JsonRpcRequestEnum {
     }
 
     /// returns the id of the first invalid result (if any). None is good
-    pub fn validate(&self) -> Option<Box<RawValue>> {
+    pub fn validate(&self) -> Option<OwnedLazyValue> {
         match self {
             Self::Batch(x) => x
                 .iter()
@@ -115,7 +111,7 @@ impl JsonRpcRequestEnum {
             Some(x) => x,
         };
 
-        let size = serde_json::to_string(&self)
+        let size = sonic_rs::to_string(&self)
             .expect("JsonRpcRequestEnum should always serialize")
             .len();
 

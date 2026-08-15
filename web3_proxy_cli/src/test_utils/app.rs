@@ -7,7 +7,7 @@ use web3_proxy::prelude::alloy::providers::ProviderBuilder;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::hashbrown::HashMap;
 use web3_proxy::prelude::reqwest::{self, header::HeaderMap};
-use web3_proxy::prelude::serde_json::json;
+use web3_proxy::prelude::sonic_rs::{self, json};
 use web3_proxy::prelude::tokio::{
     runtime::Builder,
     sync::broadcast::{self, error::SendError},
@@ -26,7 +26,7 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn spawn(anvil: &TestAnvil) -> Self {
-        let app_config: AppConfig = serde_json::from_value(json!({
+        let app_config: AppConfig = sonic_rs::from_value(&json!({
             "chain_id": anvil.instance.chain_id(),
             "min_sum_soft_limit": 1,
             "min_synced_rpcs": 1,
