@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use axum_client_ip::InsecureClientIp;
+use axum_client_ip::RightmostXForwardedFor as ClientIp;
 use axum_macros::debug_handler;
 use hashbrown::HashMap;
 use http::HeaderMap;
@@ -37,7 +37,7 @@ static CONTENT_TYPE_PLAIN: &str = "text/plain";
 #[debug_handler]
 pub async fn debug_request(
     State(app): State<Arc<App>>,
-    ip: InsecureClientIp,
+    ip: ClientIp,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let (_, _, status) = _status(app).await;

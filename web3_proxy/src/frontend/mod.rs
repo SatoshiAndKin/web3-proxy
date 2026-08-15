@@ -159,24 +159,9 @@ pub async fn serve(
         TcpListener::bind(addr).await?
     };
 
-    // into_make_service is enough if we always run behind a proxy
-    /*
-    It sequentially looks for an IP in:
-      - x-forwarded-for header (de-facto standard)
-      - x-real-ip header
-      - forwarded header (new standard)
-      - axum::extract::ConnectInfo (if not behind proxy)
-    */
-    let make_service = {
-        info!("connectinfo feature enabled");
-        router.into_make_service_with_connect_info::<SocketAddr>()
-    };
-
-    // #[cfg(not(feature = "connectinfo"))]
-    // let make_service = {
-    //     info!("connectinfo feature disabled");
-    //     router.into_make_service()
-    // };
+    // The frontend runs behind a trusted proxy. Client IP extraction uses the
+    // rightmost address from X-Forwarded-For.
+    let make_service = router.into_make_service();
 
     let server = axum::serve(listener, make_service);
 

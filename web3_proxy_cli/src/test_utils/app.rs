@@ -3,8 +3,10 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::{thread, time::Duration};
 use web3_proxy::config::{AppConfig, TopConfig, Web3RpcConfig};
+use web3_proxy::prelude::alloy::providers::ProviderBuilder;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::hashbrown::HashMap;
+use web3_proxy::prelude::reqwest::{self, header::HeaderMap};
 use web3_proxy::prelude::serde_json::json;
 use web3_proxy::prelude::tokio::{
     runtime::Builder,
@@ -12,7 +14,7 @@ use web3_proxy::prelude::tokio::{
     time::{sleep, Instant},
 };
 use web3_proxy::prelude::url::Url;
-use web3_proxy::rpcs::provider::{connect_http, AlloyHttpProvider};
+use web3_proxy::rpcs::provider::AlloyHttpProvider;
 use web3_proxy::test_utils::TestAnvil;
 
 pub struct TestApp {
@@ -88,7 +90,13 @@ impl TestApp {
         let proxy_url: Url = format!("http://127.0.0.1:{}", frontend_port.load(Ordering::SeqCst))
             .parse()
             .unwrap();
-        let proxy_provider = connect_http(proxy_url.clone()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        let proxy_provider = ProviderBuilder::default().connect_reqwest(client, proxy_url.clone());
 
         Self {
             proxy_handle: Some(proxy_handle),

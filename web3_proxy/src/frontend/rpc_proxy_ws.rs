@@ -12,7 +12,7 @@ use axum::{
     extract::State,
     response::{IntoResponse, Redirect},
 };
-use axum_client_ip::InsecureClientIp;
+use axum_client_ip::RightmostXForwardedFor as ClientIp;
 use axum_macros::debug_handler;
 use futures::SinkExt;
 use futures::{
@@ -48,7 +48,7 @@ pub enum ProxyMode {
 #[debug_handler]
 pub async fn websocket_handler(
     State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
+    ClientIp(ip): ClientIp,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     _websocket_handler(ProxyMode::Best, app, &ip, ws_upgrade).await
@@ -59,7 +59,7 @@ pub async fn websocket_handler(
 // #[debug_handler]
 pub async fn fastest_websocket_handler(
     State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
+    ClientIp(ip): ClientIp,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     // TODO: get the fastest number from the url params (default to 0/all)
@@ -72,7 +72,7 @@ pub async fn fastest_websocket_handler(
 #[debug_handler]
 pub async fn versus_websocket_handler(
     State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
+    ClientIp(ip): ClientIp,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     // TODO: config to disable this

@@ -9,7 +9,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use axum_client_ip::InsecureClientIp;
+use axum_client_ip::RightmostXForwardedFor as ClientIp;
 use axum_macros::debug_handler;
 use itertools::Itertools;
 use std::net::IpAddr;
@@ -19,7 +19,7 @@ use std::time::Duration;
 #[debug_handler]
 pub async fn proxy_web3_rpc(
     State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
+    ClientIp(ip): ClientIp,
     Extension(RequestId(request_id)): Extension<RequestId>,
     payload: Result<Json<JsonRpcRequestEnum>, JsonRejection>,
 ) -> Result<Response, Response> {
@@ -29,7 +29,7 @@ pub async fn proxy_web3_rpc(
 #[debug_handler]
 pub async fn fastest_proxy_web3_rpc(
     State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
+    ClientIp(ip): ClientIp,
     Extension(RequestId(request_id)): Extension<RequestId>,
     payload: Result<Json<JsonRpcRequestEnum>, JsonRejection>,
 ) -> Result<Response, Response> {
@@ -39,7 +39,7 @@ pub async fn fastest_proxy_web3_rpc(
 #[debug_handler]
 pub async fn versus_proxy_web3_rpc(
     State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
+    ClientIp(ip): ClientIp,
     Extension(RequestId(request_id)): Extension<RequestId>,
     payload: Result<Json<JsonRpcRequestEnum>, JsonRejection>,
 ) -> Result<Response, Response> {
