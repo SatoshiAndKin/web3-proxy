@@ -10,43 +10,23 @@ default = []
 
 mimalloc = ["dep:mimalloc"]
 rdkafka-src = ["dep:rdkafka", "rdkafka/cmake-build", "rdkafka/ssl-vendored"]
-stripe = ["dep:async-stripe"]
 tests-needing-docker = []
 
 [dependencies]
 deduped_broadcast = { path = "../deduped_broadcast" }
-deferred-rate-limiter = { path = "../deferred-rate-limiter" }
-entities = { path = "../entities" }
 latency = { path = "../latency" }
-migration = { path = "../migration" }
-payment-contracts = { path = "../payment-contracts" }
-redis-rate-limiter = { path = "../redis-rate-limiter" }
-
-#ethers = { git = "https://github.com/llamanodes/ethers-rs/", rev = "eb68f5d60850008cd302762bd3a5a4bdcfecc713", default-features = false, features = ["openssl", "ws"] }
-influxdb2 = { git = "https://github.com/llamanodes/influxdb2", default-features = false, features = ["rustls"], rev = "2d125128696a29d7e0b9abc052c928937e7c0579" }
-influxdb2-structmap = { git = "https://github.com/llamanodes/influxdb2/", rev = "2d125128696a29d7e0b9abc052c928937e7c0579"}
-
-# TODO: we can't actually use 0.6 because they want a Provider and we have an Arc<Provider>
-# TODO: this has features ethers which probably brings in things. make sure it has the minimal features
-siwe = { git = "https://github.com/llamanodes/siwe-rs", branch = "for_web3_proxy", features = ["ethers", "serde"] }
 
 # TODO: regex has several "perf" features that we might want to use
-# TODO: make sure this uuid version matches sea-orm. PR to put this in their prelude
-# TODO: import num_traits from sea-orm so we always have the same version
-# TODO: import chrono from sea-orm so we always have the same version
-# TODO: make sure this time version matches siwe. PR to put this in their prelude
-
 anyhow = { version = "1.0.75", features = ["backtrace"] }
 arc-swap = { version = "1.6.0" }
 argh = "0.1.12"
 async-stream = "0.3.5"
-async-stripe = { version = "0.25.2", default-features = false, features = ["billing", "checkout", "connect", "runtime-tokio-hyper-rustls", "webhook-events"], optional = true }
 axum = { version = "0.6.20", features = ["headers", "tracing", "ws"] }
 axum-client-ip = "0.4.2"
 axum-macros = "0.3.8"
 base64 = "0.21.5"
 bytes = "1.5.0"
-chrono = { version = "0.4.31" }
+chrono = { version = "0.4.31", features = ["serde"] }
 derivative = "2.2.0"
 derive_more = { version = "0.99.17", features = ["nightly"] }
 ethers = { version = "2.0.11", default-features = false, features = ["rustls", "ws"] }
@@ -61,7 +41,6 @@ hdrhistogram = "7.5.4"
 hostname = "0.3.1"
 http = "0.2.11"
 hyper = { version = "0.14.27", features = ["full", "nightly"] }
-ipnet = { version = "2.9.0" }
 itertools = "0.12.0"
 listenfd = { version = "1.0.1", optional = true }
 mimalloc = { version = "0.1.39", optional = true }
@@ -74,14 +53,12 @@ ordered-float = {version = "4.2.0" }
 pagerduty-rs = { version = "0.1.6", default-features = false, features = ["async", "rustls", "sync"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "nightly"] }
 rdkafka = { version = "0.36.0", default-features = false, features = ["tokio", "tracing"], optional = true }
-reqwest = { version = "0.11.22", default-features = false, features = ["json", "rustls"] }
-rust_decimal = { version = "1.33.1" }
+reqwest = { version = "0.11.22", default-features = false, features = ["json", "rustls", "stream"] }
 sentry = { version = "0.31.8", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "reqwest", "rustls", "serde_json", "tracing"] }
 sentry-tracing = "0.31.8"
-serde = { version = "1.0.193" }
+serde = { version = "1.0.193", features = ["rc"] }
 serde-inline-default = "0.1.1"
 serde_json = { version = "1.0.108", default-features = false, features = ["raw_value"] }
-serde_prometheus = "0.2.4"
 strum = { version = "0.25.0", features = ["derive"] }
 time = { version = "0.3" }
 tokio = { version = "1.34.0", features = ["full", "tracing"] }
@@ -93,7 +70,6 @@ tower-service = "0.3.2"
 tracing = "0.1"
 ulid = { version = "1.1.0", features = ["rand", "uuid", "serde"] }
 url = { version = "2.5.0" }
-uuid = { version = "1.6.1", default-features = false }
 
 # TODO: why doesn't this work in dev-dependencies. i think because of how we split web3_proxy and web3_proxy_cli. im not sure that is even helping anymore
 test-log = { version = "0.2.13", default-features = false, features = ["trace"] }

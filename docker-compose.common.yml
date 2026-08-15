@@ -12,7 +12,3 @@ services:
     volumes:
       - /etc/ssl/certs/:/etc/ssl/certs/:ro
       - /usr/local/share/ca-certificates/:/usr/local/share/ca-certificates/:ro
-
-  volatile_redis:
-    image: redis:6.2-alpine
-    command: [ "redis-server" ]

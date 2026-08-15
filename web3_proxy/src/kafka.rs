@@ -43,14 +43,7 @@ impl KafkaDebugLogger {
 
         let kafka_topic = kafka_topic.to_string();
 
-        let rpc_secret_key_id = authorization
-            .checks
-            .rpc_secret_key_id
-            .map(|x| x.get())
-            .unwrap_or_default();
-
-        let kafka_key =
-            serde_json::to_vec(&rpc_secret_key_id).expect("ids should always serialize with rmp");
+        let kafka_key = request_id.as_bytes().to_vec();
 
         let chain_id = app.config.chain_id;
 
@@ -59,21 +52,13 @@ impl KafkaDebugLogger {
         // TODO: would be nice to have the block hash too
 
         // another item is added with the response, so initial_capacity is +1 what is needed here
-        let kafka_headers = KafkaOwnedHeaders::new_with_capacity(6)
-            .insert(KafkaHeader {
-                key: "rpc_secret_key_id",
-                value: authorization
-                    .checks
-                    .rpc_secret_key_id
-                    .map(|x| x.to_string())
-                    .as_ref(),
-            })
+        let kafka_headers = KafkaOwnedHeaders::new_with_capacity(4)
             .insert(KafkaHeader {
                 key: "ip",
                 value: Some(&authorization.ip.to_string()),
             })
             .insert(KafkaHeader {
-                key: "request_ulid",
+                key: "request_id",
                 value: Some(request_id),
             })
             .insert(KafkaHeader {

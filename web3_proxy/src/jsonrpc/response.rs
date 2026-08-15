@@ -1,7 +1,6 @@
 use super::JsonRpcErrorData;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::jsonrpc::ValidatedRequest;
-use crate::response_cache::ForwardedResponse;
 use axum::body::StreamBody;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -9,17 +8,101 @@ use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, StreamExt};
 use futures_util::TryStreamExt;
 use serde::{de, Deserialize, Serialize};
-use serde_json::value::RawValue;
+use serde_json::value::{to_raw_value, RawValue};
 use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+/// A JSON-RPC result or error without a request ID.
+#[derive(Clone, Debug)]
+pub enum ResponseData<T> {
+    Result {
+        value: T,
+        num_bytes: u64,
+    },
+    RpcError {
+        error_data: JsonRpcErrorData,
+        num_bytes: u64,
+    },
+}
+
+impl<T> ResponseData<T> {
+    pub fn num_bytes(&self) -> u64 {
+        match self {
+            Self::Result { num_bytes, .. } | Self::RpcError { num_bytes, .. } => *num_bytes,
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::RpcError { .. })
+    }
+}
+
+impl<T> ResponseData<Option<T>> {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Result { value: None, .. })
+    }
+}
+
+impl ResponseData<Arc<RawValue>> {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Result { value, .. } if value.get() == "null")
+    }
+}
+
+impl From<serde_json::Value> for ResponseData<Arc<RawValue>> {
+    fn from(value: serde_json::Value) -> Self {
+        to_raw_value(&value)
+            .expect("JSON values must serialize")
+            .into()
+    }
+}
+
+impl From<Arc<RawValue>> for ResponseData<Arc<RawValue>> {
+    fn from(value: Arc<RawValue>) -> Self {
+        let num_bytes = value.get().len() as u64;
+        Self::Result { value, num_bytes }
+    }
+}
+
+impl From<Box<RawValue>> for ResponseData<Arc<RawValue>> {
+    fn from(value: Box<RawValue>) -> Self {
+        Arc::<RawValue>::from(value).into()
+    }
+}
+
+impl TryFrom<Web3ProxyResult<SingleResponse>> for ResponseData<Arc<RawValue>> {
+    type Error = Web3ProxyError;
+
+    fn try_from(response: Web3ProxyResult<SingleResponse>) -> Result<Self, Self::Error> {
+        match response? {
+            SingleResponse::Parsed(parsed) => match parsed.payload {
+                ResponsePayload::Success { result } => Ok(result.into()),
+                ResponsePayload::Error { error } => Ok(error.into()),
+            },
+            SingleResponse::Stream(stream) => Err(Web3ProxyError::StreamResponse(stream)),
+        }
+    }
+}
+
+impl<T> From<JsonRpcErrorData> for ResponseData<T> {
+    fn from(error_data: JsonRpcErrorData) -> Self {
+        let num_bytes = serde_json::to_string(&error_data)
+            .expect("JSON-RPC errors must serialize")
+            .len() as u64;
+        Self::RpcError {
+            error_data,
+            num_bytes,
+        }
+    }
+}
+
 pub trait JsonRpcParams = fmt::Debug + serde::Serialize + Send + Sync + 'static;
 pub trait JsonRpcResultData = serde::Serialize + serde::de::DeserializeOwned + fmt::Debug + Send;
 
 /// TODO: borrow values to avoid allocs if possible
-/// TODO: lots of overlap with `SingleForwardedResponse`
+/// TODO: reduce overlap with `SingleResponse`.
 #[derive(Debug, Serialize)]
 pub struct ParsedResponse<T = Arc<RawValue>> {
     pub jsonrpc: Cow<'static, str>,
@@ -40,10 +123,10 @@ impl ParsedResponse {
 
 impl ParsedResponse<Arc<RawValue>> {
     #[inline]
-    pub fn from_response_data(data: ForwardedResponse<Arc<RawValue>>, id: Box<RawValue>) -> Self {
+    pub fn from_response_data(data: ResponseData<Arc<RawValue>>, id: Box<RawValue>) -> Self {
         match data {
-            ForwardedResponse::RpcError { error_data, .. } => Self::from_error(error_data, id),
-            ForwardedResponse::Result { value, .. } => Self::from_result(value, id),
+            ResponseData::RpcError { error_data, .. } => Self::from_error(error_data, id),
+            ResponseData::Result { value, .. } => Self::from_result(value, id),
         }
     }
 }
@@ -245,7 +328,7 @@ impl<T> IntoResponse for StreamResponse<T> {
 pub enum SingleResponse<T = Arc<RawValue>> {
     /// TODO: save the size here so we don't have to serialize again
     /// TODO: before doing that, make sure we don't swap back and forth between parsed and stream and single and forwarded and end up serializing too many times
-    /// TODO: should this be a ForwardedResponse instead of ParsedResponse
+    /// TODO: save the size here so repeated serialization is not necessary.
     Parsed(ParsedResponse<T>),
     Stream(StreamResponse<T>),
 }
@@ -314,7 +397,7 @@ where
         Ok(Self::Parsed(val))
     }
 
-    /// TODO: rewrite this to go to a refactored version of ForwardedResponse. (And then rename ForwardedResponse to ParsedResponse cuz its a better name?)
+    /// Read a streaming response into a parsed response.
     pub async fn parsed(self) -> Web3ProxyResult<ParsedResponse<T>> {
         match self {
             Self::Parsed(resp, ..) => Ok(resp),

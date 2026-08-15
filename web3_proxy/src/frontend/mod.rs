@@ -4,64 +4,36 @@
 //!
 //! There are a lot of things in tower/axum that i should have used instead of implementing here.
 // TODO: these are only public so docs are generated. What's a better way to do this?
-pub mod admin;
 pub mod authorization;
 pub mod errors;
 pub mod request_id;
 pub mod rpc_proxy_http;
 pub mod rpc_proxy_ws;
 pub mod status;
-pub mod users;
 
 use crate::app::App;
 use crate::errors::Web3ProxyResult;
 use axum::{
     routing::{get, post},
-    Extension, Router,
+    Router,
 };
-use http::{header::AUTHORIZATION, Request, StatusCode};
+use http::Request;
 use hyper::Body;
 use request_id::RequestId;
 
-use moka::future::{Cache, CacheBuilder};
 use std::sync::Arc;
-use std::{iter::once, time::Duration};
+use std::time::Duration;
 use std::{net::SocketAddr, sync::atomic::Ordering};
-use strum::{EnumCount, EnumIter};
 use tokio::{process::Command, sync::broadcast};
-use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::{cors::CorsLayer, normalize_path::NormalizePathLayer, trace::TraceLayer};
 use tracing::{error, error_span, info, trace_span};
 
 #[cfg(feature = "listenfd")]
 use listenfd::ListenFd;
 
-/// simple keys for caching responses
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, EnumCount, EnumIter)]
-pub enum ResponseCacheKey {
-    BackupsNeeded,
-    Health,
-    Status,
-}
-
-pub type ResponseCache = Cache<ResponseCacheKey, (StatusCode, &'static str, axum::body::Bytes)>;
-
 /// build our axum Router
 pub fn make_router(app: Arc<App>) -> Router<()> {
-    // setup caches for whatever the frontend needs
-    // no need for max items since it is limited by the enum key
-    // TODO: latest moka allows for different ttls for different
-    let response_cache_size = ResponseCacheKey::COUNT;
-
-    let response_cache: ResponseCache = CacheBuilder::new(response_cache_size as u64)
-        .name("frontend_response")
-        .time_to_live(Duration::from_millis(200))
-        .build();
-
-    let response_cache = Arc::new(response_cache);
-
-    #[allow(unused_mut)]
-    let mut router = Router::<Arc<App>>::new()
+    let router = Router::<Arc<App>>::new()
         // TODO: i think these routes could be done a lot better
         //
         // HTTP RPC (POST)
@@ -74,28 +46,6 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
             "/",
             post(rpc_proxy_http::proxy_web3_rpc).get(rpc_proxy_ws::websocket_handler),
         )
-        // authenticated with and without trailing slash
-        .route(
-            "/rpc/:rpc_key",
-            post(rpc_proxy_http::proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::websocket_handler_with_key),
-        )
-        .route(
-            "/rpc/:rpc_key/",
-            post(rpc_proxy_http::proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::websocket_handler_with_key),
-        )
-        // authenticated debug route
-        .route(
-            "/debug/:rpc_key",
-            post(rpc_proxy_http::debug_proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::debug_websocket_handler_with_key),
-        )
-        .route(
-            "/debug/:rpc_key/",
-            post(rpc_proxy_http::debug_proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::debug_websocket_handler_with_key),
-        )
         // public fastest
         .route(
             "/fastest",
@@ -107,17 +57,6 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
             post(rpc_proxy_http::fastest_proxy_web3_rpc)
                 .get(rpc_proxy_ws::fastest_websocket_handler),
         )
-        // authenticated fastest with and without trailing slash
-        .route(
-            "/fastest/:rpc_key",
-            post(rpc_proxy_http::fastest_proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::fastest_websocket_handler_with_key),
-        )
-        .route(
-            "/fastest/:rpc_key/",
-            post(rpc_proxy_http::fastest_proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::fastest_websocket_handler_with_key),
-        )
         // public versus
         .route(
             "/versus",
@@ -127,146 +66,13 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
             "/versus/",
             post(rpc_proxy_http::versus_proxy_web3_rpc).get(rpc_proxy_ws::versus_websocket_handler),
         )
-        // authenticated versus
-        .route(
-            "/versus/:rpc_key",
-            post(rpc_proxy_http::versus_proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::versus_websocket_handler_with_key),
-        )
-        .route(
-            "/versus/:rpc_key/",
-            post(rpc_proxy_http::versus_proxy_web3_rpc_with_key)
-                .get(rpc_proxy_ws::versus_websocket_handler_with_key),
-        )
         //
         // System things
         //
-        // TODO: response_cache should probably be inside State
-        .route(
-            "/health",
-            get(status::health).route_layer(Extension(response_cache.clone())),
-        )
-        .route(
-            "/status",
-            get(status::status).route_layer(Extension(response_cache.clone())),
-        )
-        .route(
-            "/status/backups_needed",
-            get(status::backups_needed).route_layer(Extension(response_cache.clone())),
-        )
-        .route(
-            "/status/debug_request",
-            get(status::debug_request).route_layer(Extension(response_cache.clone())),
-        )
-        //
-        // User stuff
-        //
-        .route(
-            "/user/login/:user_address",
-            get(users::authentication::user_login_get),
-        )
-        .route(
-            "/user/login/:user_address/:message_eip",
-            get(users::authentication::user_login_get),
-        )
-        .route("/user/login", post(users::authentication::user_login_post))
-        .route(
-            // /:rpc_key/:subuser_address/:new_status/:new_role
-            "/user/subuser",
-            post(users::subuser::modify_subuser),
-        )
-        .route("/user/subusers", get(users::subuser::get_subusers))
-        .route(
-            "/subuser/rpc_keys",
-            get(users::subuser::get_keys_as_subuser),
-        )
-        .route("/user", get(users::user_get).post(users::user_post))
-        .route("/user/balance", get(users::payment::user_balance_get))
-        .route(
-            "/user/deposits/chain",
-            get(users::payment::user_chain_deposits_get),
-        )
-        .route(
-            "/user/deposits/stripe",
-            get(users::payment::user_stripe_deposits_get),
-        )
-        .route(
-            "/user/deposits/admin",
-            get(users::payment::user_admin_deposits_get),
-        )
-        .route(
-            "/user/balance/:tx_hash",
-            post(users::payment::user_balance_post),
-        )
-        .route(
-            "/user/balance_uncle/:uncle_hash",
-            post(users::payment::user_balance_uncle_post),
-        )
-        .route(
-            "/user/keys",
-            get(users::rpc_keys::rpc_keys_get)
-                .post(users::rpc_keys::rpc_keys_management)
-                .put(users::rpc_keys::rpc_keys_management),
-        )
-        // .route("/user/referral/:referral_link", get(users::user_referral_link_get))
-        .route(
-            "/user/referral",
-            get(users::referral::user_referral_link_get),
-        )
-        .route(
-            "/user/referral/stats/used-codes",
-            get(users::referral::user_used_referral_stats),
-        )
-        .route(
-            "/user/referral/stats/shared-codes",
-            get(users::referral::user_shared_referral_stats),
-        )
-        .route("/user/revert_logs", get(users::stats::user_revert_logs_get))
-        .route(
-            "/user/stats/aggregate",
-            get(users::stats::user_influx_stats_aggregated_get),
-        )
-        .route(
-            "/user/stats/aggregated",
-            get(users::stats::user_influx_stats_aggregated_get),
-        )
-        .route(
-            "/user/stats/accounting",
-            get(users::stats::user_mysql_stats_get),
-        )
-        .route(
-            "/user/stats/detailed",
-            get(users::stats::user_influx_stats_detailed_get),
-        )
-        .route(
-            "/user/logout",
-            post(users::authentication::user_logout_post),
-        )
-        .route(
-            "/admin/increase_balance",
-            post(admin::admin_increase_balance),
-        )
-        .route("/admin/modify_role", post(admin::admin_change_user_roles))
-        .route(
-            "/admin/imitate_login/:admin_address/:user_address",
-            get(admin::admin_imitate_login_get),
-        )
-        .route(
-            "/admin/imitate_login/:admin_address/:user_address/:message_eip",
-            get(admin::admin_imitate_login_get),
-        )
-        .route(
-            "/admin/imitate_login",
-            post(admin::admin_imitate_login_post),
-        );
-
-    #[cfg(feature = "stripe")]
-    {
-        router = router.route(
-            "/user/balance/stripe",
-            post(users::payment_stripe::user_balance_stripe_post),
-        );
-    }
+        .route("/health", get(status::health))
+        .route("/status", get(status::status))
+        .route("/status/backups_needed", get(status::backups_needed))
+        .route("/status/debug_request", get(status::debug_request));
 
     // Axum layers
     // layers are ordered bottom up
@@ -275,8 +81,6 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
         // Remove trailing slashes
         // TODO: this isn't working for me. why?
         .layer(NormalizePathLayer::trim_trailing_slash())
-        // Mark the `Authorization` request header as sensitive so it doesn't show in logs
-        .layer(SetSensitiveRequestHeadersLayer::new(once(AUTHORIZATION)))
         // handle cors. we expect queries from all sorts of places
         .layer(CorsLayer::very_permissive())
         // request id

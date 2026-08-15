@@ -10,7 +10,7 @@ pub use self::error::JsonRpcErrorData;
 pub use self::id::LooseId;
 pub use self::request::{JsonRpcRequestEnum, SingleRequest};
 pub use self::response::{
-    ParsedResponse, Response, ResponsePayload, SingleResponse, StreamResponse,
+    ParsedResponse, Response, ResponseData, ResponsePayload, SingleResponse, StreamResponse,
 };
 pub use request_builder::ValidatedRequest;
 

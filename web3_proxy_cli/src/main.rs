@@ -16,11 +16,7 @@ use tokio::runtime;
 use tracing::{info, warn};
 use tracing_subscriber::{prelude::*, EnvFilter};
 use web3_proxy::pagerduty::panic_handler;
-use web3_proxy::{
-    app::APP_USER_AGENT,
-    config::TopConfig,
-    relational_db::{connect_db, get_migrated_db},
-};
+use web3_proxy::{app::APP_USER_AGENT, config::TopConfig};
 use web3_proxy_cli::sub_commands;
 
 #[cfg(feature = "mimalloc")]
@@ -44,10 +40,6 @@ pub struct Web3ProxyCli {
     #[argh(option, default = "0")]
     pub workers: usize,
 
-    /// if no config, what database the client should connect to (only required for some commands; Defaults to dev db)
-    #[argh(option)]
-    pub db_url: Option<String>,
-
     /// if no config, what sentry url should the client should connect to (only required for some commands)
     #[argh(option)]
     pub sentry_url: Option<Dsn>,
@@ -60,32 +52,11 @@ pub struct Web3ProxyCli {
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand)]
 enum SubCommand {
-    ChangeAdminStatus(sub_commands::ChangeAdminStatusSubCommand),
-    ChangeUserAddress(sub_commands::ChangeUserAddressSubCommand),
-    ChangeUserTier(sub_commands::ChangeUserTierSubCommand),
-    ChangeUserTierByAddress(sub_commands::ChangeUserTierByAddressSubCommand),
-    ChangeUserTierByKey(sub_commands::ChangeUserTierByKeySubCommand),
-    CheckBalance(sub_commands::CheckBalanceSubCommand),
     CheckConfig(sub_commands::CheckConfigSubCommand),
-    CountUsers(sub_commands::CountUsersSubCommand),
-    CreateKey(sub_commands::CreateKeySubCommand),
-    CreateUser(sub_commands::CreateUserSubCommand),
-    DropMigrationLock(sub_commands::DropMigrationLockSubCommand),
-    GrantCreditsToAddress(sub_commands::GrantCreditsToAddress),
-    MassGrantCredits(sub_commands::MassGrantCredits),
-    MigrateStatsToV2(sub_commands::MigrateStatsToV2SubCommand),
     Pagerduty(sub_commands::PagerdutySubCommand),
     PopularityContest(sub_commands::PopularityContestSubCommand),
     Proxyd(sub_commands::ProxydSubCommand),
-    RpcAccounting(sub_commands::RpcAccountingSubCommand),
-    #[cfg(feature = "rdkafka")]
-    SearchKafka(sub_commands::SearchKafkaSubCommand),
     Sentryd(sub_commands::SentrydSubCommand),
-    TransferKey(sub_commands::TransferKeySubCommand),
-    UserExport(sub_commands::UserExportSubCommand),
-    UserImport(sub_commands::UserImportSubCommand),
-    // TODO: sub command to downgrade migrations? sea-orm has this but doing downgrades here would be easier+safer
-    // TODO: sub command to add new api keys to an existing user?
 }
 
 fn main() -> anyhow::Result<()> {
@@ -126,11 +97,8 @@ fn main() -> anyhow::Result<()> {
                     "ethers=debug",
                     "ethers_providers::rpc=off",
                     "ethers_providers=debug",
-                    "quick_cache_ttl=debug",
-                    "redis_rate_limit=debug",
                     "web3_proxy::rpcs::blockchain=info",
                     "web3_proxy::rpcs::request=debug",
-                    // "web3_proxy::stats::influxdb_queries=trace",
                     "web3_proxy=trace",
                     "web3_proxy_cli=trace",
                 ]
@@ -141,10 +109,7 @@ fn main() -> anyhow::Result<()> {
                     "ethers=debug",
                     "ethers_providers::rpc=off",
                     "ethers_providers=error",
-                    "quick_cache_ttl=info",
-                    "redis_rate_limit=debug",
                     "web3_proxy::rpcs::consensus=info",
-                    // "web3_proxy::stats::influxdb_queries=trace",
                     "web3_proxy=debug",
                     "web3_proxy_cli=debug",
                 ]
@@ -160,8 +125,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut cli_config: Web3ProxyCli = argh::from_env();
 
-    if cli_config.config.is_none() && cli_config.db_url.is_none() && cli_config.sentry_url.is_none()
-    {
+    if cli_config.config.is_none() && cli_config.sentry_url.is_none() {
         // TODO: default to example.toml if development.toml doesn't exist
         info!("defaulting to development config");
         cli_config.config = Some("./config/development.toml".to_string());
@@ -175,10 +139,6 @@ fn main() -> anyhow::Result<()> {
         let top_config: String = fs::read_to_string(top_config_path.clone())?;
 
         let mut top_config: TopConfig = toml::from_str(&top_config)?;
-
-        if cli_config.db_url.is_none() {
-            cli_config.db_url = top_config.app.db_url.clone();
-        }
 
         if let Some(sentry_url) = top_config.app.sentry_url.clone() {
             cli_config.sentry_url = Some(sentry_url);
@@ -316,187 +276,25 @@ fn main() -> anyhow::Result<()> {
 
     rt.block_on(async {
         match cli_config.sub_command {
-            SubCommand::ChangeAdminStatus(x) => {
-                let db_url = cli_config.db_url.expect(
-                    "'--config' (with a db) or '--db-url' is required to run change_admin_status",
-                );
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
+            SubCommand::CheckConfig(command) => command.main().await,
+            SubCommand::Pagerduty(command) => {
+                if cli_config.sentry_url.is_none() {
+                    warn!("sentry_url is not set; logs will only appear in this console");
+                }
+                command.main(pagerduty_async, top_config).await
             }
-            SubCommand::ChangeUserAddress(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run change_user_addres");
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::ChangeUserTier(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run change_user_tier");
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::ChangeUserTierByAddress(x) => {
-                let db_url = cli_config.db_url.expect(
-                    "'--config' (with a db) or '--db-url' is required to run change_user_tier_by_address",
-                );
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::ChangeUserTierByKey(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run change_user_tier_by_key");
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::CheckBalance(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run change_user_addres");
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::CheckConfig(x) => x.main().await,
-            SubCommand::CreateKey(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run create a key");
-
-                let db_conn = get_migrated_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::CreateUser(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run create_user");
-
-                let db_conn = get_migrated_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::CountUsers(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run count_users");
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::GrantCreditsToAddress(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run create_user");
-
-                let db_conn = get_migrated_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::Proxyd(x) => {
+            SubCommand::PopularityContest(command) => command.main().await,
+            SubCommand::Proxyd(command) => {
                 let top_config = top_config.expect("--config is required to run proxyd");
                 let top_config_path =
-                    top_config_path.expect("path must be set if top_config exists");
-
-                x.main(top_config, top_config_path, num_workers).await
+                    top_config_path.expect("path must be set when the config exists");
+                command.main(top_config, top_config_path).await
             }
-            SubCommand::DropMigrationLock(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run drop_migration_lock");
-
-                // very intentionally, do NOT run migrations here. that would wait forever if the migration lock is abandoned
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::MassGrantCredits(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run mass_grant_credits");
-
-                let db_conn = get_migrated_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::MigrateStatsToV2(x) => {
-
-                let top_config = top_config.expect("--config is required to run the migration from stats-mysql to stats-influx");
-                // let top_config_path =
-                //     top_config_path.expect("path must be set if top_config exists");
-
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run the migration from stats-mysql to stats-influx");
-
-                let db_conn = connect_db(db_url, 1, 1).await?;
-                x.main(top_config, &db_conn).await
-            }
-            SubCommand::Pagerduty(x) => {
+            SubCommand::Sentryd(command) => {
                 if cli_config.sentry_url.is_none() {
-                    warn!("sentry_url is not set! Logs will only show in this console");
+                    warn!("sentry_url is not set; logs will only appear in this console");
                 }
-
-                x.main(pagerduty_async, top_config).await
-            }
-            SubCommand::PopularityContest(x) => x.main().await,
-            #[cfg(feature = "rdkafka")]
-            SubCommand::SearchKafka(x) => x.main(top_config.unwrap()).await,
-            SubCommand::Sentryd(x) => {
-                if cli_config.sentry_url.is_none() {
-                    warn!("sentry_url is not set! Logs will only show in this console");
-                }
-
-                x.main(pagerduty_async, top_config).await
-            }
-            SubCommand::RpcAccounting(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run rpc_accounting");
-
-                let db_conn = get_migrated_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::TransferKey(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run transfer_key");
-                let db_conn = connect_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::UserExport(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run user_export");
-
-                let db_conn = get_migrated_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
-            }
-            SubCommand::UserImport(x) => {
-                let db_url = cli_config
-                    .db_url
-                    .expect("'--config' (with a db) or '--db-url' is required to run user_import");
-
-                let db_conn = get_migrated_db(db_url, 1, 1).await?;
-
-                x.main(&db_conn).await
+                command.main(pagerduty_async, top_config).await
             }
         }
     })

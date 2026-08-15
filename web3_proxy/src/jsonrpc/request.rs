@@ -119,8 +119,6 @@ impl JsonRpcRequestEnum {
             .expect("JsonRpcRequestEnum should always serialize")
             .len();
 
-        // TODO: create a stat so we can penalize
-        // TODO: what request size
         // TODO: this probably needs a permit
         let request = ValidatedRequest::new_with_app(
             app,
@@ -148,8 +146,6 @@ impl JsonRpcRequestEnum {
 
         // TODO: variable duration depending on the IP
         sleep(duration).await;
-
-        let _ = request.try_send_arc_stat();
 
         Err(response)
     }

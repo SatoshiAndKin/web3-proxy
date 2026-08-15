@@ -1,22 +1,14 @@
 use super::one::Web3Rpc;
-use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
-use crate::frontend::authorization::{Authorization, AuthorizationType};
-use crate::globals::{global_db_conn, DB_CONN};
+use crate::errors::{Web3ProxyError, Web3ProxyResult};
+use crate::frontend::authorization::AuthorizationType;
 use crate::jsonrpc::{
     self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
 };
 use anyhow::Context;
-use chrono::Utc;
 use derive_more::From;
-use entities::revert_log;
-use entities::sea_orm_active_enums::Method;
 use ethers::providers::ProviderError;
-use ethers::types::{Address, Bytes};
 use futures::Future;
 use http::StatusCode;
-use migration::sea_orm::{self, ActiveEnum, ActiveModelTrait};
-use nanorand::Rng;
-use serde_json::json;
 use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::Arc;
@@ -60,18 +52,6 @@ pub enum RequestErrorHandler {
     ErrorLevel,
     /// Log at the warn level. Use when errors do not cause problems.
     WarnLevel,
-    /// Potentially save the revert. Users can tune how often this happens
-    Save,
-}
-
-// TODO: second param could be skipped since we don't need it here
-#[derive(serde::Deserialize, serde::Serialize)]
-struct EthCallParams((EthCallFirstParams, Option<serde_json::Value>));
-
-#[derive(serde::Deserialize, serde::Serialize)]
-struct EthCallFirstParams {
-    to: Option<Address>,
-    data: Option<Bytes>,
 }
 
 impl std::fmt::Debug for OpenRequestHandle {
@@ -92,54 +72,6 @@ impl From<Level> for RequestErrorHandler {
             Level::TRACE => RequestErrorHandler::TraceLevel,
             Level::WARN => RequestErrorHandler::WarnLevel,
         }
-    }
-}
-
-impl Authorization {
-    /// Save a RPC call that return "execution reverted" to the database.
-    async fn save_revert(
-        self: Arc<Self>,
-        method: Method,
-        params: EthCallFirstParams,
-    ) -> Web3ProxyResult<()> {
-        let rpc_key_id = match self.checks.rpc_secret_key_id {
-            Some(rpc_key_id) => rpc_key_id.into(),
-            None => {
-                // trace!(?self, "cannot save revert without rpc_key_id");
-                return Ok(());
-            }
-        };
-
-        let db_conn = global_db_conn()?;
-
-        // TODO: should the database set the timestamp?
-        // we intentionally use "now" and not the time the request started
-        // why? because we aggregate stats and setting one in the past could cause confusion
-        let timestamp = Utc::now();
-
-        let to = params.to.unwrap_or_else(Address::zero).as_bytes().to_vec();
-
-        let call_data = params.data.map(|x| x.to_string());
-
-        let rl = revert_log::ActiveModel {
-            rpc_key_id: sea_orm::Set(rpc_key_id),
-            method: sea_orm::Set(method),
-            to: sea_orm::Set(to),
-            call_data: sea_orm::Set(call_data),
-            timestamp: sea_orm::Set(timestamp),
-            ..Default::default()
-        };
-
-        let rl = rl
-            .save(&db_conn)
-            .await
-            .web3_context("Failed saving new revert log")?;
-
-        // TODO: what log level and format?
-        trace!(revert_log=?rl);
-
-        // TODO: return something useful
-        Ok(())
     }
 }
 
@@ -296,38 +228,7 @@ impl OpenRequestHandle {
     }
 
     pub fn error_handler(&self) -> RequestErrorHandler {
-        if let RequestErrorHandler::Save = self.error_handler {
-            let method = self.web3_request.inner.method();
-
-            // TODO: should all these be Trace or Debug or a mix?
-            // TODO: this list should come from config. other methods might be desired
-            if !["eth_call", "eth_estimateGas"].contains(&method) {
-                // trace!(%method, "skipping save on revert");
-                RequestErrorHandler::TraceLevel
-            } else if DB_CONN.read().is_ok() {
-                let log_revert_chance = self.web3_request.authorization.checks.log_revert_chance;
-
-                if log_revert_chance == 0 {
-                    // trace!(%method, "no chance. skipping save on revert");
-                    RequestErrorHandler::TraceLevel
-                } else if log_revert_chance == u16::MAX {
-                    // trace!(%method, "gaurenteed chance. SAVING on revert");
-                    self.error_handler
-                } else if nanorand::tls_rng().generate_range(0u16..u16::MAX) < log_revert_chance {
-                    // trace!(%method, "missed chance. skipping save on revert");
-                    RequestErrorHandler::TraceLevel
-                } else {
-                    // trace!("Saving on revert");
-                    // TODO: is always logging at debug level fine?
-                    self.error_handler
-                }
-            } else {
-                // trace!(%method, "no database. skipping save on revert");
-                RequestErrorHandler::TraceLevel
-            }
-        } else {
-            self.error_handler
-        }
+        self.error_handler
     }
 
     /// Send a web3 request
@@ -346,7 +247,7 @@ impl OpenRequestHandle {
         let authorization = &self.web3_request.authorization;
 
         match &authorization.authorization_type {
-            AuthorizationType::Remote | AuthorizationType::Local => {
+            AuthorizationType::Remote => {
                 // this is just a debug counter, so Relaxed is probably fine
                 self.rpc
                     .external_requests
@@ -556,44 +457,6 @@ impl OpenRequestHandle {
                         ?response,
                         "bad response",
                     );
-                }
-                RequestErrorHandler::Save => {
-                    trace!(
-                        rpc=%self.rpc,
-                        %self.web3_request,
-                        ?response,
-                        "bad response",
-                    );
-
-                    // TODO: do not unwrap! (doesn't matter much since we check method as a string above)
-                    // TODO: open this up for even more methods
-                    let method: Method =
-                        Method::try_from_value(&self.web3_request.inner.method().to_string())
-                            .unwrap();
-
-                    // TODO: i don't think this prsing is correct
-                    match serde_json::from_value::<EthCallParams>(json!(self
-                        .web3_request
-                        .inner
-                        .params()))
-                    {
-                        Ok(params) => {
-                            // spawn saving to the database so we don't slow down the request
-                            // TODO: log if this errors
-                            // TODO: aren't the method and params already saved? this should just need the response
-                            let f = authorization.clone().save_revert(method, params.0 .0);
-
-                            tokio::spawn(f);
-                        }
-                        Err(err) => {
-                            warn!(
-                                %self.web3_request,
-                                ?response,
-                                ?err,
-                                "failed parsing eth_call params. unable to save revert",
-                            );
-                        }
-                    }
                 }
             }
         }

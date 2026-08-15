@@ -226,23 +226,16 @@ impl From<&BlockHeader> for BlockNumOrHash {
 /// TODO: change this to also return the hash needed?
 /// this replaces any "latest" identifiers in the JsonRpcRequest with the current block number which feels like the data is structured wrong
 #[derive(Debug, Default, Hash, Eq, PartialEq)]
-pub enum CacheMode {
-    SuccessForever,
-    Standard {
+pub enum RequestBlocks {
+    Point {
         block_needed: BlockNumOrHash,
-        cache_block: BlockNumAndHash,
-        /// cache jsonrpc errors (server errors are never cached)
-        cache_errors: bool,
     },
     Range {
         from_block: BlockNumOrHash,
         to_block: BlockNumOrHash,
-        cache_block: BlockNumAndHash,
-        /// cache jsonrpc errors (server errors are never cached)
-        cache_errors: bool,
     },
     #[default]
-    Never,
+    None,
 }
 
 /// TODO: i don't like this. we should make an enum with all of these methods and their types
@@ -273,10 +266,9 @@ fn get_block_param_id(method: &str) -> Option<usize> {
     }
 }
 
-impl CacheMode {
-    /// like `try_new`, but instead of erroring if things can't be cached, it will default to caching with the head block
-    /// this will still error if something is wrong about the request (like the range is too large or invalid)
-    /// returns None if this request should not be cached
+impl RequestBlocks {
+    /// Find and normalize the block range that the request needs.
+    /// Invalid or too-large ranges still return an error.
     pub async fn new<'a>(
         request: &'a mut SingleRequest,
         head_block: Option<&'a BlockHeader>,
@@ -304,13 +296,11 @@ impl CacheMode {
         }
 
         let fallback = if let Some(head_block) = head_block {
-            Self::Standard {
+            Self::Point {
                 block_needed: head_block.into(),
-                cache_block: head_block.into(),
-                cache_errors: true,
             }
         } else {
-            Self::Never
+            Self::None
         };
 
         Ok(fallback)
@@ -324,28 +314,24 @@ impl CacheMode {
         let params = &mut request.params;
 
         if head_block.is_none() {
-            // since we don't have a head block, i don't trust our anything enough to cache
-            return Ok(Self::Never);
+            // We cannot resolve relative block parameters without a head block.
+            return Ok(Self::None);
         }
 
         let head_block = head_block.expect("head_block was just checked above");
 
         if matches!(params, serde_json::Value::Null) {
-            // no params given. cache with the head block
-            return Ok(Self::Standard {
+            // Route a request without parameters against the current head.
+            return Ok(Self::Point {
                 block_needed: head_block.into(),
-                cache_block: head_block.into(),
-                cache_errors: true,
             });
         }
 
         if let Some(params) = params.as_array() {
             if params.is_empty() {
-                // no params given. cache with the head block
-                return Ok(Self::Standard {
+                // Route a request without parameters against the current head.
+                return Ok(Self::Point {
                     block_needed: head_block.into(),
-                    cache_block: head_block.into(),
-                    cache_errors: true,
                 });
             }
         }
@@ -353,23 +339,21 @@ impl CacheMode {
         match request.method.as_ref() {
             "debug_traceTransaction" => {
                 // TODO: make sure re-orgs work properly!
-                Ok(Self::SuccessForever)
+                Ok(Self::None)
             }
-            "eth_blockNumber" => Ok(Self::Standard {
+            "eth_blockNumber" => Ok(Self::Point {
                 block_needed: head_block.into(),
-                cache_block: head_block.into(),
-                cache_errors: true,
             }),
-            "eth_gasPrice" => Ok(Self::Never),
+            "eth_gasPrice" => Ok(Self::None),
             "eth_getBlockByHash" => {
                 // TODO: double check that any node can serve this
                 // TODO: can a block change? like what if it gets orphaned?
                 // TODO: make sure re-orgs work properly!
-                Ok(Self::SuccessForever)
+                Ok(Self::None)
             }
             "eth_getBlockTransactionCountByHash" => {
                 // TODO: double check that any node can serve this
-                Ok(Self::SuccessForever)
+                Ok(Self::None)
             }
             "eth_getLogs" => {
                 // TODO: think about this more
@@ -383,14 +367,14 @@ impl CacheMode {
                     })?;
 
                 if obj.contains_key("blockHash") {
-                    Ok(Self::SuccessForever)
+                    Ok(Self::None)
                 } else {
                     let from_block = if let Some(x) = obj.get_mut("fromBlock") {
                         // TODO: use .take instead of clone
                         // what if its a hash?
                         let block_num: BlockNumber = serde_json::from_value(x.clone())?;
 
-                        let (block_num, change) =
+                        let (block_num, _change) =
                             BlockNumber_to_U64(block_num, head_block.number());
 
                         // TODO: double check this. it scares me
@@ -409,11 +393,10 @@ impl CacheMode {
                         let block_num: BlockNumber = serde_json::from_value(x.clone())?;
 
                         // sometimes people request `from_block=head+1, to_block="latest"`. latest becomes head and then theres a problem
-                        // TODO: if this is in the future, this cache key won't be very likely to be used again
                         // TODO: delay here until the app has this block?
                         let latest_block = head_block.number().max(from_block.num());
 
-                        let (block_num, change) = BlockNumber_to_U64(block_num, latest_block);
+                        let (block_num, _change) = BlockNumber_to_U64(block_num, latest_block);
 
                         // TODO: double check this. it scares me but i think we need it
                         trace!("changing toBlock in eth_getLogs. {} -> {}", x, block_num);
@@ -451,61 +434,44 @@ impl CacheMode {
                         });
                     }
 
-                    let cache_block = if let BlockNumOrHash::And(x) = &to_block {
-                        x.clone()
-                    } else {
-                        BlockNumAndHash::from(head_block)
-                    };
-
                     Ok(Self::Range {
                         from_block,
                         to_block,
-                        cache_block,
-                        cache_errors: true,
                     })
                 }
             }
             "eth_getTransactionByBlockHashAndIndex" => {
                 // TODO: check a Cache of recent hashes
                 // try full nodes first. retry will use archive
-                Ok(Self::SuccessForever)
+                Ok(Self::None)
             }
-            "eth_getTransactionByHash" => Ok(Self::Never),
-            "eth_getTransactionReceipt" => Ok(Self::Never),
+            "eth_getTransactionByHash" => Ok(Self::None),
+            "eth_getTransactionReceipt" => Ok(Self::None),
             "eth_getUncleByBlockHashAndIndex" => {
                 // TODO: check a Cache of recent hashes
                 // try full nodes first. retry will use archive
                 // TODO: what happens if this block is uncled later?
-                Ok(Self::SuccessForever)
+                Ok(Self::None)
             }
             "eth_getUncleCountByBlockHash" => {
                 // TODO: check a Cache of recent hashes
                 // try full nodes first. retry will use archive
                 // TODO: what happens if this block is uncled later?
-                Ok(Self::SuccessForever)
+                Ok(Self::None)
             }
             "eth_maxPriorityFeePerGas" => {
                 // TODO: this might be too aggressive. i think it can change before a block is mined
-                Ok(Self::Never)
+                Ok(Self::None)
             }
-            "eth_sendRawTransaction" => Ok(Self::Never),
-            "net_listening" => Ok(Self::SuccessForever),
-            "net_version" => Ok(Self::SuccessForever),
+            "eth_sendRawTransaction" => Ok(Self::None),
+            "net_listening" => Ok(Self::None),
+            "net_version" => Ok(Self::None),
             method => match get_block_param_id(method) {
                 Some(block_param_id) => {
                     let block_needed =
                         clean_block_number(params, block_param_id, head_block, app).await?;
 
-                    let cache_block = match &block_needed {
-                        BlockNumOrHash::And(block) => block.clone(),
-                        BlockNumOrHash::Num(_) => head_block.into(),
-                    };
-
-                    Ok(Self::Standard {
-                        block_needed,
-                        cache_block,
-                        cache_errors: true,
-                    })
+                    Ok(Self::Point { block_needed })
                 }
                 None => Err(Web3ProxyError::UnhandledMethod(method.to_string().into())),
             },
@@ -513,58 +479,29 @@ impl CacheMode {
     }
 
     #[inline]
-    pub fn cache_jsonrpc_errors(&self) -> bool {
-        match self {
-            Self::Never => false,
-            Self::SuccessForever => true,
-            Self::Standard { cache_errors, .. } => *cache_errors,
-            Self::Range { cache_errors, .. } => *cache_errors,
-        }
-    }
-
-    #[inline]
     pub fn from_block(&self) -> Option<&BlockNumOrHash> {
         match self {
-            Self::SuccessForever => None,
-            Self::Never => None,
-            Self::Standard { .. } => None,
+            Self::None | Self::Point { .. } => None,
             Self::Range { from_block, .. } => Some(from_block),
         }
     }
 
     #[inline]
-    pub fn is_some(&self) -> bool {
-        !matches!(self, Self::Never)
-    }
-
-    #[inline]
     pub fn to_block(&self) -> Option<&BlockNumOrHash> {
         match self {
-            Self::SuccessForever => None,
-            Self::Never => None,
-            Self::Standard {
+            Self::None => None,
+            Self::Point {
                 block_needed: block,
                 ..
             } => Some(block),
             Self::Range { to_block, .. } => Some(to_block),
         }
     }
-
-    /// get the to_block used **for caching**. This may be the to_block in the request, or it might be the current head block.
-    #[inline]
-    pub fn cache_block(&self) -> Option<&BlockNumAndHash> {
-        match self {
-            Self::SuccessForever => None,
-            Self::Never => None,
-            Self::Standard { cache_block, .. } => Some(cache_block),
-            Self::Range { cache_block, .. } => Some(cache_block),
-        }
-    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::CacheMode;
+    use super::RequestBlocks;
     use crate::{
         errors::Web3ProxyError,
         jsonrpc::{LooseId, SingleRequest},
@@ -592,16 +529,14 @@ mod test {
         let mut request = SingleRequest::new(id, method.into(), params).unwrap();
 
         // TODO: instead of empty, check None?
-        let x = CacheMode::try_new(&mut request, Some(&head_block), None)
+        let x = RequestBlocks::try_new(&mut request, Some(&head_block), None)
             .await
             .unwrap();
 
         assert_eq!(
             x,
-            CacheMode::Standard {
+            RequestBlocks::Point {
                 block_needed: (&head_block).into(),
-                cache_block: (&head_block).into(),
-                cache_errors: true
             }
         );
 
@@ -627,7 +562,7 @@ mod test {
 
         let mut request = SingleRequest::new(id, method.into(), params).unwrap();
 
-        let x = CacheMode::try_new(&mut request, Some(&head_block), None)
+        let x = RequestBlocks::try_new(&mut request, Some(&head_block), None)
             .await
             .unwrap();
 
@@ -636,10 +571,8 @@ mod test {
 
         assert_eq!(
             x,
-            CacheMode::Standard {
+            RequestBlocks::Point {
                 block_needed: (&head_block).into(),
-                cache_block: (&head_block).into(),
-                cache_errors: true
             }
         );
     }
@@ -663,7 +596,7 @@ mod test {
 
         let mut request = SingleRequest::new(99.into(), method.into(), params).unwrap();
 
-        let x = CacheMode::try_new(&mut request, Some(&head_block), None)
+        let x = RequestBlocks::try_new(&mut request, Some(&head_block), None)
             .await
             .unwrap_err();
 
@@ -676,12 +609,11 @@ mod test {
             x => panic!("{:?}", x),
         }
 
-        let x = CacheMode::new(&mut request, Some(&head_block), None)
+        let x = RequestBlocks::new(&mut request, Some(&head_block), None)
             .await
             .unwrap();
 
-        // TODO: cache with the head block instead?
-        matches!(x, CacheMode::Never);
+        assert!(matches!(x, RequestBlocks::Point { .. }));
     }
 
     #[test]

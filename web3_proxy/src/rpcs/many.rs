@@ -15,7 +15,6 @@ use ethers::prelude::{TxHash, U64};
 use futures::stream::StreamExt;
 use futures_util::future::join_all;
 use hashbrown::HashMap;
-use http::StatusCode;
 use moka::future::CacheBuilder;
 use parking_lot::RwLock;
 use serde::ser::{SerializeStruct, Serializer};
@@ -24,9 +23,9 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::fmt::{self, Display};
 use std::sync::Arc;
+use tokio::pin;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{sleep_until, Duration, Instant};
-use tokio::{pin, select};
+use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
 /// A collection of web3 connections. Sends requests either the current best server or all servers.
@@ -47,7 +46,7 @@ pub struct Web3Rpcs {
     /// this head receiver makes it easy to wait until there is a new block
     /// this is None if none of the child Rpcs are subscribed to newHeads
     pub(super) watch_head_block: Option<watch::Sender<Option<BlockHeader>>>,
-    /// TODO: this map is going to grow forever unless we do some sort of pruning. maybe store pruned in redis?
+    /// TODO: this map is going to grow forever unless we add pruning.
     /// all blocks, including uncles
     /// TODO: i think uncles should be excluded
     pub(crate) blocks_by_hash: BlocksByHashCache,
@@ -211,8 +210,6 @@ impl Web3Rpcs {
 
         let mut names_to_keep = vec![];
 
-        let server_id = app.config.unique_id;
-
         // turn configs into connections (in parallel)
         let spawn_handles: Vec<_> = rpc_configs
             .into_iter()
@@ -223,8 +220,6 @@ impl Web3Rpcs {
                 }
 
                 let http_client = app.http_client.clone();
-                let vredis_pool = app.vredis_pool.clone();
-
                 let block_and_rpc_sender = if self.watch_head_block.is_some() {
                     Some(self.block_and_rpc_sender.clone())
                 } else {
@@ -239,8 +234,6 @@ impl Web3Rpcs {
 
                 let handle = server_config.clone().spawn(
                     server_name.clone(),
-                    vredis_pool,
-                    server_id,
                     chain_id,
                     block_interval,
                     http_client,
@@ -355,44 +348,7 @@ impl Web3Rpcs {
         &self,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<RpcsForRequest> {
-        let mut watch_consensus_rpcs = self.watch_ranked_rpcs.subscribe();
-
-        loop {
-            // other places check web3_request ttl. i don't think we need a check here too
-            let next_try = match self.try_rpcs_for_request(web3_request).await {
-                Ok(x) => return Ok(x),
-                Err(Web3ProxyError::RateLimited(_, Some(retry_at))) => retry_at,
-                Err(x) => return Err(x),
-            };
-
-            if next_try > web3_request.connect_timeout_at() {
-                let retry_in = Instant::now().duration_since(next_try).as_secs().min(1);
-
-                // we don't use Web3ProxyError::RateLimited because that is for the user being rate limited
-                return Err(Web3ProxyError::StatusCode(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "backend rpcs are all rate limited!".into(),
-                    Some(json!({"retry_in": retry_in})),
-                ));
-            }
-
-            trace!(?next_try, "retry needed");
-
-            // todo!("this must be a bug in our tests. in prod if things are overloaded i could see it happening")
-            debug_assert!(Instant::now() < next_try);
-
-            select! {
-                _ = sleep_until(next_try) => {
-                    // rpcs didn't change and we have waited too long. break to return an error
-                    warn!(?self, "timeout during wait_for_rpcs_for_request!");
-                },
-                _ = watch_consensus_rpcs.changed() => {
-                    // consensus rpcs changed!
-                    // TODO: i don't love that we throw it away
-                    watch_consensus_rpcs.borrow_and_update();
-                }
-            }
-        }
+        self.try_rpcs_for_request(web3_request).await
     }
 
     /// get all rpc servers that are not rate limited
@@ -687,7 +643,7 @@ mod tests {
     #![allow(unused_imports)]
 
     use super::*;
-    use crate::block_number::{BlockNumAndHash, CacheMode};
+    use crate::block_number::{BlockNumAndHash, RequestBlocks};
     use crate::rpcs::blockchain::BlockHeader;
     use crate::rpcs::consensus::ConsensusFinder;
     use arc_swap::ArcSwap;
@@ -1030,7 +986,7 @@ mod tests {
     //     ));
 
     //     /*
-    //     // TODO: bring this back. it is failing because there is no global APP and so things default to not needing caching. no cache checks means we don't know this is a future block
+    //     // TODO: bring this back after internal requests can detect future blocks without a global APP.
     //     // future block should not get a handle
     //     let future_block_num = head_block.as_ref().number.unwrap() + U64::from(10);
     //     let r = ValidatedRequest::new_internal(
@@ -1436,19 +1392,6 @@ mod tests {
     //     .await
     //     .unwrap();
 
-    //     match &r.cache_mode {
-    //         CacheMode::Standard {
-    //             block,
-    //             cache_errors,
-    //         } => {
-    //             assert_eq!(block, &BlockNumAndHash::from(&block_1));
-    //             assert!(cache_errors);
-    //         }
-    //         x => {
-    //             panic!("unexpected CacheMode: {:?}", x);
-    //         }
-    //     }
-
     //     let all_connections = rpcs.all_connections(&r, None, None).await;
 
     //     debug!("all_connections: {:#?}", all_connections);
@@ -1460,8 +1403,7 @@ mod tests {
     //     );
 
     //     // this should give us only the archive server
-    //     // TODO: i think this might have problems because block_1 - 100 isn't a real block and so queries for it will fail. then it falls back to caching with the head block
-    //     // TODO: what if we check if its an archive block while doing cache_mode.
+    //     // TODO: block_1 - 100 is not a real block, so this query can fail.
     //     let r = ValidatedRequest::new_internal(
     //         "eth_getBlockByNumber".to_string(),
     //         &(block_archive.number(), false),
@@ -1470,19 +1412,6 @@ mod tests {
     //     )
     //     .await
     //     .unwrap();
-
-    //     match &r.cache_mode {
-    //         CacheMode::Standard {
-    //             block,
-    //             cache_errors,
-    //         } => {
-    //             assert_eq!(block, &BlockNumAndHash::from(&block_archive));
-    //             assert!(cache_errors);
-    //         }
-    //         x => {
-    //             panic!("unexpected CacheMode: {:?}", x);
-    //         }
-    //     }
 
     //     let all_connections = rpcs.all_connections(&r, None, None).await;
 

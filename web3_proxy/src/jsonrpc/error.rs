@@ -1,3 +1,4 @@
+use ethers::providers::{HttpClientError, JsonRpcError, ProviderError, WsClientError};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -43,6 +44,52 @@ impl From<String> for JsonRpcErrorData {
             code: -32000,
             message: value.into(),
             data: None,
+        }
+    }
+}
+
+impl From<&JsonRpcError> for JsonRpcErrorData {
+    fn from(value: &JsonRpcError) -> Self {
+        Self {
+            code: value.code,
+            message: value.message.clone().into(),
+            data: value.data.clone(),
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a ProviderError> for JsonRpcErrorData {
+    type Error = &'a ProviderError;
+
+    fn try_from(error: &'a ProviderError) -> Result<Self, Self::Error> {
+        match error {
+            provider_error @ ProviderError::JsonRpcClientError(client_error) => client_error
+                .as_error_response()
+                .map(Self::from)
+                .ok_or(provider_error),
+            error => Err(error),
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a HttpClientError> for JsonRpcErrorData {
+    type Error = &'a HttpClientError;
+
+    fn try_from(error: &'a HttpClientError) -> Result<Self, Self::Error> {
+        match error {
+            HttpClientError::JsonRpcError(error) => Ok(error.into()),
+            error => Err(error),
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a WsClientError> for JsonRpcErrorData {
+    type Error = &'a WsClientError;
+
+    fn try_from(error: &'a WsClientError) -> Result<Self, Self::Error> {
+        match error {
+            WsClientError::JsonRpcError(error) => Ok(error.into()),
+            error => Err(error),
         }
     }
 }

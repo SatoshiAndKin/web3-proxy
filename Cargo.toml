@@ -1,13 +1,8 @@
 [workspace]
 members = [
   "deduped_broadcast",
-  "deferred-rate-limiter",
-  "entities",
   "latency",
-  "migration",
-  "payment-contracts",
   "rate-counter",
-  "redis-rate-limiter",
   "web3_proxy",
   "web3_proxy_cli",
 ]

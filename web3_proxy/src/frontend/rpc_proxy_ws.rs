@@ -2,16 +2,14 @@
 //!
 //! WebSockets are the preferred method of receiving requests, but not all clients have good support.
 
-use super::authorization::{ip_is_authorized, key_is_authorized, Authorization};
+use super::authorization::{ip_is_authorized, Authorization};
 use crate::errors::{RequestForError, Web3ProxyError, Web3ProxyResponse};
 use crate::jsonrpc::{self, ParsedResponse, ValidatedRequest};
 use crate::{app::App, errors::Web3ProxyResult, jsonrpc::SingleRequest};
-use axum::headers::{Origin, Referer, UserAgent};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{Path, State},
+    extract::State,
     response::{IntoResponse, Redirect},
-    TypedHeader,
 };
 use axum_client_ip::InsecureClientIp;
 use axum_macros::debug_handler;
@@ -21,9 +19,7 @@ use futures::{
     future::AbortHandle,
     stream::{SplitSink, SplitStream, StreamExt},
 };
-use handlebars::Handlebars;
 use hashbrown::HashMap;
-use http::{HeaderMap, StatusCode};
 use serde_json::json;
 use std::net::IpAddr;
 use std::str::from_utf8_mut;
@@ -56,10 +52,9 @@ pub enum ProxyMode {
 pub async fn websocket_handler(
     State(app): State<Arc<App>>,
     InsecureClientIp(ip): InsecureClientIp,
-    origin: Option<TypedHeader<Origin>>,
     ws_upgrade: Option<WebSocketUpgrade>,
 ) -> Web3ProxyResponse {
-    _websocket_handler(ProxyMode::Best, app, &ip, origin.as_deref(), ws_upgrade).await
+    _websocket_handler(ProxyMode::Best, app, &ip, ws_upgrade).await
 }
 
 /// Public entrypoint for WebSocket JSON-RPC requests that uses all synced servers.
@@ -68,19 +63,11 @@ pub async fn websocket_handler(
 pub async fn fastest_websocket_handler(
     State(app): State<Arc<App>>,
     InsecureClientIp(ip): InsecureClientIp,
-    origin: Option<TypedHeader<Origin>>,
     ws_upgrade: Option<WebSocketUpgrade>,
 ) -> Web3ProxyResponse {
     // TODO: get the fastest number from the url params (default to 0/all)
     // TODO: config to disable this
-    _websocket_handler(
-        ProxyMode::Fastest(0),
-        app,
-        &ip,
-        origin.as_deref(),
-        ws_upgrade,
-    )
-    .await
+    _websocket_handler(ProxyMode::Fastest(0), app, &ip, ws_upgrade).await
 }
 
 /// Public entrypoint for WebSocket JSON-RPC requests that uses all synced servers.
@@ -89,21 +76,19 @@ pub async fn fastest_websocket_handler(
 pub async fn versus_websocket_handler(
     State(app): State<Arc<App>>,
     InsecureClientIp(ip): InsecureClientIp,
-    origin: Option<TypedHeader<Origin>>,
     ws_upgrade: Option<WebSocketUpgrade>,
 ) -> Web3ProxyResponse {
     // TODO: config to disable this
-    _websocket_handler(ProxyMode::Versus, app, &ip, origin.as_deref(), ws_upgrade).await
+    _websocket_handler(ProxyMode::Versus, app, &ip, ws_upgrade).await
 }
 
 async fn _websocket_handler(
     proxy_mode: ProxyMode,
     app: Arc<App>,
     ip: &IpAddr,
-    origin: Option<&Origin>,
     ws_upgrade: Option<WebSocketUpgrade>,
 ) -> Web3ProxyResponse {
-    let authorization = ip_is_authorized(&app, ip, origin, proxy_mode).await?;
+    let authorization = ip_is_authorized(&app, ip, proxy_mode).await?;
 
     let authorization = Arc::new(authorization);
 
@@ -122,184 +107,11 @@ async fn _websocket_handler(
     }
 }
 
-/// Authenticated entrypoint for WebSocket JSON-RPC requests. Web3 wallets use this.
-/// Rate limit and billing based on the api key in the url.
-/// Can optionally authorized based on origin, referer, or user agent.
-#[debug_handler]
-pub async fn websocket_handler_with_key(
-    State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
-    Path(rpc_key): Path<String>,
-    origin: Option<TypedHeader<Origin>>,
-    referer: Option<TypedHeader<Referer>>,
-    user_agent: Option<TypedHeader<UserAgent>>,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> Web3ProxyResponse {
-    _websocket_handler_with_key(
-        ProxyMode::Best,
-        app,
-        &ip,
-        rpc_key,
-        origin.as_deref(),
-        referer.as_deref(),
-        user_agent.as_deref(),
-        ws_upgrade,
-    )
-    .await
-}
-
-#[debug_handler]
-#[allow(clippy::too_many_arguments)]
-pub async fn debug_websocket_handler_with_key(
-    State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
-    Path(rpc_key): Path<String>,
-    origin: Option<TypedHeader<Origin>>,
-    referer: Option<TypedHeader<Referer>>,
-    user_agent: Option<TypedHeader<UserAgent>>,
-    headers: HeaderMap,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> Web3ProxyResponse {
-    let mut response = _websocket_handler_with_key(
-        ProxyMode::Debug,
-        app,
-        &ip,
-        rpc_key,
-        origin.as_deref(),
-        referer.as_deref(),
-        user_agent.as_deref(),
-        ws_upgrade,
-    )
-    .await?;
-
-    // add some headers that might be useful while debugging
-    let response_headers = response.headers_mut();
-
-    if let Some(x) = headers.get("x-amzn-trace-id").cloned() {
-        response_headers.insert("x-amzn-trace-id", x);
-    }
-
-    if let Some(x) = headers.get("x-balance-id").cloned() {
-        response_headers.insert("x-balance-id", x);
-    }
-
-    response_headers.insert("client-ip", ip.to_string().parse().unwrap());
-
-    Ok(response)
-}
-
-#[debug_handler]
-pub async fn fastest_websocket_handler_with_key(
-    State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
-    Path(rpc_key): Path<String>,
-    origin: Option<TypedHeader<Origin>>,
-    referer: Option<TypedHeader<Referer>>,
-    user_agent: Option<TypedHeader<UserAgent>>,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> Web3ProxyResponse {
-    // TODO: get the fastest number from the url params (default to 0/all)
-    _websocket_handler_with_key(
-        ProxyMode::Fastest(0),
-        app,
-        &ip,
-        rpc_key,
-        origin.as_deref(),
-        referer.as_deref(),
-        user_agent.as_deref(),
-        ws_upgrade,
-    )
-    .await
-}
-
-#[debug_handler]
-pub async fn versus_websocket_handler_with_key(
-    State(app): State<Arc<App>>,
-    InsecureClientIp(ip): InsecureClientIp,
-    Path(rpc_key): Path<String>,
-    origin: Option<TypedHeader<Origin>>,
-    referer: Option<TypedHeader<Referer>>,
-    user_agent: Option<TypedHeader<UserAgent>>,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> Web3ProxyResponse {
-    _websocket_handler_with_key(
-        ProxyMode::Versus,
-        app,
-        &ip,
-        rpc_key,
-        origin.as_deref(),
-        referer.as_deref(),
-        user_agent.as_deref(),
-        ws_upgrade,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn _websocket_handler_with_key(
-    proxy_mode: ProxyMode,
-    app: Arc<App>,
-    ip: &IpAddr,
-    rpc_key: String,
-    origin: Option<&Origin>,
-    referer: Option<&Referer>,
-    user_agent: Option<&UserAgent>,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> Web3ProxyResponse {
-    let rpc_key = rpc_key.parse()?;
-
-    let authorization =
-        key_is_authorized(&app, &rpc_key, ip, origin, proxy_mode, referer, user_agent).await?;
-
-    trace!("websocket_handler_with_key {:?}", authorization);
-
-    let authorization = Arc::new(authorization);
-
-    match ws_upgrade {
-        Some(ws_upgrade) => {
-            Ok(ws_upgrade.on_upgrade(move |socket| proxy_web3_socket(app, authorization, socket)))
-        }
-        None => {
-            // if no websocket upgrade, this is probably a user loading the url with their browser
-            match (
-                &app.config.redirect_public_url,
-                &app.config.redirect_rpc_key_url,
-                authorization.checks.rpc_secret_key_id,
-            ) {
-                (None, None, _) => Err(Web3ProxyError::StatusCode(
-                    StatusCode::BAD_REQUEST,
-                    "this page is for rpcs".into(),
-                    None,
-                )),
-                (Some(redirect_public_url), _, None) => {
-                    Ok(Redirect::permanent(redirect_public_url).into_response())
-                }
-                (_, Some(redirect_rpc_key_url), Some(rpc_key_id)) => {
-                    let reg = Handlebars::new();
-
-                    let redirect_rpc_key_url = reg
-                        .render_template(redirect_rpc_key_url, &json!({ "rpc_key_id": rpc_key_id }))
-                        .expect("templating should always work");
-
-                    // this is not a websocket. redirect to a page for this user
-                    Ok(Redirect::permanent(&redirect_rpc_key_url).into_response())
-                }
-                // any other combinations get a simple error
-                _ => Err(Web3ProxyError::StatusCode(
-                    StatusCode::BAD_REQUEST,
-                    "this page is for rpcs".into(),
-                    None,
-                )),
-            }
-        }
-    }
-}
-
 async fn proxy_web3_socket(app: Arc<App>, authorization: Arc<Authorization>, socket: WebSocket) {
     // split the websocket so we can read and write concurrently
     let (ws_tx, ws_rx) = socket.split();
 
-    let buffer = authorization.checks.max_concurrent_requests.unwrap_or(2048) as usize;
+    let buffer = authorization.checks.max_concurrent_requests.unwrap_or(2048);
 
     // create a channel for our reader and writer can communicate. todo: benchmark different channels
     // TODO: this should be bounded. async blocking on too many messages would be fine

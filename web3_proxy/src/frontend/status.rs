@@ -3,7 +3,6 @@
 //! For ease of development, users can currently access these endponts.
 //! They will eventually move to another port.
 
-use super::{ResponseCache, ResponseCacheKey};
 use crate::{
     app::{App, APP_USER_AGENT},
     errors::Web3ProxyError,
@@ -13,7 +12,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Json,
 };
 use axum_client_ip::InsecureClientIp;
 use axum_macros::debug_handler;
@@ -25,7 +24,6 @@ use serde::{ser::SerializeStruct, Serialize};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
-use tracing::trace;
 
 static HEALTH_OK: Lazy<Bytes> = Lazy::new(|| Bytes::from("OK\n"));
 static HEALTH_NOT_OK: Lazy<Bytes> = Lazy::new(|| Bytes::from(":(\n"));
@@ -76,15 +74,8 @@ pub async fn debug_request(
 
 /// Health check page for load balancers to use.
 #[debug_handler]
-pub async fn health(
-    State(app): State<Arc<App>>,
-    Extension(cache): Extension<Arc<ResponseCache>>,
-) -> Result<impl IntoResponse, Web3ProxyError> {
-    let (code, content_type, body) = timeout(
-        Duration::from_secs(1),
-        cache.get_with(ResponseCacheKey::Health, async move { _health(app).await }),
-    )
-    .await?;
+pub async fn health(State(app): State<Arc<App>>) -> Result<impl IntoResponse, Web3ProxyError> {
+    let (code, content_type, body) = timeout(Duration::from_secs(1), _health(app)).await?;
 
     let x = Response::builder()
         .status(code)
@@ -95,11 +86,8 @@ pub async fn health(
     Ok(x)
 }
 
-// TODO: _health doesn't need to be async, but _quick_cache_ttl needs an async function
 #[inline]
 async fn _health(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
-    trace!("health is not cached");
-
     if app.balanced_rpcs.synced() {
         (StatusCode::OK, CONTENT_TYPE_PLAIN, HEALTH_OK.clone())
     } else {
@@ -115,15 +103,8 @@ async fn _health(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
 #[debug_handler]
 pub async fn backups_needed(
     State(app): State<Arc<App>>,
-    Extension(cache): Extension<Arc<ResponseCache>>,
 ) -> Result<impl IntoResponse, Web3ProxyError> {
-    let (code, content_type, body) = timeout(
-        Duration::from_secs(1),
-        cache.get_with(ResponseCacheKey::BackupsNeeded, async move {
-            _backups_needed(app).await
-        }),
-    )
-    .await?;
+    let (code, content_type, body) = timeout(Duration::from_secs(1), _backups_needed(app)).await?;
 
     let x = Response::builder()
         .status(code)
@@ -136,8 +117,6 @@ pub async fn backups_needed(
 
 #[inline]
 async fn _backups_needed(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
-    trace!("backups_needed is not cached");
-
     let code = {
         let consensus_rpcs = app.balanced_rpcs.watch_ranked_rpcs.borrow().clone();
 
@@ -164,15 +143,8 @@ async fn _backups_needed(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
 ///
 /// TODO: replace this with proper stats and monitoring. frontend uses it for their public dashboards though
 #[debug_handler]
-pub async fn status(
-    State(app): State<Arc<App>>,
-    Extension(cache): Extension<Arc<ResponseCache>>,
-) -> Result<impl IntoResponse, Web3ProxyError> {
-    let (code, content_type, body) = timeout(
-        Duration::from_secs(1),
-        cache.get_with(ResponseCacheKey::Status, async move { _status(app).await }),
-    )
-    .await?;
+pub async fn status(State(app): State<Arc<App>>) -> Result<impl IntoResponse, Web3ProxyError> {
+    let (code, content_type, body) = timeout(Duration::from_secs(1), _status(app)).await?;
 
     let x = Response::builder()
         .status(code)
@@ -183,31 +155,23 @@ pub async fn status(
     Ok(x)
 }
 
-// TODO: _status doesn't need to be async, but _quick_cache_ttl needs an async function
 #[inline]
 async fn _status(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
-    trace!("status is not cached");
-
     // TODO: get out of app.balanced_rpcs instead?
     let head_block = app.watch_consensus_head_receiver.borrow().clone();
 
-    // TODO: what else should we include? uptime, cache hit rates, cpu load, memory used
+    // TODO: what else should we include? CPU load and memory use.
     // TODO: the hostname is probably not going to change. only get once at the start?
     let body = json!({
         "balanced_rpcs": app.balanced_rpcs,
         "bundler_4337_rpcs": app.bundler_4337_rpcs,
         "caches": [
             MokaCacheSerializer(&app.ip_semaphores),
-            MokaCacheSerializer(&app.jsonrpc_response_cache),
-            MokaCacheSerializer(&app.rpc_secret_key_cache),
-            MokaCacheSerializer(&app.user_balance_cache.0),
-            MokaCacheSerializer(&app.user_semaphores),
         ],
         "chain_id": app.config.chain_id,
         "head_block_hash": head_block.as_ref().map(|x| x.hash()),
         "head_block_num": head_block.as_ref().map(|x| x.number()),
         "hostname": app.hostname,
-        "payment_factory_address": app.config.deposit_factory_contract,
         "pending_txid_firehose": app.pending_txid_firehose,
         "private_rpcs": app.protected_rpcs,
         "uptime": app.start.elapsed().as_secs(),

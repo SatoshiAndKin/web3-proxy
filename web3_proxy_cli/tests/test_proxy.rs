@@ -10,28 +10,13 @@ use web3_proxy::prelude::http::StatusCode;
 use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::tokio::{self, task::yield_now, time::sleep};
 use web3_proxy::rpcs::blockchain::ArcBlock;
-use web3_proxy_cli::test_utils::{TestAnvil, TestApp, TestMysql};
-
-#[cfg_attr(not(feature = "tests-needing-docker"), ignore)]
-#[test_log::test(tokio::test)]
-async fn it_migrates_the_db() {
-    let a = TestAnvil::spawn(31337).await;
-    let db = TestMysql::spawn().await;
-
-    let x = TestApp::spawn(&a, Some(&db), None, None).await;
-
-    // we call flush stats more to be sure it works than because we expect it to save any stats
-    x.flush_stats_and_wait().await.unwrap();
-
-    // drop x first to avoid spurious warnings about anvil/influx/mysql shutting down before the app
-    drop(x);
-}
+use web3_proxy_cli::test_utils::{TestAnvil, TestApp};
 
 #[test_log::test(tokio::test)]
 async fn it_starts_and_stops() {
     let a = TestAnvil::spawn(31337).await;
 
-    let x = TestApp::spawn(&a, None, None, None).await;
+    let x = TestApp::spawn(&a).await;
 
     let anvil_provider = &a.provider;
     let proxy_provider = &x.proxy_provider;
@@ -46,6 +31,15 @@ async fn it_starts_and_stops() {
     let status_response = reqwest::get(format!("{}status", proxy_url)).await;
     dbg!(&status_response);
     assert_eq!(status_response.unwrap().status(), StatusCode::OK);
+
+    let client = reqwest::Client::new();
+    let removed_key_route = client
+        .post(format!("{}rpc/removed-key", proxy_url))
+        .json(&json!({"jsonrpc": "2.0", "method": "eth_chainId", "id": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed_key_route.status(), StatusCode::NOT_FOUND);
 
     let anvil_result = anvil_provider
         .request::<_, Option<ArcBlock>>("eth_getBlockByNumber", ("latest", false))
@@ -107,11 +101,6 @@ async fn it_starts_and_stops() {
 
     assert_eq!(Some(anvil_result), proxy_result);
 
-    // this won't do anything since stats aren't tracked when there isn't a db
-    let flushed = x.flush_stats_and_wait().await.unwrap();
-    assert_eq!(flushed.relational, 0);
-    assert_eq!(flushed.timeseries, 0);
-
     // most tests won't need to wait, but we should wait here to be sure all the shutdown logic works properly
     x.wait_for_stop();
 }
@@ -126,7 +115,7 @@ async fn it_matches_anvil() {
 
     a.provider.request::<_, U64>("evm_mine", ()).await.unwrap();
 
-    let x = TestApp::spawn(&a, None, None, None).await;
+    let x = TestApp::spawn(&a).await;
 
     let proxy_provider = Http::from_str(x.proxy_provider.url().as_str()).unwrap();
 

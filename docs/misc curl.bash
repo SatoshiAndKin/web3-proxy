@@ -1,13 +1,13 @@
 #!/bin/bash
 set -eux -o pipefail
 
-curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"web3_clientVersion","id":1}' http://127.0.0.1:8544/debug/$dev_rpc_key
-curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}' http://127.0.0.1:8544/debug/$dev_rpc_key
-curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_getBalance", "params": ["0x0000000000000000000000000000000000000000", "latest"],"id":1}' http://127.0.0.1:8544/debug/$dev_rpc_key
+curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"web3_clientVersion","id":1}' http://127.0.0.1:8544/
+curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}' http://127.0.0.1:8544/
+curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_getBalance", "params": ["0x0000000000000000000000000000000000000000", "latest"],"id":1}' http://127.0.0.1:8544/
 
-curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"web3_clientVersion","id":1}' https://eth.llamarpc.com/debug/$prod_rpc_key
-curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}' https://eth.llamarpc.com/debug/$prod_rpc_key
-curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_getBalance", "params": ["0x0000000000000000000000000000000000000000", "latest"],"id":1}' https://eth.llamarpc.com/debug/$prod_rpc_key
+curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"web3_clientVersion","id":1}' https://eth.llamarpc.com/
+curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_blockNumber","id":1}' https://eth.llamarpc.com/
+curl --verbose -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_getBalance", "params": ["0x0000000000000000000000000000000000000000", "latest"],"id":1}' https://eth.llamarpc.com/
 
 # TODO: what chain?
 curl http://127.0.0.1:8544  -X POST \

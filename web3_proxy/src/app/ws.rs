@@ -3,20 +3,17 @@
 use super::App;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::frontend::authorization::RequestOrMethod;
+use crate::jsonrpc::ResponseData;
 use crate::jsonrpc::{self, ValidatedRequest};
-use crate::response_cache::ForwardedResponse;
-use axum::extract::ws::{CloseFrame, Message};
-use deferred_rate_limiter::DeferredRateLimitResult;
+use axum::extract::ws::Message;
 use ethers::types::U64;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
 use futures::stream::StreamExt;
-use http::StatusCode;
 use serde_json::json;
 use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::WatchStream;
 use tracing::{error, trace};
@@ -37,17 +34,6 @@ impl App {
             .ok_or_else(|| {
                 Web3ProxyError::BadRequest("unable to subscribe using these params".into())
             })?;
-
-        // anyone can subscribe to newHeads
-        // only premium users are allowed to subscribe to the other things
-        if !(self.config.free_subscriptions
-            || subscribe_to == "newHeads"
-            || web3_request.authorization.active_premium().await)
-        {
-            return Err(Web3ProxyError::AccessDenied(
-                "eth_subscribe for this event requires an active premium account".into(),
-            ));
-        }
 
         let (subscription_abort_handle, subscription_registration) = AbortHandle::new_pair();
 
@@ -101,16 +87,7 @@ impl App {
                                 break;
                             }
                             Ok(subscription_web3_request) => {
-                                if let Some(close_message) = app
-                                    .rate_limit_close_websocket(&subscription_web3_request)
-                                    .await
-                                {
-                                    // TODO: send them a message so they know they were rate limited
-                                    let _ = response_sender.send(close_message).await;
-                                    break;
-                                }
-
-                                // TODO: make a struct for this? using our SingleForwardedResponse won't work because it needs an id
+                                // TODO: make a response struct for subscription notifications.
                                 let response_json = json!({
                                     "jsonrpc": "2.0",
                                     "method":"eth_subscription",
@@ -124,7 +101,6 @@ impl App {
                                 let response_str = serde_json::to_string(&response_json)
                                     .expect("this should always be valid json");
 
-                                // we could use ForwardedResponse::num_bytes() here, but since we already have the string, this is easier
                                 let response_bytes = response_str.len() as u64;
 
                                 // TODO: do clients support binary messages?
@@ -192,15 +168,6 @@ impl App {
                                         break;
                                     }
                                     Ok(subscription_web3_request) => {
-                                        // check if we should close the websocket connection
-                                        if let Some(close_message) = app
-                                            .rate_limit_close_websocket(&subscription_web3_request)
-                                            .await
-                                        {
-                                            let _ = response_sender.send(close_message).await;
-                                            break;
-                                        }
-
                                         // TODO: make a struct/helper function for this
                                         let response_json = json!({
                                             "jsonrpc": "2.0",
@@ -214,7 +181,6 @@ impl App {
                                         let response_str = serde_json::to_string(&response_json)
                                             .expect("this should always be valid json");
 
-                                        // we could use ForwardedResponse::num_bytes() here, but since we already have the string, this is easier
                                         let response_bytes = response_str.len() as u64;
 
                                         subscription_web3_request.set_response(response_bytes);
@@ -252,7 +218,7 @@ impl App {
 
         // TODO: do something with subscription_join_handle?
 
-        let response_data = ForwardedResponse::from(json!(subscription_id));
+        let response_data = ResponseData::from(json!(subscription_id));
 
         let response =
             jsonrpc::ParsedResponse::from_response_data(response_data, web3_request.id());
@@ -265,52 +231,5 @@ impl App {
 
         // TODO: make a `SubscriptonHandle(AbortHandle, JoinHandle)` struct?
         Ok((subscription_abort_handle, response))
-    }
-
-    async fn rate_limit_close_websocket(&self, web3_request: &ValidatedRequest) -> Option<Message> {
-        let authorization = &web3_request.authorization;
-
-        if !authorization.active_premium().await {
-            if let Some(rate_limiter) = &self.frontend_public_rate_limiter {
-                match rate_limiter
-                    .throttle(
-                        authorization.ip,
-                        authorization.checks.max_requests_per_period,
-                        1,
-                    )
-                    .await
-                {
-                    Ok(DeferredRateLimitResult::RetryNever) => {
-                        let close_frame = CloseFrame {
-                            code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                            reason:
-                                "rate limited. upgrade to premium for unlimited websocket messages"
-                                    .into(),
-                        };
-
-                        return Some(Message::Close(Some(close_frame)));
-                    }
-                    Ok(DeferredRateLimitResult::RetryAt(retry_at)) => {
-                        let retry_at = retry_at.duration_since(Instant::now());
-
-                        let reason = format!("rate limited. upgrade to premium for unlimited websocket messages. retry in {}s", retry_at.as_secs_f32());
-
-                        let close_frame = CloseFrame {
-                            code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                            reason: reason.into(),
-                        };
-
-                        return Some(Message::Close(Some(close_frame)));
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        // this an internal error of some kind, not the rate limit being hit
-                        error!(?err, "rate limiter is unhappy. allowing ip");
-                    }
-                }
-            }
-        }
-
-        None
     }
 }

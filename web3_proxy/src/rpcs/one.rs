@@ -16,11 +16,9 @@ use ethers::prelude::{Address, Bytes, Middleware, Transaction, TxHash, U256, U64
 use futures::future::select_all;
 use futures::StreamExt;
 use latency::{EwmaLatency, PeakEwmaLatency, RollingQuantileLatency};
-use migration::sea_orm::DatabaseConnection;
 use nanorand::tls::TlsWyRand;
 use nanorand::Rng;
 use parking_lot::RwLock;
-use redis_rate_limiter::{RedisPool, RedisRateLimitResult, RedisRateLimiter};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use serde_json::json;
@@ -46,7 +44,6 @@ pub struct Web3Rpc {
     pub client_version: RwLock<Option<String>>,
     pub block_interval: Duration,
     pub display_name: Option<String>,
-    pub db_conn: Option<DatabaseConnection>,
 
     /// Track in-flight requests
     pub(super) active_requests: AtomicUsize,
@@ -67,9 +64,6 @@ pub struct Web3Rpc {
     /// keep track of hard limits
     /// hard_limit_until is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) hard_limit_until: Option<watch::Sender<Instant>>,
-    /// rate limits are stored in a central redis so that multiple proxies can share their rate limits
-    /// We do not use the deferred rate limiter because going over limits would cause errors
-    pub(super) hard_limit: Option<RedisRateLimiter>,
     /// used for ensuring enough requests are available before advancing the head block
     pub(super) soft_limit: u32,
     /// use web3 queries to find the block data limit for archive/pruned nodes
@@ -118,8 +112,6 @@ impl Web3Rpc {
         chain_id: u64,
         // optional because this is only used for http providers. websocket-only providers don't use it
         http_client: Option<reqwest::Client>,
-        redis_pool: Option<RedisPool>,
-        server_id: i64,
         block_interval: Duration,
         block_map: BlocksByHashCache,
         block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
@@ -127,34 +119,6 @@ impl Web3Rpc {
         max_head_block_age: Duration,
     ) -> anyhow::Result<(Arc<Web3Rpc>, Web3ProxyJoinHandle<()>)> {
         let created_at = Instant::now();
-
-        let hard_limit = match (config.hard_limit, redis_pool) {
-            (None, None) => None,
-            (Some(hard_limit), Some(redis_pool)) => {
-                let label = if config.hard_limit_per_endpoint {
-                    format!("{}:{}:{}", chain_id, "endpoint", name)
-                } else {
-                    format!("{}:{}:{}", chain_id, server_id, name)
-                };
-
-                // TODO: in process rate limiter instead? or maybe deferred? or is this good enough?
-                let rrl = RedisRateLimiter::new(
-                    "web3_proxy",
-                    &label,
-                    hard_limit,
-                    config.hard_limit_period as f32,
-                    redis_pool,
-                );
-
-                Some(rrl)
-            }
-            (None, Some(_)) => None,
-            (Some(_hard_limit), None) => {
-                return Err(anyhow::anyhow!(
-                    "no redis client pool! needed for hard limit"
-                ))
-            }
-        };
 
         let backup = config.backup;
 
@@ -226,7 +190,6 @@ impl Web3Rpc {
             chain_id,
             created_at: Some(created_at),
             display_name: config.display_name,
-            hard_limit,
             hard_limit_until: Some(hard_limit_until),
             head_block_sender: Some(head_block),
             http_url,
@@ -1084,81 +1047,18 @@ impl Web3Rpc {
         Err(Web3ProxyError::NoServersSynced)
     }
 
-    async fn wait_for_throttle(self: &Arc<Self>, wait_until: Instant) -> Web3ProxyResult<u64> {
-        loop {
-            match self.try_throttle().await? {
-                RedisRateLimitResult::Allowed(y) => return Ok(y),
-                RedisRateLimitResult::RetryAt(retry_at, _) => {
-                    if wait_until < retry_at {
-                        break;
-                    }
-
-                    if retry_at < Instant::now() {
-                        // TODO: think more about this
-                        error!(
-                            "retry_at is in the past {}s",
-                            retry_at.elapsed().as_secs_f32()
-                        );
-                        sleep(Duration::from_millis(200)).await;
-                    } else {
-                        sleep_until(retry_at).await;
-                    }
-                }
-                RedisRateLimitResult::RetryNever => {
-                    // TODO: not sure what this should be
-                    return Err(Web3ProxyError::Timeout(None));
-                }
-            }
-        }
-
-        // TODO: not sure what this should be. maybe if when we convert to JSON we can set it?
-        Err(Web3ProxyError::Timeout(None))
-    }
-
-    async fn try_throttle(self: &Arc<Self>) -> Web3ProxyResult<RedisRateLimitResult> {
-        // check cached rate limits
+    async fn wait_for_throttle(self: &Arc<Self>, wait_until: Instant) -> Web3ProxyResult<()> {
         let now = Instant::now();
-        let hard_limit_until = self.next_available(now);
-
-        if now < hard_limit_until {
-            return Ok(RedisRateLimitResult::RetryAt(hard_limit_until, u64::MAX));
+        let retry_at = self.next_available(now);
+        if retry_at > wait_until {
+            return Err(Web3ProxyError::Timeout(None));
         }
 
-        // check shared rate limits
-        if let Some(ratelimiter) = self.hard_limit.as_ref() {
-            // TODO: how should we know if we should set expire or not?
-            match ratelimiter
-                .throttle()
-                .await
-                .context(format!("attempting to throttle {}", self))?
-            {
-                x @ RedisRateLimitResult::Allowed(_) => Ok(x),
-                RedisRateLimitResult::RetryAt(retry_at, count) => {
-                    // rate limit gave us a wait time
-                    // if not a backup server, warn. backups hit rate limits often
-                    if !self.backup {
-                        let when = retry_at.duration_since(Instant::now());
-                        warn!(
-                            retry_ms=%when.as_millis(),
-                            "Exhausted rate limit on {}",
-                            self,
-                        );
-                    }
-
-                    if let Some(hard_limit_until) = self.hard_limit_until.as_ref() {
-                        hard_limit_until.send_replace(retry_at);
-                    }
-
-                    Ok(RedisRateLimitResult::RetryAt(retry_at, count))
-                }
-                x @ RedisRateLimitResult::RetryNever => {
-                    error!("how did retry never on {} happen?", self);
-                    Ok(x)
-                }
-            }
-        } else {
-            Ok(RedisRateLimitResult::Allowed(u64::MAX))
+        if retry_at > now {
+            sleep_until(retry_at).await;
         }
+
+        Ok(())
     }
 
     pub async fn try_request_handle(
@@ -1258,17 +1158,11 @@ impl Web3Rpc {
             }
         }
 
-        // check rate limits
-        match self.try_throttle().await? {
-            RedisRateLimitResult::Allowed(_) => {}
-            RedisRateLimitResult::RetryAt(retry_at, _) => {
-                return Ok(OpenRequestResult::RetryAt(retry_at));
-            }
-            RedisRateLimitResult::RetryNever => {
-                warn!("how did retry never on {} happen?", self);
-                return Ok(OpenRequestResult::Failed);
-            }
-        };
+        let now = Instant::now();
+        let retry_at = self.next_available(now);
+        if retry_at > now {
+            return Ok(OpenRequestResult::RetryAt(retry_at));
+        }
 
         let handle =
             OpenRequestHandle::new(web3_request.clone(), self.clone(), error_handler).await;
@@ -1588,7 +1482,6 @@ mod tests {
 
         let x = Web3Rpc {
             name: "name".to_string(),
-            db_conn: None,
             display_name: None,
             url: "ws://example.com".to_string(),
             http_client: None,

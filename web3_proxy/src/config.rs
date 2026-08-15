@@ -1,13 +1,9 @@
 use crate::app::Web3ProxyJoinHandle;
-use crate::compute_units::default_usd_per_cu;
 use crate::rpcs::blockchain::{BlockHeader, BlocksByHashCache};
 use crate::rpcs::one::Web3Rpc;
-use argh::FromArgs;
 use deduped_broadcast::DedupedBroadcaster;
-use ethers::prelude::{Address, TxHash};
-use ethers::types::{U256, U64};
+use ethers::types::{TxHash, U256, U64};
 use hashbrown::HashMap;
-use migration::sea_orm::prelude::Decimal;
 use sentry::types::Dsn;
 use serde::{de, Deserialize, Deserializer};
 use serde_inline_default::serde_inline_default;
@@ -20,32 +16,6 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 pub type BlockAndRpc = (Option<BlockHeader>, Arc<Web3Rpc>);
-pub type TxHashAndRpc = (TxHash, Arc<Web3Rpc>);
-
-#[derive(Debug, FromArgs)]
-/// Web3_proxy is a fast caching and load balancing proxy for web3 (Ethereum or similar) JsonRPC servers.
-pub struct CliConfig {
-    /// path to a toml of rpc servers
-    #[argh(option, default = "\"./config/development.toml\".to_string()")]
-    pub config: String,
-
-    /// what port the proxy should listen on
-    #[argh(option, default = "8544")]
-    pub port: u16,
-
-    /// what port the proxy should expose prometheus stats on
-    #[argh(option, default = "8543")]
-    pub prometheus_port: u16,
-
-    /// number of worker threads. Defaults to the number of logical processors
-    #[argh(option, default = "0")]
-    pub workers: usize,
-
-    /// path to a binary file used to encrypt cookies. Should be at least 64 bytes.
-    #[argh(option, default = "\"./data/development_cookie_key\".to_string()")]
-    pub cookie_key_filename: String,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct TopConfig {
     pub app: AppConfig,
@@ -78,72 +48,14 @@ impl TopConfig {
 #[serde_inline_default]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
-    /// Request limit for allowed origins for anonymous users.
-    /// These requests get rate limited by IP.
-    #[serde(default = "Default::default")]
-    pub allowed_origin_requests_per_period: HashMap<String, u64>,
-
     /// erigon defaults to pruning beyond 90,000 blocks
     #[serde_inline_default(90_000u64)]
     pub archive_depth: u64,
-
-    /// pool of extra connections allowed for authenticated users
-    #[serde_inline_default(0usize)]
-    pub bonus_premium_concurrency: usize,
-    /// pool of extra connections allowed for anonymous users
-    #[serde_inline_default(0usize)]
-    pub bonus_public_concurrency: usize,
-
-    /// pool of extra requests per second allowed for authenticaed users
-    #[serde_inline_default(0u64)]
-    pub bonus_frontend_public_rate_limit: u64,
-
-    #[serde_inline_default(0u64)]
-    pub bonus_frontend_premium_rate_limit: u64,
 
     /// EVM chain id. 1 for ETH
     /// TODO: better type for chain_id? max of `u64::MAX / 2 - 36` <https://github.com/ethereum/EIPs/issues/2294>
     #[serde_inline_default(1u64)]
     pub chain_id: u64,
-
-    /// Cost per computational unit
-    // pub cost_per_cu: Decimal,
-
-    /// Database is used for user data.
-    /// Currently supports mysql or compatible backend.
-    pub db_url: Option<String>,
-
-    /// minimum size of the connection pool for the database.
-    /// If none, the number of workers are used.
-    pub db_min_connections: Option<u32>,
-
-    /// maximum size of the connection pool for the database.
-    /// If none, the minimum * 2 is used.
-    pub db_max_connections: Option<u32>,
-
-    /// Read-only replica of db_url.
-    pub db_replica_url: Option<String>,
-
-    /// minimum size of the connection pool for the database replica.
-    /// If none, db_min_connections is used.
-    pub db_replica_min_connections: Option<u32>,
-
-    /// maximum size of the connection pool for the database replica.
-    /// If none, db_max_connections is used.
-    pub db_replica_max_connections: Option<u32>,
-
-    /// Default request limit for registered users.
-    /// 0 = block all requests
-    /// None = allow all requests
-    pub default_user_max_requests_per_period: Option<u64>,
-
-    /// Default ERC address for out deposit contract
-    pub deposit_factory_contract: Option<Address>,
-
-    /// True if anonymous users should be able to eth_subscribe
-    /// newHeads is always allowed because that is cheap to send
-    #[serde_inline_default(false)]
-    pub free_subscriptions: bool,
 
     /// minimum amount to increase eth_estimateGas results
     pub gas_increase_min: Option<U256>,
@@ -151,30 +63,15 @@ pub struct AppConfig {
     /// percentage to increase eth_estimateGas results. 100 == 100%
     pub gas_increase_percent: Option<U256>,
 
-    /// bearer token for internal requests. keep this secret
-    pub internal_bearer_token: Option<String>,
-
-    /// Restrict user registration.
-    /// None = no code needed
-    pub invite_code: Option<String>,
-
     /// Optional kafka brokers
-    /// Used by /debug/:rpc_key urls for logging requests and responses. No other endpoints log request/response data.
+    /// Used for optional Kafka request logging.
     pub kafka_urls: Option<String>,
 
     #[serde_inline_default("ssl".to_string())]
     pub kafka_protocol: String,
 
-    /// domain in sign-in-with-ethereum messages
-    pub login_domain: Option<String>,
-
     /// do not serve any requests if the best known block is behind the best known block by more than this many blocks.
     pub max_head_block_lag: Option<U64>,
-
-    /// Rate limit for the login entrypoint.
-    /// This is separate from the rpc limits.
-    #[serde_inline_default(10u64)]
-    pub login_rate_limit_per_period: u64,
 
     /// The soft limit prevents thundering herds as new blocks are seen.
     #[serde_inline_default(1u32)]
@@ -189,23 +86,8 @@ pub struct AppConfig {
     /// None = allow all requests
     pub public_max_concurrent_requests: Option<usize>,
 
-    /// Request limit for anonymous users.
-    /// Some(0) = block all requests
-    /// None = allow all requests
-    pub public_requests_per_period: Option<u64>,
-
-    /// Salt for hashing recent ips. Not a perfect way to introduce privacy, but better than nothing
-    pub public_recent_ips_salt: Option<String>,
-
-    /// RPC responses are cached locally
-    #[serde_inline_default(10u64.pow(8))]
-    pub response_cache_max_bytes: u64,
-
     /// the stats page url for an anonymous user.
     pub redirect_public_url: Option<String>,
-
-    /// the stats page url for a logged in user. if set, must contain "{rpc_key_id}"
-    pub redirect_rpc_key_url: Option<String>,
 
     /// optional script to run before shutting the frontend down.
     /// this is useful for keeping load balancers happy.
@@ -226,42 +108,6 @@ pub struct AppConfig {
     /// Optionally send errors to <https://sentry.io>
     pub sentry_url: Option<Dsn>,
 
-    /// Stripe api key for checking validity of webhooks
-    pub stripe_whsec_key: Option<String>,
-
-    pub usd_per_cu: Option<Decimal>,
-
-    /// Track rate limits in a redis (or compatible backend)
-    /// It is okay if this data is lost.
-    pub volatile_redis_url: Option<String>,
-
-    /// maximum size of the connection pool for the cache
-    /// If none, workers * 2 is used
-    pub volatile_redis_max_connections: Option<usize>,
-
-    /// influxdb host for stats
-    pub influxdb_host: Option<String>,
-
-    /// influxdb org for stats
-    pub influxdb_org: Option<String>,
-
-    /// influxdb token for stats
-    pub influxdb_token: Option<String>,
-
-    /// influxdb bucket to use for stats
-    pub influxdb_bucket: Option<String>,
-
-    /// unique_id keeps stats from different servers being seen as duplicates of each other.
-    /// this int is used as part of the "nanoseconds" part of the influx timestamp.
-    /// it can also be used by the rate limiter.
-    ///
-    /// This **MUST** be set to a unique value for each running server.
-    /// If not set, severs will overwrite eachother's stats!
-    ///
-    /// <https://docs.influxdata.com/influxdb/v2.0/write-data/best-practices/duplicate-points/#increment-the-timestamp>
-    #[serde_inline_default(0i64)]
-    pub unique_id: i64,
-
     /// unknown config options get put here
     #[serde(flatten, default = "HashMap::default")]
     pub extra: HashMap<String, serde_json::Value>,
@@ -276,14 +122,6 @@ impl Default for AppConfig {
 impl AppConfig {
     /// TODO: this should probably be part of Deserialize
     fn clean(&mut self) {
-        if self.usd_per_cu.is_none() {
-            self.usd_per_cu = Some(default_usd_per_cu(self.chain_id));
-        }
-
-        if let Some(influxdb_id) = self.extra.get("influxdb_id") {
-            self.unique_id = influxdb_id.as_i64().unwrap();
-        }
-
         if !self.extra.is_empty() {
             warn!(
                 extra=?self.extra.keys(),
@@ -404,15 +242,6 @@ pub struct Web3RpcConfig {
     pub disabled: bool,
     /// a name used in /status and other user facing messages
     pub display_name: Option<String>,
-    /// the requests per period at which the server throws errors (rate limit or otherwise)
-    pub hard_limit: Option<u64>,
-    /// the number of seconds in a rate limiting period
-    /// some providers allow burst limits and rolling windows, but coding that is a lot more complicated
-    #[serde_inline_default(1u32)]
-    pub hard_limit_period: u32,
-    /// if hard limits are applied per server or per endpoint. default is per server
-    #[serde(default = "Default::default")]
-    pub hard_limit_per_endpoint: bool,
     /// while not absolutely required, a http:// or https:// connection will allow erigon to stream JSON
     pub http_url: Option<String>,
     /// while not absolutely required, a ipc connection should be fastest
@@ -444,8 +273,6 @@ impl Web3RpcConfig {
     pub async fn spawn(
         self,
         name: String,
-        redis_pool: Option<redis_rate_limiter::RedisPool>,
-        server_id: i64,
         chain_id: u64,
         block_interval: Duration,
         http_client: Option<reqwest::Client>,
@@ -464,8 +291,6 @@ impl Web3RpcConfig {
             name,
             chain_id,
             http_client,
-            redis_pool,
-            server_id,
             block_interval,
             blocks_by_hash_cache,
             block_and_rpc_sender,

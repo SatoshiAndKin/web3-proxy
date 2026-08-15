@@ -6,7 +6,6 @@ use std::{fs, thread};
 use tracing::{error, info, trace, warn};
 use web3_proxy::app::App;
 use web3_proxy::config::TopConfig;
-use web3_proxy::globals::global_db_conn;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::futures::StreamExt;
@@ -14,11 +13,10 @@ use web3_proxy::prelude::num::Zero;
 use web3_proxy::prelude::tokio;
 use web3_proxy::prelude::tokio::process::Command;
 use web3_proxy::prelude::tokio::signal::unix::SignalKind;
-use web3_proxy::prelude::tokio::sync::{broadcast, mpsc, oneshot};
+use web3_proxy::prelude::tokio::sync::broadcast;
 use web3_proxy::prelude::tokio::time::{sleep_until, Instant};
 use web3_proxy::prelude::tokio::{select, signal};
 use web3_proxy::prelude::toml;
-use web3_proxy::stats::FlushedStats;
 use web3_proxy::{frontend, prometheus};
 
 /// start the main proxy daemon
@@ -36,43 +34,29 @@ pub struct ProxydSubCommand {
 }
 
 impl ProxydSubCommand {
-    pub async fn main(
-        self,
-        top_config: TopConfig,
-        top_config_path: PathBuf,
-        num_workers: usize,
-    ) -> anyhow::Result<()> {
+    pub async fn main(self, top_config: TopConfig, top_config_path: PathBuf) -> anyhow::Result<()> {
         let (frontend_shutdown_sender, _) = broadcast::channel(1);
         // TODO: i think there is a small race. if config_path changes
 
         let frontend_port = Arc::new(self.port.into());
         let prometheus_port = Arc::new(self.prometheus_port.into());
-        let (flush_stat_buffer_sender, flush_stat_buffer_receiver) = mpsc::channel(8);
-
         Self::_main(
             top_config,
             Some(top_config_path),
             frontend_port,
             prometheus_port,
-            num_workers,
             frontend_shutdown_sender,
-            flush_stat_buffer_sender,
-            flush_stat_buffer_receiver,
         )
         .await
     }
 
     /// this shouldn't really be pub except it makes test fixtures easier
-    #[allow(clippy::too_many_arguments)]
     pub async fn _main(
         top_config: TopConfig,
         top_config_path: Option<PathBuf>,
         frontend_port: Arc<AtomicU16>,
         prometheus_port: Arc<AtomicU16>,
-        num_workers: usize,
         frontend_shutdown_sender: broadcast::Sender<()>,
-        flush_stat_buffer_sender: mpsc::Sender<oneshot::Sender<FlushedStats>>,
-        flush_stat_buffer_receiver: mpsc::Receiver<oneshot::Sender<FlushedStats>>,
     ) -> anyhow::Result<()> {
         let mut terminate_stream = signal::unix::signal(SignalKind::terminate())?;
 
@@ -93,10 +77,7 @@ impl ProxydSubCommand {
             frontend_port,
             prometheus_port,
             top_config.clone(),
-            num_workers,
             app_shutdown_sender.clone(),
-            flush_stat_buffer_sender,
-            flush_stat_buffer_receiver,
         )
         .await?;
 
@@ -158,10 +139,6 @@ impl ProxydSubCommand {
             spawned_app.app.clone(),
             prometheus_shutdown_receiver,
         ));
-
-        if spawned_app.app.config.db_url.is_some() {
-            // give 30 seconds for the db to connect. if it does not connect, it will keep retrying
-        }
 
         info!("waiting up to 60 seconds for a head block");
         let max_wait_until = Instant::now() + Duration::from_secs(60);
@@ -353,18 +330,6 @@ impl ProxydSubCommand {
                     continue;
                 }
             }
-        }
-
-        // TODO: make sure this happens even if we exit with an error
-        if let Ok(db_conn) = global_db_conn() {
-            /*
-            From the sqlx docs:
-
-            We recommend calling .close().await to gracefully close the pool and its connections when you are done using it.
-            This will also wake any tasks that are waiting on an .acquire() call,
-            so for long-lived applications it’s a good idea to call .close() during shutdown.
-            */
-            db_conn.close().await?;
         }
 
         if background_errors.is_zero() && !exited_with_err {
