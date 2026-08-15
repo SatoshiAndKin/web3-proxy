@@ -2,7 +2,8 @@ use crate::app::App;
 use crate::frontend::authorization::{Authorization, RequestOrMethod};
 use core::fmt;
 use ethers::types::U64;
-use rdkafka::message::{Header as KafkaHeader, OwnedHeaders as KafkaOwnedHeaders, OwnedMessage};
+use rdkafka::message::{Header as KafkaHeader, OwnedHeaders as KafkaOwnedHeaders};
+use rdkafka::producer::future_producer::OwnedDeliveryResult;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout as KafkaTimeout;
 use std::sync::atomic::{self, AtomicUsize};
@@ -29,7 +30,7 @@ impl fmt::Debug for KafkaDebugLogger {
     }
 }
 
-type KafkaLogResult = Result<(i32, i64), (rdkafka::error::KafkaError, OwnedMessage)>;
+type KafkaLogResult = OwnedDeliveryResult;
 
 impl KafkaDebugLogger {
     pub fn try_new(
@@ -37,11 +38,14 @@ impl KafkaDebugLogger {
         authorization: Arc<Authorization>,
         head_block_num: Option<U64>,
         kafka_topic: &str,
-        request_id: &str,
+        request_id: Option<&str>,
     ) -> Option<Arc<Self>> {
         let kafka_producer = app.kafka_producer.clone()?;
 
         let kafka_topic = kafka_topic.to_string();
+        let request_id = request_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| Ulid::generate().to_string());
 
         let kafka_key = request_id.as_bytes().to_vec();
 
@@ -59,7 +63,7 @@ impl KafkaDebugLogger {
             })
             .insert(KafkaHeader {
                 key: "request_id",
-                value: Some(request_id),
+                value: Some(&request_id),
             })
             .insert(KafkaHeader {
                 key: "head_block_num",

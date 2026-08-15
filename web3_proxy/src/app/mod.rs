@@ -588,11 +588,7 @@ impl App {
 
         // TODO: helper for doing parsed() inside a response?
         if let Ok(SingleResponse::Stream(x)) = response {
-            response = x
-                .read()
-                .await
-                .map(SingleResponse::Parsed)
-                .map_err(Into::into);
+            response = x.read().await.map(SingleResponse::Parsed);
         }
 
         let mut response = response.try_into()?;
@@ -933,7 +929,7 @@ impl App {
 
                 // TODO: helper for doing parsed() inside a result?
                 if let Ok(SingleResponse::Stream(x)) = result {
-                    result = x.read().await.map(SingleResponse::Parsed).map_err(Into::into);
+                    result = x.read().await.map(SingleResponse::Parsed);
                 }
 
                 // if we got "null" or "", it is probably because the tx is old. retry on nodes with old block data

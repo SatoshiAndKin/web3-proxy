@@ -7,7 +7,6 @@ use crate::jsonrpc::ValidatedRequest;
 use crate::rpcs::request::OpenRequestResult;
 use async_stream::stream;
 use base64::engine::general_purpose;
-use derive_more::Constructor;
 use ethers::prelude::{H256, U64};
 use futures::future::select_all;
 use futures::Stream;
@@ -24,7 +23,7 @@ use tokio::select;
 use tokio::time::{sleep_until, Instant};
 use tracing::{debug, enabled, error, info, trace, warn, Level};
 
-#[derive(Constructor, Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RpcRanking {
     backup: bool,
     /// note: the servers in this tier might have blocks higher than this
@@ -298,7 +297,7 @@ impl RankedRpcs {
         }
     }
 
-    pub fn all(&self) -> hashbrown::hash_set::Iter<Arc<Web3Rpc>> {
+    pub fn all(&self) -> hashbrown::hash_set::Iter<'_, Arc<Web3Rpc>> {
         self.inner.iter()
     }
 

@@ -8,7 +8,7 @@ use anyhow::Context;
 use derive_more::From;
 use ethers::providers::ProviderError;
 use futures::Future;
-use http::StatusCode;
+use reqwest::StatusCode;
 use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::Arc;

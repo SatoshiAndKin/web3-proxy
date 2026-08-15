@@ -29,7 +29,6 @@ use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 use {
     crate::{jsonrpc, kafka::KafkaDebugLogger},
     tracing::warn,
-    ulid::Ulid,
 };
 
 #[derive(Derivative)]
@@ -358,7 +357,7 @@ impl ValidatedRequest {
                 authorization.clone(),
                 head_block.as_ref().map(|x| x.number()),
                 "web3_proxy:rpc",
-                &request_id,
+                request_id.as_deref(),
             )
         } else {
             None

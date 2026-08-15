@@ -105,7 +105,7 @@ impl App {
 
                                 // TODO: do clients support binary messages?
                                 // TODO: can we check a content type header?
-                                let response_msg = Message::Text(response_str);
+                                let response_msg = Message::Text(response_str.into());
 
                                 if response_sender.send(response_msg).await.is_err() {
                                     // TODO: increment error_response? i don't think so. i think this will happen once every time a client disconnects.
@@ -187,7 +187,7 @@ impl App {
 
                                         // TODO: do clients support binary messages?
                                         // TODO: can we check a content type header?
-                                        let response_msg = Message::Text(response_str);
+                                        let response_msg = Message::Text(response_str.into());
 
                                         if response_sender.send(response_msg).await.is_err() {
                                             // TODO: increment error_response? i don't think so. i think this will happen once every time a client disconnects.

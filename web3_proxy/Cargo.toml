@@ -9,7 +9,8 @@ edition = "2021"
 default = []
 
 mimalloc = ["dep:mimalloc"]
-rdkafka-src = ["dep:rdkafka", "rdkafka/cmake-build", "rdkafka/ssl-vendored"]
+rdkafka = ["dep:rdkafka"]
+rdkafka-src = ["rdkafka", "rdkafka/cmake-build", "rdkafka/ssl-vendored"]
 tests-needing-docker = []
 
 [dependencies]
@@ -21,54 +22,53 @@ anyhow = { version = "1.0.104", features = ["backtrace"] }
 arc-swap = { version = "1.9.2" }
 argh = "0.1.19"
 async-stream = "0.3.6"
-axum = { version = "0.6.20", features = ["headers", "tracing", "ws"] }
-axum-client-ip = "0.4.2"
-axum-macros = "0.3.8"
-base64 = "0.21.7"
+axum = { version = "0.8.9", features = ["tracing", "ws"] }
+axum-client-ip = "0.7.0"
+axum-macros = "0.5.1"
+base64 = "0.23.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 derivative = "2.2.0"
-derive_more = { version = "0.99.20", features = ["nightly"] }
+derive_more = { version = "2.1.1", features = ["display", "error", "from"] }
 ethers = { version = "2.0.14", default-features = false, features = ["rustls", "ws"] }
 fdlimit = "0.3.0"
 fstrings = "0.2"
 futures = { version = "0.3.34" }
 futures-util = "0.3.34"
 glob = "0.3.4"
-handlebars = "4.5.0"
-hashbrown = { version = "0.14.5", features = ["serde", "nightly"] }
+handlebars = "6.4.4"
+hashbrown = { version = "0.17.1", features = ["serde", "nightly"] }
 hdrhistogram = "7.6.0"
-hostname = "0.3.1"
-http = "0.2.12"
-hyper = { version = "0.14.32", features = ["full", "nightly"] }
-itertools = "0.12.1"
+hostname = "0.4.2"
+http = "1.5.0"
+itertools = "0.15.0"
 listenfd = { version = "1.0.2", optional = true }
 mimalloc = { version = "0.1.52", optional = true }
 moka = { version = "0.12.16", default-features = false, features = ["atomic64", "future", "quanta"] }
-nanorand = { version = "0.7.0", default-features = false, features = ["std", "tls", "wyrand"] }
+nanorand = { version = "0.8.0", default-features = false, features = ["std", "tls", "wyrand"] }
 num = { version = "0.4.3" }
 num-traits = "0.2.19"
 once_cell = { version = "1.21.4" }
-ordered-float = {version = "4.6.0" }
+ordered-float = {version = "5.3.0" }
 pagerduty-rs = { version = "0.1.6", default-features = false, features = ["async", "rustls", "sync"] }
 parking_lot = { version = "0.12.5", features = ["arc_lock", "nightly"] }
-rdkafka = { version = "0.36.2", default-features = false, features = ["tokio", "tracing"], optional = true }
+rdkafka = { version = "0.39.0", default-features = false, features = ["tokio", "tracing"], optional = true }
 reqwest = { version = "0.11.27", default-features = false, features = ["json", "rustls", "stream"] }
-sentry = { version = "0.31.8", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "reqwest", "rustls", "serde_json", "tracing"] }
-sentry-tracing = "0.31.8"
+sentry = { version = "0.49.1", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "reqwest", "rustls", "serde_json", "tracing"] }
+sentry-tracing = "0.49.1"
 serde = { version = "1.0.229", features = ["rc"] }
-serde-inline-default = "0.1.1"
+serde-inline-default = "1.0.2"
 serde_json = { version = "1.0.151", default-features = false, features = ["raw_value"] }
-strum = { version = "0.25.0", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 time = { version = "0.3" }
 tokio = { version = "1.53.1", features = ["full", "tracing"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
-toml = "0.8.23"
-tower-http = { version = "0.4.4", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }
+toml = "1.1.4"
+tower-http = { version = "0.7.0", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tracing = "0.1"
-ulid = { version = "1.2.1", features = ["rand", "uuid", "serde"] }
+ulid = { version = "3.0.0", features = ["uuid", "serde"] }
 url = { version = "2.5.8" }
 
 # TODO: why doesn't this work in dev-dependencies. i think because of how we split web3_proxy and web3_proxy_cli. im not sure that is even helping anymore
@@ -78,7 +78,7 @@ test-log = { version = "0.2.21", default-features = false, features = ["trace"] 
 # check-if-email-exists = "0.9.0"
 
 [dev-dependencies]
-env_logger = { version ="0.10", default-features = true, features = ["auto-color"] }
+env_logger = { version ="0.11", default-features = true, features = ["auto-color"] }
 tokio = { version = "1.53.1", default-features = false, features = ["full", "test-util"] }
 tracing = {version = "0.1", default-features = false}
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}

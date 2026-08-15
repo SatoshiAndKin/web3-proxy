@@ -1,11 +1,11 @@
 use axum::extract::State;
-use axum::headers::HeaderName;
-use axum::http::HeaderValue;
+use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -25,12 +25,10 @@ pub async fn serve(
     // TODO: config for the host?
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    let service = router.into_make_service();
+    let listener = TcpListener::bind(addr).await?;
+    let server = axum::serve(listener, router.into_make_service());
 
-    // `axum::Server` is a re-export of `hyper::Server`
-    let server = axum::Server::bind(&addr).serve(service);
-
-    let port = server.local_addr().port();
+    let port = server.local_addr()?.port();
     info!("prometheus listening on port {}", port);
 
     app.prometheus_port.store(port, Ordering::SeqCst);

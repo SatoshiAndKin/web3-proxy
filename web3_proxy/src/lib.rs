@@ -1,7 +1,4 @@
-#![feature(lazy_cell)]
-#![feature(let_chains)]
 #![feature(trait_alias)]
-#![feature(result_flattening)]
 #![forbid(unsafe_code)]
 
 pub mod app;

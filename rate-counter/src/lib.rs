@@ -22,7 +22,7 @@ impl RateCounter {
         let now = Instant::now();
         let too_old = now - self.period;
 
-        while self.items.front().map_or(false, |t| *t < too_old) {
+        while self.items.front().is_some_and(|t| *t < too_old) {
             self.items.pop_front();
         }
 

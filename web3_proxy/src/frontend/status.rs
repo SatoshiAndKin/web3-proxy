@@ -8,7 +8,7 @@ use crate::{
     errors::Web3ProxyError,
 };
 use axum::{
-    body::{Bytes, Full},
+    body::{Body, Bytes},
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -80,7 +80,7 @@ pub async fn health(State(app): State<Arc<App>>) -> Result<impl IntoResponse, We
     let x = Response::builder()
         .status(code)
         .header("content-type", content_type)
-        .body(Full::from(body))
+        .body(Body::from(body))
         .unwrap();
 
     Ok(x)
@@ -109,7 +109,7 @@ pub async fn backups_needed(
     let x = Response::builder()
         .status(code)
         .header("content-type", content_type)
-        .body(Full::from(body))
+        .body(Body::from(body))
         .unwrap();
 
     Ok(x)
@@ -149,7 +149,7 @@ pub async fn status(State(app): State<Arc<App>>) -> Result<impl IntoResponse, We
     let x = Response::builder()
         .status(code)
         .header("content-type", content_type)
-        .body(Full::from(body))
+        .body(Body::from(body))
         .unwrap();
 
     Ok(x)

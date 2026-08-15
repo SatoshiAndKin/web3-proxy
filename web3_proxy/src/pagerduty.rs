@@ -6,7 +6,7 @@ use std::backtrace::Backtrace;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    panic::PanicInfo,
+    panic::PanicHookInfo,
 };
 use time::OffsetDateTime;
 use tracing::{debug, error, warn};
@@ -67,7 +67,7 @@ use tracing::{debug, error, warn};
 pub fn panic_handler(
     top_config: Option<TopConfig>,
     pagerduty_sync: &PagerdutySyncEventsV2,
-    panic_info: &PanicInfo,
+    panic_info: &PanicHookInfo,
 ) {
     let summary = format!("{}", panic_info);
 

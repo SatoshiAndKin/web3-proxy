@@ -1,7 +1,7 @@
 use super::JsonRpcErrorData;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::jsonrpc::ValidatedRequest;
-use axum::body::StreamBody;
+use axum::body::Body;
 use axum::response::IntoResponse;
 use axum::Json;
 use bytes::{Bytes, BytesMut};
@@ -319,7 +319,7 @@ impl<T> IntoResponse for StreamResponse<T> {
 
                 x
             });
-        let body = StreamBody::new(stream);
+        let body = Body::from_stream(stream);
         body.into_response()
     }
 }

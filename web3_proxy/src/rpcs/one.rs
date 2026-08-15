@@ -235,6 +235,7 @@ impl Web3Rpc {
     /// - backups last
     /// - block number (descending)
     /// - tier (ascending)
+    ///
     /// TODO: tests on this!
     /// TODO: should tier or block number take priority?
     /// TODO: should this return a struct that implements sorting traits?
@@ -1379,7 +1380,7 @@ impl fmt::Debug for Web3Rpc {
 
 impl fmt::Display for Web3Rpc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.name)
+        write!(f, "{}", self.name)
     }
 }
 

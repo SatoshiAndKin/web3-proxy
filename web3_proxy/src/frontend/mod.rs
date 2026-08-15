@@ -14,17 +14,16 @@ pub mod status;
 use crate::app::App;
 use crate::errors::Web3ProxyResult;
 use axum::{
+    body::Body,
     routing::{get, post},
     Router,
 };
 use http::Request;
-use hyper::Body;
 use request_id::RequestId;
 
 use std::sync::Arc;
-use std::time::Duration;
 use std::{net::SocketAddr, sync::atomic::Ordering};
-use tokio::{process::Command, sync::broadcast};
+use tokio::{net::TcpListener, process::Command, sync::broadcast};
 use tower_http::{cors::CorsLayer, normalize_path::NormalizePathLayer, trace::TraceLayer};
 use tracing::{error, error_span, info, trace_span};
 
@@ -77,7 +76,7 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
     // Axum layers
     // layers are ordered bottom up
     // the last layer is first for requests and last for responses
-    let router: Router<(), _> = router
+    let router: Router = router
         // Remove trailing slashes
         // TODO: this isn't working for me. why?
         .layer(NormalizePathLayer::trim_trailing_slash())
@@ -139,24 +138,25 @@ pub async fn serve(
     // TODO: https://docs.rs/tower-http/latest/tower_http/propagate_header/index.html
 
     #[cfg(feature = "listenfd")]
-    let server_builder = if let Some(listener) = ListenFd::from_env().take_tcp_listener(0)? {
+    let listener = if let Some(listener) = ListenFd::from_env().take_tcp_listener(0)? {
         // use systemd socket magic for no downtime deploys
         let addr = listener.local_addr()?;
 
         info!("listening with fd at {}", addr);
 
-        axum::Server::from_tcp(listener)?
+        listener.set_nonblocking(true)?;
+        TcpListener::from_std(listener)?
     } else {
         // TODO: allow only listening on localhost? top_config.app.host.parse()?
         let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
 
-        axum::Server::try_bind(&addr)?
+        TcpListener::bind(addr).await?
     };
     #[cfg(not(feature = "listenfd"))]
-    let server_builder = {
+    let listener = {
         let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
 
-        axum::Server::try_bind(&addr)?
+        TcpListener::bind(addr).await?
     };
 
     // into_make_service is enough if we always run behind a proxy
@@ -178,12 +178,9 @@ pub async fn serve(
     //     router.into_make_service()
     // };
 
-    // TODO: get settings from app config
-    let server = server_builder
-        .http2_keep_alive_timeout(Duration::from_secs(70))
-        .serve(make_service);
+    let server = axum::serve(listener, make_service);
 
-    let port = server.local_addr().port();
+    let port = server.local_addr()?.port();
     info!("listening on port {}", port);
 
     app.frontend_port.store(port, Ordering::SeqCst);

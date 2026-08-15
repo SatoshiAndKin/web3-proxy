@@ -11,7 +11,6 @@ use crate::rpcs::provider::EthersHttpProvider;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::Message;
 use axum::{
-    headers,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -51,7 +50,7 @@ pub enum Web3ProxyError {
     Anyhow(anyhow::Error),
     Arc(Arc<Self>),
     #[from(ignore)]
-    #[display(fmt = "{:?} to {:?}", min, max)]
+    #[display("{:?} to {:?}", min, max)]
     ArchiveRequired {
         min: Option<U64>,
         max: Option<U64>,
@@ -67,7 +66,7 @@ pub enum Web3ProxyError {
     EthersHttpClient(ethers::providers::HttpClientError),
     EthersProvider(ethers::prelude::ProviderError),
     EthersWsClient(ethers::prelude::WsClientError),
-    #[display(fmt = "{:?} < {}", head, requested)]
+    #[display("{:?} < {}", head, requested)]
     #[from(ignore)]
     FarFutureBlock {
         head: Option<U64>,
@@ -75,11 +74,9 @@ pub enum Web3ProxyError {
     },
     GasEstimateNotU256,
     HdrRecord(hdrhistogram::errors::RecordError),
-    Headers(headers::Error),
     HeaderToString(ToStrError),
     HttpUri(InvalidUri),
-    Hyper(hyper::Error),
-    #[display(fmt = "{} > {}", min, max)]
+    #[display("{} > {}", min, max)]
     #[from(ignore)]
     InvalidBlockBounds {
         min: u64,
@@ -89,24 +86,24 @@ pub enum Web3ProxyError {
     Io(std::io::Error),
     JoinError(JoinError),
     JsonRejection(JsonRejection),
-    #[display(fmt = "{:?}", _0)]
+    #[display("{:?}", _0)]
     #[error(ignore)]
     JsonRpcErrorData(JsonRpcErrorData),
     #[from(ignore)]
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
     MdbxPanic(String, Cow<'static, str>),
     NoBlockNumberOrHash,
     NoBlocksKnown,
     NoConsensusHeadBlock,
     NoHandleReady,
     NoServersSynced,
-    #[display(fmt = "{}/{}", num_known, min_head_rpcs)]
+    #[display("{}/{}", num_known, min_head_rpcs)]
     #[from(ignore)]
     NotEnoughRpcs {
         num_known: usize,
         min_head_rpcs: usize,
     },
-    #[display(fmt = "{}/{}", available, needed)]
+    #[display("{}/{}", available, needed)]
     #[from(ignore)]
     NotEnoughSoftLimit {
         available: u32,
@@ -118,17 +115,17 @@ pub enum Web3ProxyError {
     MethodNotFound(Cow<'static, str>),
     #[error(ignore)]
     #[from(ignore)]
-    #[display(fmt = "{} @ {}", _0, _1)]
+    #[display("{} @ {}", _0, _1)]
     OldHead(Arc<Web3Rpc>, BlockHeader),
-    #[display(fmt = "{:?}", _0)]
+    #[display("{:?}", _0)]
     #[error(ignore)]
     ParseBytesError(Option<ethers::types::ParseBytesError>),
-    #[display(fmt = "{:?} > {:?}", from, to)]
+    #[display("{:?} > {:?}", from, to)]
     RangeInvalid {
         from: BlockNumOrHash,
         to: BlockNumOrHash,
     },
-    #[display(fmt = "{:?} > {:?}", from, to)]
+    #[display("{:?} > {:?}", from, to)]
     #[error(ignore)]
     #[from(ignore)]
     RangeTooLarge {
@@ -141,18 +138,18 @@ pub enum Web3ProxyError {
     SemaphoreAcquireError(AcquireError),
     SerdeJson(serde_json::Error),
     /// simple way to return an error message to the user and an anyhow to our logs
-    #[display(fmt = "{}, {}, {:?}", _0, _1, _2)]
+    #[display("{}, {}, {:?}", _0, _1, _2)]
     StatusCode(StatusCode, Cow<'static, str>, Option<serde_json::Value>),
-    #[display(fmt = "streaming response")]
+    #[display("streaming response")]
     #[error(ignore)]
     StreamResponse(StreamResponse<Arc<RawValue>>),
     /// TODO: what should be attached to the timout?
-    #[display(fmt = "{:?}", _0)]
+    #[display("{:?}", _0)]
     #[error(ignore)]
     Timeout(Option<Duration>),
     #[error(ignore)]
     UnknownBlockHash(H256),
-    #[display(fmt = "known: {known}, unknown: {unknown}")]
+    #[display("known: {known}, unknown: {unknown}")]
     #[error(ignore)]
     UnknownBlockNumber {
         known: U64,
@@ -163,7 +160,7 @@ pub enum Web3ProxyError {
     WatchRecvError(tokio::sync::watch::error::RecvError),
     WatchSendError,
     WebsocketOnly,
-    #[display(fmt = "{:?}, {}", _0, _1)]
+    #[display("{:?}, {}", _0, _1)]
     #[error(ignore)]
     WithContext(Option<Box<Web3ProxyError>>, Cow<'static, str>),
 }
@@ -436,20 +433,6 @@ impl Web3ProxyError {
                     },
                 )
             }
-            Self::Headers(err) => {
-                trace!(?err, "HeadersError");
-                (
-                    StatusCode::BAD_REQUEST,
-                    JsonRpcErrorData {
-                        message: "headers error".into(),
-                        code: StatusCode::BAD_REQUEST.as_u16().into(),
-                        data: Some(json!({
-                            "request": request_for_error,
-                            "err": err.to_string(),
-                        })),
-                    },
-                )
-            }
             Self::HeaderToString(err) => {
                 trace!(?err, "HeaderToString");
                 (
@@ -471,21 +454,6 @@ impl Web3ProxyError {
                     JsonRpcErrorData {
                         message: err.to_string().into(),
                         code: StatusCode::BAD_REQUEST.as_u16().into(),
-                        data: Some(json!({
-                            "request": request_for_error,
-                            "err": err.to_string(),
-                        })),
-                    },
-                )
-            }
-            Self::Hyper(err) => {
-                warn!(?err, "hyper");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    JsonRpcErrorData {
-                        // TODO: is it safe to expose these error strings?
-                        message: err.to_string().into(),
-                        code: StatusCode::INTERNAL_SERVER_ERROR.as_u16().into(),
                         data: Some(json!({
                             "request": request_for_error,
                             "err": err.to_string(),
@@ -1050,6 +1018,6 @@ impl Web3ProxyError {
         let msg = serde_json::to_string(&err).expect("errors should always serialize to json");
 
         // TODO: what about a binary message?
-        Message::Text(msg)
+        Message::Text(msg.into())
     }
 }

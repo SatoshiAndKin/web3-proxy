@@ -7,7 +7,7 @@ use crate::errors::{RequestForError, Web3ProxyError, Web3ProxyResponse};
 use crate::jsonrpc::{self, ParsedResponse, ValidatedRequest};
 use crate::{app::App, errors::Web3ProxyResult, jsonrpc::SingleRequest};
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
     extract::State,
     response::{IntoResponse, Redirect},
 };
@@ -22,7 +22,7 @@ use futures::{
 use hashbrown::HashMap;
 use serde_json::json;
 use std::net::IpAddr;
-use std::str::from_utf8_mut;
+use std::str::from_utf8;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::select;
@@ -52,7 +52,7 @@ pub enum ProxyMode {
 pub async fn websocket_handler(
     State(app): State<Arc<App>>,
     InsecureClientIp(ip): InsecureClientIp,
-    ws_upgrade: Option<WebSocketUpgrade>,
+    ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     _websocket_handler(ProxyMode::Best, app, &ip, ws_upgrade).await
 }
@@ -63,7 +63,7 @@ pub async fn websocket_handler(
 pub async fn fastest_websocket_handler(
     State(app): State<Arc<App>>,
     InsecureClientIp(ip): InsecureClientIp,
-    ws_upgrade: Option<WebSocketUpgrade>,
+    ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     // TODO: get the fastest number from the url params (default to 0/all)
     // TODO: config to disable this
@@ -76,7 +76,7 @@ pub async fn fastest_websocket_handler(
 pub async fn versus_websocket_handler(
     State(app): State<Arc<App>>,
     InsecureClientIp(ip): InsecureClientIp,
-    ws_upgrade: Option<WebSocketUpgrade>,
+    ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     // TODO: config to disable this
     _websocket_handler(ProxyMode::Versus, app, &ip, ws_upgrade).await
@@ -86,17 +86,17 @@ async fn _websocket_handler(
     proxy_mode: ProxyMode,
     app: Arc<App>,
     ip: &IpAddr,
-    ws_upgrade: Option<WebSocketUpgrade>,
+    ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     let authorization = ip_is_authorized(&app, ip, proxy_mode).await?;
 
     let authorization = Arc::new(authorization);
 
     match ws_upgrade {
-        Some(ws) => Ok(ws
+        Ok(ws) => Ok(ws
             .on_upgrade(move |socket| proxy_web3_socket(app, authorization, socket))
             .into_response()),
-        None => {
+        Err(_) => {
             if let Some(redirect) = &app.config.redirect_public_url {
                 // this is not a websocket. redirect to a friendly page
                 Ok(Redirect::permanent(redirect).into_response())
@@ -268,7 +268,7 @@ async fn handle_socket_payload(
         }
     };
 
-    Ok((Message::Text(response_str), semaphore))
+    Ok((Message::Text(response_str.into()), semaphore))
 }
 
 async fn read_web3_socket(
@@ -329,8 +329,8 @@ async fn read_web3_socket(
                                 let _ = close_sender.send(true);
                                 return;
                             }
-                            Message::Binary(mut payload) => {
-                                let payload = from_utf8_mut(&mut payload).unwrap();
+                            Message::Binary(payload) => {
+                                let payload = from_utf8(&payload).unwrap();
 
                                 let (m, s) = match handle_socket_payload(
                                     &app,
@@ -351,7 +351,7 @@ async fn read_web3_socket(
 
                                 // TODO: is this an okay way to convert from text to binary?
                                 let m = if let Message::Text(m) = m {
-                                    Message::Binary(m.as_bytes().to_vec())
+                                    Message::Binary(m.as_bytes().to_vec().into())
                                 } else {
                                     unimplemented!();
                                 };

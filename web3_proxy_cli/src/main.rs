@@ -169,16 +169,15 @@ fn main() -> anyhow::Result<()> {
 
     // set up sentry connection
     // this guard does nothing is sentry_url is None
-    let _sentry_guard = sentry::init(sentry::ClientOptions {
-        dsn: cli_config.sentry_url.clone(),
-        release: sentry::release_name!(),
-        environment: Some(sentry_env),
+    let mut sentry_options = sentry::ClientOptions::new()
+        .maybe_release(sentry::release_name!())
+        .environment(sentry_env)
         // TODO: make sample_rate configurable!
-        sample_rate: 1.0,
+        .sample_rate(1.0)
         // TODO: make traces_sample_rate configurable! (its not yet available for our rust project)
-        traces_sample_rate: 0.0,
-        ..Default::default()
-    });
+        .traces_sample_rate(0.0);
+    sentry_options.dsn = cli_config.sentry_url.clone();
+    let _sentry_guard = sentry::init(sentry_options);
 
     sentry::configure_scope(|scope| {
         let chain_id = top_config.as_ref().map(|x| x.app.chain_id).unwrap_or(0);

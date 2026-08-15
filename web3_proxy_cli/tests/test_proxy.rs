@@ -6,8 +6,7 @@ use web3_proxy::prelude::ethers::{
     providers::{Http, JsonRpcClient, Quorum, QuorumProvider, WeightedProvider},
     types::{transaction::eip2718::TypedTransaction, Address, Bytes, Eip1559TransactionRequest},
 };
-use web3_proxy::prelude::http::StatusCode;
-use web3_proxy::prelude::reqwest;
+use web3_proxy::prelude::reqwest::{self, StatusCode};
 use web3_proxy::prelude::tokio::{self, task::yield_now, time::sleep};
 use web3_proxy::rpcs::blockchain::ArcBlock;
 use web3_proxy_cli::test_utils::{TestAnvil, TestApp};

@@ -30,7 +30,7 @@ impl AtomicF32Pair {
         F: FnMut([f32; 2]) -> Option<[f32; 2]>,
     {
         self.0
-            .fetch_update(set_order, fetch_order, |bits| {
+            .try_update(set_order, fetch_order, |bits| {
                 f(from_bits(bits)).map(to_bits)
             })
             .map(from_bits)

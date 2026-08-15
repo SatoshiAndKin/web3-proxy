@@ -45,7 +45,7 @@ where
             .get("x-amzn-trace-id")
             .and_then(|x| x.to_str().ok())
             .map(ToString::to_string)
-            .unwrap_or_else(|| Ulid::new().to_string());
+            .unwrap_or_else(|| Ulid::generate().to_string());
         req.extensions_mut().insert(RequestId(request_id));
         self.inner.call(req)
     }
