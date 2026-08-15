@@ -2,19 +2,16 @@ use web3_proxy::prelude::*;
 
 use anyhow::Context;
 use argh::FromArgs;
-use pagerduty_rs::eventsv2async::EventsV2 as PagerdutyAsyncEventsV2;
-use pagerduty_rs::eventsv2sync::EventsV2 as PagerdutySyncEventsV2;
 use sentry::types::Dsn;
 use std::{
     borrow::Cow,
-    fs, panic,
+    fs,
     path::Path,
     sync::atomic::{self, AtomicUsize},
 };
 use tokio::runtime;
 use tracing::{info, warn};
 use tracing_subscriber::{prelude::*, EnvFilter};
-use web3_proxy::pagerduty::panic_handler;
 use web3_proxy::prelude::alloy::primitives::U256;
 use web3_proxy::{app::APP_USER_AGENT, config::TopConfig};
 use web3_proxy_cli::sub_commands;
@@ -53,7 +50,6 @@ pub struct Web3ProxyCli {
 #[argh(subcommand)]
 enum SubCommand {
     CheckConfig(sub_commands::CheckConfigSubCommand),
-    Pagerduty(sub_commands::PagerdutySubCommand),
     PopularityContest(sub_commands::PopularityContestSubCommand),
     Proxyd(sub_commands::ProxydSubCommand),
     Sentryd(sub_commands::SentrydSubCommand),
@@ -212,34 +208,6 @@ fn main() -> anyhow::Result<()> {
 
     info!(%APP_USER_AGENT);
 
-    // optionally connect to pagerduty
-    // TODO: fix this nested result
-    // TODO: get this out of the config file instead of the environment
-    let (pagerduty_async, pagerduty_sync) = if let Ok(pagerduty_key) =
-        std::env::var("PAGERDUTY_INTEGRATION_KEY")
-    {
-        let pagerduty_async =
-            PagerdutyAsyncEventsV2::new(pagerduty_key.clone(), Some(APP_USER_AGENT.to_string()))?;
-        let pagerduty_sync =
-            PagerdutySyncEventsV2::new(pagerduty_key, Some(APP_USER_AGENT.to_string()))?;
-
-        (Some(pagerduty_async), Some(pagerduty_sync))
-    } else {
-        info!("No PAGERDUTY_INTEGRATION_KEY");
-
-        (None, None)
-    };
-
-    // panic handler that sends to pagerduty.
-    // TODO: use the sentry handler if no pager duty. use default if no sentry
-    if let Some(pagerduty_sync) = pagerduty_sync {
-        let top_config = top_config.clone();
-
-        panic::set_hook(Box::new(move |x| {
-            panic_handler(top_config.clone(), &pagerduty_sync, x);
-        }));
-    }
-
     // set up tokio's async runtime
     let mut rt_builder = runtime::Builder::new_multi_thread();
 
@@ -274,12 +242,6 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async {
         match cli_config.sub_command {
             SubCommand::CheckConfig(command) => command.main().await,
-            SubCommand::Pagerduty(command) => {
-                if cli_config.sentry_url.is_none() {
-                    warn!("sentry_url is not set; logs will only appear in this console");
-                }
-                command.main(pagerduty_async, top_config).await
-            }
             SubCommand::PopularityContest(command) => command.main().await,
             SubCommand::Proxyd(command) => {
                 let top_config = top_config.expect("--config is required to run proxyd");
@@ -291,7 +253,7 @@ fn main() -> anyhow::Result<()> {
                 if cli_config.sentry_url.is_none() {
                     warn!("sentry_url is not set; logs will only appear in this console");
                 }
-                command.main(pagerduty_async, top_config).await
+                command.main().await
             }
         }
     })

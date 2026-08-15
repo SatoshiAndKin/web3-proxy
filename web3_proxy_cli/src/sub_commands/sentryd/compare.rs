@@ -67,7 +67,7 @@ pub async fn main(
         return error_builder.result(anyhow!("bad response from {}: {}", rpc, a.status()));
     }
 
-    // TODO: capture response headers now in case of error. store them in the extra data on the pager duty alert
+    // Capture response headers now so errors include them.
     let headers = format!("{:#?}", a.headers());
 
     let body = a

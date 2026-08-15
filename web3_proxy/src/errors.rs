@@ -485,8 +485,6 @@ impl Web3ProxyError {
             Self::MdbxPanic(rpc_name, msg) => {
                 error!(%msg, "mdbx panic");
 
-                // TODO: this is bad enough that we should send something to pager duty
-
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     JsonRpcErrorData {

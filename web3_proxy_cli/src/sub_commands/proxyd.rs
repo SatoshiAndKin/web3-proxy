@@ -145,8 +145,7 @@ impl ProxydSubCommand {
         loop {
             select! {
                 _ = sleep_until(max_wait_until) => {
-                    // TODO: an error would be fine if we had automated alerting in sentry
-                    // for now, alerts are mostly in pagerduty and pagerduty alerts on panics
+                    // Sentry captures this panic when it is configured.
                     panic!("oh no! we never got a head block!");
                 }
                 _ = head_block_receiver.changed() => {

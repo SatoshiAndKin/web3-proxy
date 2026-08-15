@@ -3,34 +3,23 @@ mod simple;
 
 use std::time::Duration;
 use tracing::{debug, error, info, warn, Level};
-use web3_proxy::prelude::anyhow::{self, Context};
+use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::futures::{
     stream::{FuturesUnordered, StreamExt},
     Future,
 };
-use web3_proxy::prelude::pagerduty_rs;
-use web3_proxy::prelude::pagerduty_rs::{
-    eventsv2async::EventsV2 as PagerdutyAsyncEventsV2, types::Event,
-};
-use web3_proxy::prelude::serde_json;
-use web3_proxy::prelude::serde_json::json;
 use web3_proxy::prelude::tokio;
 use web3_proxy::prelude::tokio::sync::mpsc;
 use web3_proxy::prelude::tokio::time::{interval, MissedTickBehavior};
-use web3_proxy::{config::TopConfig, pagerduty::pagerduty_alert};
 
 #[derive(FromArgs, PartialEq, Debug, Eq)]
-/// Loop healthchecks and send pager duty alerts if any fail
+/// Loop health checks and log failures
 #[argh(subcommand, name = "sentryd")]
 pub struct SentrydSubCommand {
     #[argh(positional)]
     /// the main (HTTP only) web3-proxy being checked.
     web3_proxy: String,
-
-    /// the chain id to require. Only used if not using --config.
-    #[argh(option)]
-    chain_id: Option<u64>,
 
     #[argh(option)]
     /// warning threshold for age of the best known head block
@@ -57,12 +46,10 @@ pub struct SentrydSubCommand {
 pub struct SentrydError {
     /// The class/type of the event, for example ping failure or cpu load
     class: String,
-    /// Errors will send a pagerduty alert. others just give log messages
+    /// Log level for the failed check
     level: Level,
-    /// A short summary that should be mostly static
-    summary: String,
-    /// Lots of detail about the error
-    extra: Option<serde_json::Value>,
+    /// The check error and its context chain
+    error: anyhow::Error,
 }
 
 /// helper for creating SentrydErrors
@@ -76,9 +63,8 @@ impl SentrydErrorBuilder {
     fn build(&self, err: anyhow::Error) -> SentrydError {
         SentrydError {
             class: self.class.to_owned(),
-            level: self.level.to_owned(),
-            summary: format!("{}", err),
-            extra: Some(json!(format!("{:#?}", err))),
+            level: self.level,
+            error: err,
         }
     }
 
@@ -90,17 +76,8 @@ impl SentrydErrorBuilder {
 type SentrydResult = Result<(), SentrydError>;
 
 impl SentrydSubCommand {
-    pub async fn main(
-        self,
-        pagerduty_async: Option<PagerdutyAsyncEventsV2>,
-        top_config: Option<TopConfig>,
-    ) -> anyhow::Result<()> {
+    pub async fn main(self) -> anyhow::Result<()> {
         // sentry logging should already be configured
-
-        let chain_id = self
-            .chain_id
-            .or_else(|| top_config.map(|x| x.app.chain_id))
-            .context("--config or --chain-id required")?;
 
         let primary_proxy = self.web3_proxy.trim_end_matches('/').to_string();
 
@@ -120,43 +97,20 @@ impl SentrydSubCommand {
 
         let mut handles = FuturesUnordered::new();
 
-        // channels and a task for sending errors to logs/pagerduty
+        // Channel and task for logging check failures.
         let (error_sender, mut error_receiver) = mpsc::channel::<SentrydError>(10);
 
         {
             let error_handler_f = async move {
-                if pagerduty_async.is_none() {
-                    info!("set PAGERDUTY_INTEGRATION_KEY to send create alerts for errors");
-                }
-
                 while let Some(err) = error_receiver.recv().await {
-                    if matches!(err.level, Level::ERROR) {
-                        warn!(?err, "check failed");
-
-                        let alert = pagerduty_alert(
-                            Some(chain_id),
-                            Some(err.class),
-                            Some("web3-proxy-sentry".to_string()),
-                            None,
-                            None,
-                            err.extra,
-                            pagerduty_rs::types::Severity::Error,
-                            None,
-                            err.summary,
-                            None,
-                        );
-
-                        if let Some(ref pagerduty_async) = pagerduty_async {
-                            info!("sending to pagerduty: {:#}", json!(&alert));
-
-                            if let Err(err) =
-                                pagerduty_async.event(Event::AlertTrigger(alert)).await
-                            {
-                                error!("Failed sending to pagerduty: {:#?}", err);
-                            }
-                        }
+                    if err.level == Level::ERROR {
+                        error!(class = %err.class, error = ?err.error, "check failed");
+                    } else if err.level == Level::WARN {
+                        warn!(class = %err.class, error = ?err.error, "check failed");
+                    } else if err.level == Level::INFO {
+                        info!(class = %err.class, error = ?err.error, "check failed");
                     } else {
-                        debug!("check failed ({:?}): {:#?}", err.level, err);
+                        debug!(class = %err.class, error = ?err.error, "check failed");
                     }
                 }
 

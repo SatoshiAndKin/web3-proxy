@@ -8,7 +8,6 @@ pub mod errors;
 pub mod frontend;
 pub mod globals;
 pub mod jsonrpc;
-pub mod pagerduty;
 pub mod prelude;
 pub mod prometheus;
 pub mod rpcs;

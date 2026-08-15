@@ -10,7 +10,6 @@ pub use http;
 pub use moka;
 pub use num;
 pub use ordered_float;
-pub use pagerduty_rs;
 pub use parking_lot;
 pub use reqwest;
 pub use sentry;
