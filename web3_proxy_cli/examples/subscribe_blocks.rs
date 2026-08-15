@@ -1,6 +1,6 @@
 //! Subscribe to blocks from a WebSocket RPC endpoint.
 
-use web3_proxy::prelude::alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
+use web3_proxy::prelude::alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::fdlimit;
 use web3_proxy::prelude::futures::StreamExt;

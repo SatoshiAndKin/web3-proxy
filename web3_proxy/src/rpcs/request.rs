@@ -4,7 +4,7 @@ use crate::frontend::authorization::AuthorizationType;
 use crate::jsonrpc::{
     self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
 };
-use alloy_provider::Provider;
+use alloy::providers::Provider;
 use anyhow::Context;
 use derive_more::From;
 use futures::Future;

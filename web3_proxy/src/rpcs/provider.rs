@@ -1,4 +1,4 @@
-use alloy_provider::{ProviderBuilder, RootProvider, WsConnect};
+use alloy::providers::{ProviderBuilder, RootProvider, WsConnect};
 use url::Url;
 
 use crate::errors::Web3ProxyResult;

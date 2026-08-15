@@ -10,7 +10,7 @@ use crate::{
     globals::APP,
     rpcs::{blockchain::BlockHeader, one::Web3Rpc},
 };
-use alloy_primitives::U64;
+use alloy::primitives::U64;
 use anyhow::Context;
 use chrono::Utc;
 use derivative::Derivative;

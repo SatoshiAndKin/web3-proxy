@@ -5,7 +5,7 @@ use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::frontend::authorization::RequestOrMethod;
 use crate::jsonrpc::ResponseData;
 use crate::jsonrpc::{self, ValidatedRequest};
-use alloy_primitives::U64;
+use alloy::primitives::U64;
 use axum::extract::ws::Message;
 use futures::future::AbortHandle;
 use futures::future::Abortable;

@@ -1,6 +1,6 @@
 use prettytable::{row, Table};
 use std::{cmp::Reverse, str::FromStr};
-use web3_proxy::prelude::alloy_primitives::U64;
+use web3_proxy::prelude::alloy::primitives::U64;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::ordered_float::OrderedFloat;

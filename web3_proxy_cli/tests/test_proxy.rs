@@ -1,11 +1,12 @@
 use serde_json::{json, Value};
 use std::{fmt::Debug, time::Duration};
 use tracing::{info, warn};
-use web3_proxy::prelude::alloy_consensus::{SignableTransaction, TxEip1559};
-use web3_proxy::prelude::alloy_eips::Encodable2718;
-use web3_proxy::prelude::alloy_primitives::{Address, Bytes, TxKind, B256, U256, U64};
-use web3_proxy::prelude::alloy_provider::{network::TxSignerSync, Provider, RootProvider};
-use web3_proxy::prelude::alloy_rpc_types_eth::{Block, Log, Transaction};
+use web3_proxy::prelude::alloy::consensus::{SignableTransaction, TxEip1559};
+use web3_proxy::prelude::alloy::eips::Encodable2718;
+use web3_proxy::prelude::alloy::network::TxSignerSync;
+use web3_proxy::prelude::alloy::primitives::{Address, Bytes, TxKind, B256, U256, U64};
+use web3_proxy::prelude::alloy::providers::{Provider, RootProvider};
+use web3_proxy::prelude::alloy::rpc::types::{Block, Log, Transaction};
 use web3_proxy::prelude::reqwest::{self, StatusCode};
 use web3_proxy::prelude::serde::{de::DeserializeOwned, Serialize};
 use web3_proxy::prelude::tokio::{self, task::yield_now, time::sleep};

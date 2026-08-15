@@ -5,8 +5,8 @@ use crate::{
     errors::{Web3ProxyError, Web3ProxyResult},
     rpcs::blockchain::BlockHeader,
 };
-use alloy_primitives::{B256, U64};
-use alloy_rpc_types_eth::BlockNumberOrTag;
+use alloy::primitives::{B256, U64};
+use alloy::rpc::types::BlockNumberOrTag;
 use anyhow::Context;
 use derive_more::From;
 use serde::Serialize;
@@ -504,8 +504,8 @@ mod test {
         jsonrpc::{LooseId, SingleRequest},
         rpcs::blockchain::BlockHeader,
     };
-    use alloy_primitives::{B256, U64};
-    use alloy_rpc_types_eth::Block;
+    use alloy::primitives::{B256, U64};
+    use alloy::rpc::types::Block;
     use serde_json::json;
     use std::sync::Arc;
 

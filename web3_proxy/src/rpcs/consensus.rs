@@ -5,7 +5,7 @@ use super::request::OpenRequestHandle;
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::jsonrpc::ValidatedRequest;
 use crate::rpcs::request::OpenRequestResult;
-use alloy_primitives::{B256, U64};
+use alloy::primitives::{B256, U64};
 use async_stream::stream;
 use base64::engine::general_purpose;
 use futures::future::select_all;

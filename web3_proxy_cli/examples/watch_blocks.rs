@@ -1,6 +1,6 @@
 //! Poll blocks from an HTTP RPC endpoint.
 
-use web3_proxy::prelude::alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use web3_proxy::prelude::alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::fdlimit;
 use web3_proxy::prelude::futures::{self, StreamExt};

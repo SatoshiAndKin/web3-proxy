@@ -9,10 +9,10 @@ use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
 use crate::jsonrpc::{self, JsonRpcParams, JsonRpcResultData};
 use crate::rpcs::request::RequestErrorHandler;
-use alloy_consensus::Transaction as _;
-use alloy_primitives::{Address, Bytes, TxHash, U256, U64};
-use alloy_provider::Provider;
-use alloy_rpc_types_eth::Transaction;
+use alloy::consensus::Transaction as _;
+use alloy::primitives::{Address, Bytes, TxHash, U256, U64};
+use alloy::providers::Provider;
+use alloy::rpc::types::Transaction;
 use anyhow::{anyhow, Context};
 use arc_swap::ArcSwapOption;
 use deduped_broadcast::DedupedBroadcaster;
@@ -1397,8 +1397,8 @@ impl fmt::Display for Web3Rpc {
 mod tests {
     #![allow(unused_imports)]
     use super::*;
-    use alloy_primitives::{B256, U256};
-    use alloy_rpc_types_eth::Block;
+    use alloy::primitives::{B256, U256};
+    use alloy::rpc::types::Block;
 
     fn block(number: u64, timestamp: u64) -> Block {
         let mut block: Block = Block::default();

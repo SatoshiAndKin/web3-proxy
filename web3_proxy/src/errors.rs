@@ -7,7 +7,7 @@ use crate::jsonrpc::{
 };
 use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::one::Web3Rpc;
-use alloy_primitives::{B256, U64};
+use alloy::primitives::{B256, U64};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::Message;
 use axum::{
@@ -59,7 +59,7 @@ pub enum Web3ProxyError {
     #[from(ignore)]
     BadResponse(Cow<'static, str>),
     BadRouting,
-    AlloyTransport(alloy_provider::transport::TransportError),
+    AlloyTransport(alloy::transports::TransportError),
     #[display("{:?} < {}", head, requested)]
     #[from(ignore)]
     FarFutureBlock {

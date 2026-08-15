@@ -6,7 +6,7 @@ use super::authorization::{ip_is_authorized, Authorization};
 use crate::errors::{RequestForError, Web3ProxyError, Web3ProxyResponse};
 use crate::jsonrpc::{self, ParsedResponse, ValidatedRequest};
 use crate::{app::App, errors::Web3ProxyResult, jsonrpc::SingleRequest};
-use alloy_primitives::U64;
+use alloy::primitives::U64;
 use axum::{
     extract::ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
     extract::State,

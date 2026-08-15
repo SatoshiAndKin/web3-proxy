@@ -1,4 +1,4 @@
-use alloy_provider::transport::TransportError;
+use alloy::transports::TransportError;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 

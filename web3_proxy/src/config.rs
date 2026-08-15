@@ -1,7 +1,7 @@
 use crate::app::Web3ProxyJoinHandle;
 use crate::rpcs::blockchain::{BlockHeader, BlocksByHashCache};
 use crate::rpcs::one::Web3Rpc;
-use alloy_primitives::{TxHash, U256, U64};
+use alloy::primitives::{TxHash, U256, U64};
 use deduped_broadcast::DedupedBroadcaster;
 use hashbrown::HashMap;
 use sentry::types::Dsn;

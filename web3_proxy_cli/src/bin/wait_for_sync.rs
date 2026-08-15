@@ -2,8 +2,8 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{info, warn};
-use web3_proxy::prelude::alloy_primitives::U64;
-use web3_proxy::prelude::alloy_rpc_types_eth::Block;
+use web3_proxy::prelude::alloy::primitives::U64;
+use web3_proxy::prelude::alloy::rpc::types::Block;
 use web3_proxy::prelude::anyhow::{self, Context};
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::chrono::{DateTime, Utc};

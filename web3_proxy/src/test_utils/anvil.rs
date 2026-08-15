@@ -2,8 +2,8 @@
 // TODO: option to subscribe to another anvil and copy blocks
 
 use crate::rpcs::provider::{connect_http, AlloyHttpProvider};
-use alloy_node_bindings::{Anvil, AnvilInstance};
-use alloy_signer_local::PrivateKeySigner;
+use alloy::node_bindings::{Anvil, AnvilInstance};
+use alloy::signers::local::PrivateKeySigner;
 use tracing::info;
 
 /// on drop, the anvil instance will be shut down

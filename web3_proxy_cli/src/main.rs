@@ -1,6 +1,5 @@
 use web3_proxy::prelude::*;
 
-use alloy_primitives::U256;
 use anyhow::Context;
 use argh::FromArgs;
 use pagerduty_rs::eventsv2async::EventsV2 as PagerdutyAsyncEventsV2;
@@ -16,6 +15,7 @@ use tokio::runtime;
 use tracing::{info, warn};
 use tracing_subscriber::{prelude::*, EnvFilter};
 use web3_proxy::pagerduty::panic_handler;
+use web3_proxy::prelude::alloy::primitives::U256;
 use web3_proxy::{app::APP_USER_AGENT, config::TopConfig};
 use web3_proxy_cli::sub_commands;
 

@@ -1,8 +1,8 @@
 use super::{SentrydErrorBuilder, SentrydResult};
 use tracing::{debug, warn};
 use web3_proxy::jsonrpc::JsonRpcErrorData;
-use web3_proxy::prelude::alloy_primitives::B256;
-use web3_proxy::prelude::alloy_rpc_types_eth::Block;
+use web3_proxy::prelude::alloy::primitives::B256;
+use web3_proxy::prelude::alloy::rpc::types::Block;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::anyhow::{anyhow, Context};
 use web3_proxy::prelude::chrono::{DateTime, Utc};
