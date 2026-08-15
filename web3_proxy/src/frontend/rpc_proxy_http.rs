@@ -25,9 +25,11 @@ pub async fn proxy_web3_rpc(
     Extension(RequestId(request_id)): Extension<RequestId>,
     headers: HeaderMap,
     payload: Result<Bytes, BytesRejection>,
-) -> Result<Response, Response> {
+) -> Response {
     let payload = parse_payload(&headers, payload);
-    proxy(app, &ip, payload, ProxyMode::Best, request_id).await
+    proxy(app, &ip, payload, ProxyMode::Best, request_id)
+        .await
+        .unwrap_or_else(|response| *response)
 }
 
 #[debug_handler]
@@ -37,9 +39,11 @@ pub async fn fastest_proxy_web3_rpc(
     Extension(RequestId(request_id)): Extension<RequestId>,
     headers: HeaderMap,
     payload: Result<Bytes, BytesRejection>,
-) -> Result<Response, Response> {
+) -> Response {
     let payload = parse_payload(&headers, payload);
-    proxy(app, &ip, payload, ProxyMode::Fastest(0), request_id).await
+    proxy(app, &ip, payload, ProxyMode::Fastest(0), request_id)
+        .await
+        .unwrap_or_else(|response| *response)
 }
 
 #[debug_handler]
@@ -49,9 +53,11 @@ pub async fn versus_proxy_web3_rpc(
     Extension(RequestId(request_id)): Extension<RequestId>,
     headers: HeaderMap,
     payload: Result<Bytes, BytesRejection>,
-) -> Result<Response, Response> {
+) -> Response {
     let payload = parse_payload(&headers, payload);
-    proxy(app, &ip, payload, ProxyMode::Versus, request_id).await
+    proxy(app, &ip, payload, ProxyMode::Versus, request_id)
+        .await
+        .unwrap_or_else(|response| *response)
 }
 
 fn parse_payload(
@@ -92,14 +98,16 @@ async fn proxy(
     payload: Result<JsonRpcRequestEnum, Web3ProxyError>,
     proxy_mode: ProxyMode,
     request_id: String,
-) -> Result<Response, Response> {
-    let payload =
-        payload.map_err(|error| error.into_response_with_id(None, None::<RequestForError>))?;
+) -> Result<Response, Box<Response>> {
+    let payload = payload
+        .map_err(|error| Box::new(error.into_response_with_id(None, None::<RequestForError>)))?;
 
     let first_id = payload.first_id();
     let authorization = ip_is_authorized(&app, ip, proxy_mode)
         .await
-        .map_err(|error| error.into_response_with_id(first_id.clone(), None::<RequestForError>))?;
+        .map_err(|error| {
+            Box::new(error.into_response_with_id(first_id.clone(), None::<RequestForError>))
+        })?;
     let authorization = Arc::new(authorization);
 
     payload
@@ -109,7 +117,9 @@ async fn proxy(
     let (status_code, response, rpcs) = app
         .proxy_web3_rpc(authorization, payload, Some(request_id))
         .await
-        .map_err(|error| error.into_response_with_id(first_id, None::<RequestForError>))?;
+        .map_err(|error| {
+            Box::new(error.into_response_with_id(first_id, None::<RequestForError>))
+        })?;
 
     let mut response = (status_code, response).into_response();
     let mut backup_used = false;

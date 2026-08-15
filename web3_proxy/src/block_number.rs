@@ -278,7 +278,7 @@ impl RequestBlocks {
                     "no servers available to get block from params"
                 );
             }
-            err @ Err(Web3ProxyError::RangeTooLarge { .. }) => return err,
+            err @ Err(Web3ProxyError::RangeTooLarge(..)) => return err,
             err @ Err(Web3ProxyError::RangeInvalid { .. }) => return err,
             Err(err) => {
                 error!(
@@ -415,12 +415,12 @@ impl RequestBlocks {
 
                     if let Some(range) = to_block.num().checked_sub(from_block.num()) {
                         if range.to::<u64>() > 200_000 {
-                            return Err(Web3ProxyError::RangeTooLarge {
-                                from: from_block,
-                                to: to_block,
-                                requested: range,
-                                allowed: U64::from(200_000u32),
-                            });
+                            return Err(Web3ProxyError::range_too_large(
+                                from_block,
+                                to_block,
+                                range,
+                                U64::from(200_000u32),
+                            ));
                         }
                     } else {
                         return Err(Web3ProxyError::RangeInvalid {

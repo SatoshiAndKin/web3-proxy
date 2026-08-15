@@ -2,9 +2,7 @@
 
 use crate::block_number::BlockNumOrHash;
 use crate::jsonrpc::ResponseData;
-use crate::jsonrpc::{
-    self, JsonRpcErrorData, ParsedResponse, SingleRequest, StreamResponse, ValidatedRequest,
-};
+use crate::jsonrpc::{self, JsonRpcErrorData, ParsedResponse, SingleRequest, ValidatedRequest};
 use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::one::Web3Rpc;
 use alloy::primitives::{B256, U64};
@@ -33,6 +31,15 @@ impl From<Web3ProxyError> for Web3ProxyResult<()> {
     fn from(value: Web3ProxyError) -> Self {
         Err(value)
     }
+}
+
+#[derive(Debug, Display)]
+#[display("{:?} > {:?}", from, to)]
+pub struct RangeTooLargeError {
+    pub from: BlockNumOrHash,
+    pub to: BlockNumOrHash,
+    pub requested: U64,
+    pub allowed: U64,
 }
 
 #[derive(Debug, Display, Error, From)]
@@ -117,24 +124,15 @@ pub enum Web3ProxyError {
         from: BlockNumOrHash,
         to: BlockNumOrHash,
     },
-    #[display("{:?} > {:?}", from, to)]
     #[error(ignore)]
     #[from(ignore)]
-    RangeTooLarge {
-        from: BlockNumOrHash,
-        to: BlockNumOrHash,
-        requested: U64,
-        allowed: U64,
-    },
+    RangeTooLarge(Box<RangeTooLargeError>),
     Reqwest(reqwest::Error),
     SemaphoreAcquireError(AcquireError),
     Sonic(sonic_rs::Error),
     /// simple way to return an error message to the user and an anyhow to our logs
     #[display("{}, {}, {:?}", _0, _1, _2)]
     StatusCode(StatusCode, Cow<'static, str>, Option<Value>),
-    #[display("streaming response")]
-    #[error(ignore)]
-    StreamResponse(StreamResponse<Arc<OwnedLazyValue>>),
     /// TODO: what should be attached to the timout?
     #[display("{:?}", _0)]
     #[error(ignore)]
@@ -176,6 +174,20 @@ pub enum RequestForError<'a> {
 }
 
 impl Web3ProxyError {
+    pub fn range_too_large(
+        from: BlockNumOrHash,
+        to: BlockNumOrHash,
+        requested: U64,
+        allowed: U64,
+    ) -> Self {
+        Self::RangeTooLarge(Box::new(RangeTooLargeError {
+            from,
+            to,
+            requested,
+            allowed,
+        }))
+    }
+
     pub fn as_json_response_parts<'a, R>(
         &self,
         id: OwnedLazyValue,
@@ -663,12 +675,13 @@ impl Web3ProxyError {
                     },
                 )
             }
-            Self::RangeTooLarge {
-                from,
-                to,
-                requested,
-                allowed,
-            } => {
+            Self::RangeTooLarge(range) => {
+                let RangeTooLargeError {
+                    from,
+                    to,
+                    requested,
+                    allowed,
+                } = range.as_ref();
                 trace!(?from, ?to, %requested, %allowed, "RangeTooLarge");
                 (
                     StatusCode::BAD_REQUEST,
@@ -743,10 +756,6 @@ impl Web3ProxyError {
                         data: data.clone(),
                     },
                 )
-            }
-            Self::StreamResponse(..) => {
-                // TODO: should it really?
-                unimplemented!("streaming should be handled elsewhere");
             }
             Self::Timeout(x) => {
                 let data = json!({
@@ -927,5 +936,22 @@ impl Web3ProxyError {
 
         // TODO: what about a binary message?
         Message::Text(msg.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Web3ProxyError;
+    use std::mem::size_of;
+
+    #[test]
+    fn web3_proxy_error_fits_result_error_budget() {
+        const CLIPPY_ERROR_SIZE_THRESHOLD: usize = 128;
+        let actual_size = size_of::<Web3ProxyError>();
+
+        assert!(
+            actual_size < CLIPPY_ERROR_SIZE_THRESHOLD,
+            "Web3ProxyError must be smaller than {CLIPPY_ERROR_SIZE_THRESHOLD} bytes; actual size is {actual_size} bytes"
+        );
     }
 }

@@ -504,7 +504,7 @@ impl App {
         // TODO: return now if already confirmed
         // TODO: error if the nonce is way far in the future
 
-        let mut response = if protected_only {
+        let response = if protected_only {
             if self.protected_rpcs.is_empty() {
                 // TODO: different error?
                 return Err(Web3ProxyError::NoServersSynced);
@@ -520,12 +520,7 @@ impl App {
                 .await
         };
 
-        // TODO: helper for doing parsed() inside a response?
-        if let Ok(SingleResponse::Stream(x)) = response {
-            response = x.read().await.map(SingleResponse::Parsed);
-        }
-
-        let mut response = response.try_into()?;
+        let mut response: ResponseData<Arc<OwnedLazyValue>> = response?.parsed().await?.into();
 
         let txid = tx.hash();
 

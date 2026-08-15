@@ -82,16 +82,11 @@ impl From<OwnedLazyValue> for ResponseData<Arc<OwnedLazyValue>> {
     }
 }
 
-impl TryFrom<Web3ProxyResult<SingleResponse>> for ResponseData<Arc<OwnedLazyValue>> {
-    type Error = Web3ProxyError;
-
-    fn try_from(response: Web3ProxyResult<SingleResponse>) -> Result<Self, Self::Error> {
-        match response? {
-            SingleResponse::Parsed(parsed) => match parsed.payload {
-                ResponsePayload::Success { result } => Ok(result.into()),
-                ResponsePayload::Error { error } => Ok(error.into()),
-            },
-            SingleResponse::Stream(stream) => Err(Web3ProxyError::StreamResponse(stream)),
+impl From<ParsedResponse<Arc<OwnedLazyValue>>> for ResponseData<Arc<OwnedLazyValue>> {
+    fn from(response: ParsedResponse<Arc<OwnedLazyValue>>) -> Self {
+        match response.payload {
+            ResponsePayload::Success { result } => result.into(),
+            ResponsePayload::Error { error } => error.into(),
         }
     }
 }
@@ -493,6 +488,59 @@ where
         match self {
             Self::Single(resp) => resp.into_response(),
             Self::Batch(resps) => json_response(StatusCode::OK, &resps),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ParsedResponse, ResponseData};
+    use crate::jsonrpc::JsonRpcErrorData;
+    use sonic_rs::OwnedLazyValue;
+    use std::sync::Arc;
+
+    #[test]
+    fn parsed_success_converts_to_response_data() {
+        let result = Arc::new(sonic_rs::from_str::<OwnedLazyValue>("42").unwrap());
+        let response = ParsedResponse::from_result(result, Default::default());
+
+        let response_data: ResponseData<Arc<OwnedLazyValue>> = response.into();
+
+        match response_data {
+            ResponseData::Result { value, num_bytes } => {
+                assert_eq!(sonic_rs::to_string(&value).unwrap(), "42");
+                assert_eq!(num_bytes, 2);
+            }
+            ResponseData::RpcError { .. } => panic!("expected successful response data"),
+        }
+    }
+
+    #[test]
+    fn parsed_error_converts_to_response_data() {
+        let error = JsonRpcErrorData {
+            code: -32000,
+            message: "request failed".into(),
+            data: Some(sonic_rs::json!({ "retryable": false })),
+        };
+        let expected_num_bytes = error.num_bytes();
+        let response = ParsedResponse::<Arc<OwnedLazyValue>>::from_error(error, Default::default());
+
+        let response_data: ResponseData<Arc<OwnedLazyValue>> = response.into();
+
+        match response_data {
+            ResponseData::RpcError {
+                error_data,
+                num_bytes,
+            } => {
+                assert_eq!(error_data.code, -32000);
+                assert_eq!(error_data.message, "request failed");
+                assert_eq!(
+                    sonic_rs::to_string(&error_data.data).unwrap(),
+                    r#"{"retryable":false}"#
+                );
+                assert_eq!(num_bytes, expected_num_bytes);
+            }
+            ResponseData::Result { .. } => panic!("expected error response data"),
         }
     }
 }

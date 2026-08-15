@@ -105,7 +105,7 @@ impl JsonRpcRequestEnum {
         app: &Arc<App>,
         authorization: &Arc<Authorization>,
         duration: Duration,
-    ) -> Result<(), AxumResponse> {
+    ) -> Result<(), Box<AxumResponse>> {
         let err_id = match self.validate() {
             None => return Ok(()),
             Some(x) => x,
@@ -143,7 +143,7 @@ impl JsonRpcRequestEnum {
         // TODO: variable duration depending on the IP
         sleep(duration).await;
 
-        Err(response)
+        Err(Box::new(response))
     }
 }
 
