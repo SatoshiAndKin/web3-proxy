@@ -12,23 +12,21 @@ use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::consensus::RankedRpcs;
 use crate::rpcs::many::Web3Rpcs;
 use crate::rpcs::one::Web3Rpc;
-use crate::rpcs::provider::{connect_http, EthersHttpProvider};
+use alloy_consensus::{Transaction as _, TxEnvelope};
+use alloy_eips::Decodable2718;
+use alloy_primitives::{keccak256, Address, Bytes, TxHash, B256, U256, U64};
 use axum::http::StatusCode;
 use deduped_broadcast::DedupedBroadcaster;
-use ethers::core::utils::keccak256;
-use ethers::prelude::{Address, Bytes, Transaction, TxHash, H256, U256, U64};
-use ethers::utils::rlp::{Decodable, Rlp};
 use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use hashbrown::HashSet;
 use moka::future::{Cache, CacheBuilder};
-use once_cell::sync::OnceCell;
 use serde_json::json;
 use serde_json::value::RawValue;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch, Semaphore};
@@ -77,10 +75,6 @@ pub struct App {
     pub start: Instant,
     /// limit the number of tx subscriptions
     pub tx_subscriptions: Semaphore,
-
-    /// Simple way to connect ethers Contracsts to the proxy
-    /// TODO: make this more efficient
-    internal_provider: OnceCell<Arc<EthersHttpProvider>>,
 }
 
 /// starting an app creates many tasks
@@ -213,7 +207,6 @@ impl App {
             frontend_port: frontend_port.clone(),
             hostname,
             http_client,
-            internal_provider: Default::default(),
             ip_semaphores,
             pending_txid_firehose: deduped_txid_firehose,
             protected_rpcs: private_rpcs,
@@ -328,34 +321,6 @@ impl App {
 
     pub fn head_block_receiver(&self) -> watch::Receiver<Option<BlockHeader>> {
         self.watch_consensus_head_receiver.clone()
-    }
-
-    /// an ethers provider that you can use with ether's abigen.
-    /// this works for now, but I don't like it
-    /// TODO: I would much prefer we figure out the traits and `impl JsonRpcClient for Web3ProxyApp`
-    pub fn internal_provider(&self) -> &Arc<EthersHttpProvider> {
-        self.internal_provider.get_or_init(|| {
-            // TODO: i'm sure theres much better ways to do this, but i don't want to spend time fighting traits right now
-            // TODO: what interval? i don't think we use it
-            // i tried and failed to `impl JsonRpcClient for Web3ProxyApi`
-            // i tried and failed to set up ipc. http is already running, so lets just use that
-            let frontend_port = self.frontend_port.load(Ordering::SeqCst);
-
-            if frontend_port == 0 {
-                panic!("frontend is not running. cannot create provider yet");
-            }
-
-            let internal_provider = connect_http(
-                format!("http://127.0.0.1:{}", frontend_port)
-                    .parse()
-                    .unwrap(),
-                self.http_client.clone(),
-                Duration::from_secs(10),
-            )
-            .unwrap();
-
-            Arc::new(internal_provider)
-        })
     }
 
     pub async fn prometheus_metrics(&self) -> String {
@@ -493,7 +458,7 @@ impl App {
 
     /// try to send transactions to the best available rpcs with protected/private mempools
     /// if no protected rpcs are configured (and protected_only is false), then public rpcs are used instead
-    /// TODO: should this return an H256 instead of an Arc<RawValue>?
+    /// TODO: should this return a B256 instead of an Arc<RawValue>?
     async fn try_send_protected(
         self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
@@ -519,14 +484,12 @@ impl App {
             return Err(Web3ProxyError::BadRequest("empty bytes".into()));
         }
 
-        let rlp = Rlp::new(bytes.as_ref());
-
-        let tx = Transaction::decode(&rlp).map_err(|_| {
+        let tx = TxEnvelope::decode_2718_exact(bytes.as_ref()).map_err(|_| {
             Web3ProxyError::BadRequest("failed to parse rlp into transaction".into())
         })?;
 
-        if let Some(chain_id) = tx.chain_id {
-            if self.config.chain_id != chain_id.as_u64() {
+        if let Some(chain_id) = tx.chain_id() {
+            if self.config.chain_id != chain_id {
                 return Err(Web3ProxyError::BadRequest(
                     format!(
                         "unexpected chain_id. {} != {}",
@@ -601,7 +564,7 @@ impl App {
                 response = ResponseData::from(json!(txid));
             }
 
-            self.pending_txid_firehose.send(txid).await;
+            self.pending_txid_firehose.send(*txid).await;
         }
 
         Ok(response)
@@ -850,7 +813,7 @@ impl App {
             // TODO: eth_sendPrivateTransaction (https://docs.flashbots.net/flashbots-auction/searchers/advanced/rpc-endpoint#eth_sendprivatetransaction)
             "eth_coinbase" => {
                 // no need for serving coinbase
-                jsonrpc::ParsedResponse::from_value(json!(Address::zero()), web3_request.id()).into()
+                jsonrpc::ParsedResponse::from_value(json!(Address::ZERO), web3_request.id()).into()
             }
             "eth_estimateGas" => {
                 // TODO: timeout
@@ -947,7 +910,7 @@ impl App {
                 }
             }
             // TODO: eth_gasPrice that does awesome magic to predict the future
-            "eth_hashrate" => jsonrpc::ParsedResponse::from_value(json!(U64::zero()), web3_request.id()).into(),
+            "eth_hashrate" => jsonrpc::ParsedResponse::from_value(json!(U64::ZERO), web3_request.id()).into(),
             "eth_mining" => jsonrpc::ParsedResponse::from_value(serde_json::Value::Bool(false), web3_request.id()).into(),
             "eth_sendRawTransaction" => {
                 // TODO: eth_sendPrivateTransaction that only sends private and never to balanced. it has different params though
@@ -1006,17 +969,21 @@ impl App {
                             let param = Bytes::from_str(
                                 params[0]
                                     .as_str()
-                                    .ok_or(Web3ProxyError::ParseBytesError(None))
+                                    .ok_or_else(|| {
+                                        Web3ProxyError::BadRequest(
+                                            "param 0 must contain hex bytes".into(),
+                                        )
+                                    })
                                     .web3_context("parsing params 0 into str then bytes")?,
                             )
                             .map_err(|x| {
                                 trace!("bad request: {:?}", x);
                                 Web3ProxyError::BadRequest(
-                                    "param 0 could not be read as H256".into(),
+                                    "param 0 could not be read as B256".into(),
                                 )
                             })?;
 
-                            let hash = H256::from(keccak256(param));
+                            let hash = B256::from(keccak256(param));
 
                             jsonrpc::ParsedResponse::from_value(json!(hash), web3_request.id()).into()
                         }

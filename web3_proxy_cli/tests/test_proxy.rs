@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::{str::FromStr, time::Duration};
 use tracing::{info, warn};
+use web3_proxy::prelude::alloy_provider::Provider;
 use web3_proxy::prelude::ethers::{
     prelude::{Block, Log, Transaction, TxHash, H256, U256, U64},
     providers::{Http, JsonRpcClient, Quorum, QuorumProvider, WeightedProvider},
@@ -41,7 +42,7 @@ async fn it_starts_and_stops() {
     assert_eq!(removed_key_route.status(), StatusCode::NOT_FOUND);
 
     let anvil_result = anvil_provider
-        .request::<_, Option<ArcBlock>>("eth_getBlockByNumber", ("latest", false))
+        .raw_request::<_, Option<ArcBlock>>("eth_getBlockByNumber".into(), ("latest", false))
         .await
         .unwrap()
         .unwrap();
@@ -53,19 +54,22 @@ async fn it_starts_and_stops() {
 
     assert_eq!(anvil_result, proxy_result);
 
-    let first_block_num = anvil_result.number.unwrap();
+    let first_block_num = anvil_result.number();
 
     // mine a block
-    let _: U256 = anvil_provider.request("evm_mine", ()).await.unwrap();
+    let _: Value = anvil_provider
+        .raw_request("evm_mine".into(), ())
+        .await
+        .unwrap();
 
     // make sure the block advanced
     let anvil_result = anvil_provider
-        .request::<_, Option<ArcBlock>>("eth_getBlockByNumber", ("latest", false))
+        .raw_request::<_, Option<ArcBlock>>("eth_getBlockByNumber".into(), ("latest", false))
         .await
         .unwrap()
         .unwrap();
 
-    let second_block_num = anvil_result.number.unwrap();
+    let second_block_num = anvil_result.number();
 
     assert_eq!(first_block_num, second_block_num - 1);
 
@@ -83,7 +87,7 @@ async fn it_starts_and_stops() {
                 proxy_result = x;
 
                 if let Some(ref proxy_result) = proxy_result {
-                    if proxy_result.number == Some(second_block_num) {
+                    if proxy_result.number() == second_block_num {
                         break;
                     }
                 }
@@ -112,7 +116,7 @@ async fn it_matches_anvil() {
 
     let a = TestAnvil::spawn(chain_id).await;
 
-    a.provider.request::<_, U64>("evm_mine", ()).await.unwrap();
+    let _: Value = a.provider.raw_request("evm_mine".into(), ()).await.unwrap();
 
     let x = TestApp::spawn(&a).await;
 

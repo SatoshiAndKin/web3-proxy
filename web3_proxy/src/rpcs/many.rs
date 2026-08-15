@@ -9,9 +9,9 @@ use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::frontend::status::MokaCacheSerializer;
 use crate::jsonrpc::ValidatedRequest;
 use crate::jsonrpc::{self, JsonRpcErrorData, JsonRpcParams, JsonRpcResultData};
+use alloy_primitives::{TxHash, U64};
 use deduped_broadcast::DedupedBroadcaster;
 use derive_more::From;
-use ethers::prelude::{TxHash, U64};
 use futures::stream::StreamExt;
 use futures_util::future::join_all;
 use hashbrown::HashMap;
@@ -141,7 +141,8 @@ impl Web3Rpcs {
         });
 
         // TODO: think about the max more for long block interval chains
-        let max_head_block_age = block_interval.mul_f32((max_head_block_lag.as_u64() * 10) as f32);
+        let max_head_block_age =
+            block_interval.mul_f32((max_head_block_lag.to::<u64>() * 10) as f32);
 
         let connections = Arc::new(Self {
             block_and_rpc_sender,
@@ -639,6 +640,7 @@ impl Serialize for Web3Rpcs {
     }
 }
 
+#[cfg(test)]
 mod tests {
     #![allow(unused_imports)]
 
@@ -646,9 +648,9 @@ mod tests {
     use crate::block_number::{BlockNumAndHash, RequestBlocks};
     use crate::rpcs::blockchain::BlockHeader;
     use crate::rpcs::consensus::ConsensusFinder;
+    use alloy_primitives::{B256, U256};
+    use alloy_rpc_types_eth::Block;
     use arc_swap::ArcSwap;
-    use ethers::types::H256;
-    use ethers::types::{Block, U256};
     use latency::PeakEwmaLatency;
     use moka::future::{Cache, CacheBuilder};
     use std::cmp::Reverse;
@@ -660,29 +662,23 @@ mod tests {
         PeakEwmaLatency::spawn(Duration::from_secs(1), 4, Duration::from_secs(1))
     }
 
+    fn block(number: u64, parent_hash: B256) -> Block {
+        let mut block: Block = Block::default();
+        block.header.hash = B256::with_last_byte((number + 1) as u8);
+        block.header.inner.number = number;
+        block.header.inner.parent_hash = parent_hash;
+        block
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_sort_connections_by_sync_status() {
-        let block_0 = Block {
-            number: Some(0.into()),
-            hash: Some(H256::random()),
-            ..Default::default()
-        };
-        let block_1 = Block {
-            number: Some(1.into()),
-            hash: Some(H256::random()),
-            parent_hash: block_0.hash.unwrap(),
-            ..Default::default()
-        };
-        let block_2 = Block {
-            number: Some(2.into()),
-            hash: Some(H256::random()),
-            parent_hash: block_1.hash.unwrap(),
-            ..Default::default()
-        };
+        let block_0 = block(0, B256::ZERO);
+        let block_1 = block(1, block_0.header.hash);
+        let block_2 = block(2, block_1.header.hash);
 
         let blocks: Vec<_> = [block_0, block_1, block_2]
             .into_iter()
-            .map(|x| BlockHeader::try_new(Arc::new(x)).unwrap())
+            .map(|x| BlockHeader::new(Arc::new(x)))
             .collect();
 
         let (tx_a, _) = watch::channel(None);
@@ -743,7 +739,7 @@ mod tests {
         let now = Instant::now();
 
         // TODO: also test with max_block = 0 and 1
-        rpcs.sort_by_cached_key(|x| x.sort_for_load_balancing_on(Some(2.into()), now));
+        rpcs.sort_by_cached_key(|x| x.sort_for_load_balancing_on(Some(U64::from(2u8)), now));
 
         let names_in_sort_order: Vec<_> = rpcs.iter().map(|x| x.name.as_str()).collect();
 

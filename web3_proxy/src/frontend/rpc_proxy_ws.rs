@@ -6,6 +6,7 @@ use super::authorization::{ip_is_authorized, Authorization};
 use crate::errors::{RequestForError, Web3ProxyError, Web3ProxyResponse};
 use crate::jsonrpc::{self, ParsedResponse, ValidatedRequest};
 use crate::{app::App, errors::Web3ProxyResult, jsonrpc::SingleRequest};
+use alloy_primitives::U64;
 use axum::{
     extract::ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -13,7 +14,6 @@ use axum::{
 };
 use axum_client_ip::InsecureClientIp;
 use axum_macros::debug_handler;
-use ethers::types::U64;
 use futures::SinkExt;
 use futures::{
     future::AbortHandle,

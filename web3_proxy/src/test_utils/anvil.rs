@@ -1,7 +1,7 @@
 // TODO: option to spawn in a dedicated thread?
 // TODO: option to subscribe to another anvil and copy blocks
 
-use crate::rpcs::provider::EthersHttpProvider;
+use crate::rpcs::provider::{connect_http, AlloyHttpProvider};
 use ethers::{
     signers::LocalWallet,
     utils::{Anvil, AnvilInstance},
@@ -11,7 +11,7 @@ use tracing::info;
 /// on drop, the anvil instance will be shut down
 pub struct TestAnvil {
     pub instance: AnvilInstance,
-    pub provider: EthersHttpProvider,
+    pub provider: AlloyHttpProvider,
 }
 
 impl TestAnvil {
@@ -30,7 +30,7 @@ impl TestAnvil {
 
         let instance = instance.spawn();
 
-        let provider = EthersHttpProvider::try_from(instance.endpoint()).unwrap();
+        let provider = connect_http(instance.endpoint().parse().unwrap()).unwrap();
 
         Self { instance, provider }
     }

@@ -16,6 +16,11 @@ latency = { path = "../latency" }
 
 # TODO: regex has several "perf" features that we might want to use
 anyhow = { version = "1.0.104", features = ["backtrace"] }
+alloy-consensus = "2.4.1"
+alloy-eips = "2.4.1"
+alloy-primitives = { version = "1.6.1", features = ["serde"] }
+alloy-provider = { version = "2.4.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls", "ws-ring"] }
+alloy-rpc-types-eth = "2.4.1"
 arc-swap = { version = "1.9.2" }
 argh = "0.1.19"
 async-stream = "0.3.6"

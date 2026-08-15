@@ -10,10 +10,10 @@ use crate::{
     globals::APP,
     rpcs::{blockchain::BlockHeader, one::Web3Rpc},
 };
+use alloy_primitives::U64;
 use anyhow::Context;
 use chrono::Utc;
 use derivative::Derivative;
-use ethers::types::U64;
 use parking_lot::Mutex;
 use serde::{ser::SerializeStruct, Serialize};
 use serde_json::{json, value::RawValue};
@@ -411,7 +411,7 @@ impl ValidatedRequest {
                 let response_lock = self.response.lock();
 
                 if response_lock.archive_request {
-                    Some(U64::zero())
+                    Some(U64::ZERO)
                 } else {
                     None
                 }

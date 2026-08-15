@@ -1,80 +1,27 @@
-use ethers::providers::{Authorization, ConnectionDetails};
-use std::time::Duration;
+use alloy_provider::{ProviderBuilder, RootProvider, WsConnect};
 use url::Url;
 
 use crate::errors::Web3ProxyResult;
 
-pub type EthersHttpProvider = ethers::providers::Provider<ethers::providers::Http>;
-pub type EthersWsProvider = ethers::providers::Provider<ethers::providers::Ws>;
+pub type AlloyWsProvider = RootProvider;
+pub type AlloyHttpProvider = RootProvider;
 
-pub fn extract_auth(url: &mut Url) -> Option<Authorization> {
-    if let Some(pass) = url.password().map(|x| x.to_string()) {
-        // to_string is needed because we are going to remove these items from the url
-        let user = url.username().to_string();
-
-        // clear username and password from the url
-        url.set_username("")
-            .expect("unable to clear username on websocket");
-        url.set_password(None)
-            .expect("unable to clear password on websocket");
-
-        // keep them
-        Some(Authorization::basic(user, pass))
-    } else {
-        None
+pub fn connect_http(url: Url) -> Web3ProxyResult<AlloyHttpProvider> {
+    if !url.scheme().starts_with("http") {
+        return Err(anyhow::anyhow!("only HTTP servers are supported: {url}").into());
     }
+
+    Ok(ProviderBuilder::default().connect_http(url))
 }
 
-/// Note, if the http url has an authority the http_client param is ignored and a dedicated http_client will be used
-/// TODO: take a reqwest::Client or a reqwest::ClientBuilder. that way we can do things like set compression even when auth is set
-pub fn connect_http(
-    mut url: Url,
-    http_client: Option<reqwest::Client>,
-    interval: Duration,
-) -> Web3ProxyResult<EthersHttpProvider> {
-    let auth = extract_auth(&mut url);
+pub async fn connect_ws(url: Url) -> Web3ProxyResult<AlloyWsProvider> {
+    if !url.scheme().starts_with("ws") {
+        return Err(anyhow::anyhow!("only WebSocket servers are supported: {url}").into());
+    }
 
-    let mut provider = if url.scheme().starts_with("http") {
-        let provider = if let Some(auth) = auth {
-            // TODO: there are two "HttpClientError" in ethers. this one is not in the prelude
-            ethers::providers::Http::new_with_auth(url, auth)
-                .map_err(|err| anyhow::anyhow!("http client error: {:?}", err))?
-        } else if let Some(http_client) = http_client {
-            ethers::providers::Http::new_with_client(url, http_client)
-        } else {
-            ethers::providers::Http::new(url)
-        };
-
-        // TODO: i don't think this interval matters for our uses, but we should probably set it to like `block time / 2`
-        ethers::providers::Provider::new(provider).interval(Duration::from_secs(2))
-    } else {
-        return Err(anyhow::anyhow!("only http servers are supported. cannot use {}", url).into());
-    };
-
-    provider.set_interval(interval);
-
-    Ok(provider)
-}
-
-pub async fn connect_ws(mut url: Url, reconnects: usize) -> Web3ProxyResult<EthersWsProvider> {
-    let auth = extract_auth(&mut url);
-
-    let provider = if url.scheme().starts_with("ws") {
-        let provider = if auth.is_some() {
-            let connection_details = ConnectionDetails::new(url.as_str(), auth);
-
-            // if they error, we do our own reconnection with backoff
-            ethers::providers::Ws::connect_with_reconnects(connection_details, reconnects).await?
-        } else {
-            ethers::providers::Ws::connect_with_reconnects(url.as_str(), reconnects).await?
-        };
-
-        // TODO: dry this up (needs https://github.com/gakonst/ethers-rs/issues/592)
-        // TODO: i don't think this interval matters
-        ethers::providers::Provider::new(provider)
-    } else {
-        return Err(anyhow::anyhow!("ws servers are supported").into());
-    };
+    let provider = ProviderBuilder::default()
+        .connect_ws(WsConnect::new(url.as_str()))
+        .await?;
 
     Ok(provider)
 }

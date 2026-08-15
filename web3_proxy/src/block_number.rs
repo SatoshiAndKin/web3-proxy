@@ -1,50 +1,47 @@
-//! Helper functions for turning ether's BlockNumber into numbers and updating incoming queries to match.
+//! Helper functions for resolving Alloy block identifiers and updating incoming queries to match.
 use crate::app::App;
 use crate::jsonrpc::SingleRequest;
 use crate::{
     errors::{Web3ProxyError, Web3ProxyResult},
     rpcs::blockchain::BlockHeader,
 };
+use alloy_primitives::{B256, U64};
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use anyhow::Context;
 use derive_more::From;
-use ethers::{
-    prelude::{BlockNumber, U64},
-    types::H256,
-};
 use serde::Serialize;
 use serde_json::json;
 use tracing::{error, trace, warn};
 
-#[allow(non_snake_case)]
-pub fn BlockNumber_to_U64(block_num: BlockNumber, latest_block: U64) -> (U64, bool) {
+pub fn block_number_to_u64(block_num: BlockNumberOrTag, latest_block: U64) -> (U64, bool) {
     match block_num {
-        BlockNumber::Earliest => (U64::zero(), false),
-        BlockNumber::Finalized => {
+        BlockNumberOrTag::Earliest => (U64::ZERO, false),
+        BlockNumberOrTag::Finalized => {
             warn!("finalized block requested! not yet implemented!");
-            (latest_block - 10, false)
+            (latest_block - U64::from(10), false)
         }
-        BlockNumber::Latest => {
+        BlockNumberOrTag::Latest => {
             // change "latest" to a number
             (latest_block, true)
         }
-        BlockNumber::Number(x) => {
+        BlockNumberOrTag::Number(x) => {
             // we already have a number
-            (x, false)
+            (U64::from(x), false)
         }
-        BlockNumber::Pending => {
+        BlockNumberOrTag::Pending => {
             // modified is false because we want the backend to see "pending"
             // TODO: think more about how to handle Pending
             (latest_block, false)
         }
-        BlockNumber::Safe => {
+        BlockNumberOrTag::Safe => {
             warn!("safe block requested! not yet implemented!");
-            (latest_block - 3, false)
+            (latest_block - U64::from(3), false)
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, From, Hash, PartialEq, Serialize)]
-pub struct BlockNumAndHash(U64, H256);
+pub struct BlockNumAndHash(U64, B256);
 
 impl BlockNumAndHash {
     #[inline]
@@ -52,7 +49,7 @@ impl BlockNumAndHash {
         self.0
     }
     #[inline]
-    pub fn hash(&self) -> &H256 {
+    pub fn hash(&self) -> &B256 {
         &self.1
     }
 }
@@ -100,7 +97,7 @@ pub async fn clean_block_number<'a>(
                 let (block, change) = if let Some(obj) = x.as_object_mut() {
                     // it might be a Map like `{"blockHash": String("0xa5626dc20d3a0a209b1de85521717a3e859698de8ce98bca1b16822b7501f74b")}`
                     if let Some(block_hash) = obj.get("blockHash").cloned() {
-                        let block_hash: H256 =
+                        let block_hash: B256 =
                             serde_json::from_value(block_hash).context("decoding blockHash")?;
 
                         if block_hash == *head_block.hash() {
@@ -133,10 +130,10 @@ pub async fn clean_block_number<'a>(
                     } else if let Ok(block_num) = serde_json::from_value::<U64>(x.to_owned()) {
                         (block_num, false)
                     } else if let Ok(block_number) =
-                        serde_json::from_value::<BlockNumber>(x.to_owned())
+                        serde_json::from_value::<BlockNumberOrTag>(x.to_owned())
                     {
-                        BlockNumber_to_U64(block_number, head_block.number())
-                    } else if let Ok(block_hash) = serde_json::from_value::<H256>(x.clone()) {
+                        block_number_to_u64(block_number, head_block.number())
+                    } else if let Ok(block_hash) = serde_json::from_value::<B256>(x.clone()) {
                         if block_hash == *head_block.hash() {
                             (head_block.number(), false)
                         } else if let Some(app) = app {
@@ -372,10 +369,10 @@ impl RequestBlocks {
                     let from_block = if let Some(x) = obj.get_mut("fromBlock") {
                         // TODO: use .take instead of clone
                         // what if its a hash?
-                        let block_num: BlockNumber = serde_json::from_value(x.clone())?;
+                        let block_num: BlockNumberOrTag = serde_json::from_value(x.clone())?;
 
                         let (block_num, _change) =
-                            BlockNumber_to_U64(block_num, head_block.number());
+                            block_number_to_u64(block_num, head_block.number());
 
                         // TODO: double check this. it scares me
                         // we always change because some clients send U64 with padding and erigon doesn't like that
@@ -384,19 +381,19 @@ impl RequestBlocks {
 
                         BlockNumOrHash::Num(block_num)
                     } else {
-                        BlockNumOrHash::Num(U64::zero())
+                        BlockNumOrHash::Num(U64::ZERO)
                     };
 
                     let to_block = if let Some(x) = obj.get_mut("toBlock") {
                         // TODO: use .take instead of clone
                         // what if its a hash?
-                        let block_num: BlockNumber = serde_json::from_value(x.clone())?;
+                        let block_num: BlockNumberOrTag = serde_json::from_value(x.clone())?;
 
                         // sometimes people request `from_block=head+1, to_block="latest"`. latest becomes head and then theres a problem
                         // TODO: delay here until the app has this block?
                         let latest_block = head_block.number().max(from_block.num());
 
-                        let (block_num, _change) = BlockNumber_to_U64(block_num, latest_block);
+                        let (block_num, _change) = block_number_to_u64(block_num, latest_block);
 
                         // TODO: double check this. it scares me but i think we need it
                         trace!("changing toBlock in eth_getLogs. {} -> {}", x, block_num);
@@ -419,12 +416,12 @@ impl RequestBlocks {
                     };
 
                     if let Some(range) = to_block.num().checked_sub(from_block.num()) {
-                        if range.as_u64() > 200_000 {
+                        if range.to::<u64>() > 200_000 {
                             return Err(Web3ProxyError::RangeTooLarge {
                                 from: from_block,
                                 to: to_block,
                                 requested: range,
-                                allowed: 200_000.into(),
+                                allowed: U64::from(200_000u32),
                             });
                         }
                     } else {
@@ -507,22 +504,26 @@ mod test {
         jsonrpc::{LooseId, SingleRequest},
         rpcs::blockchain::BlockHeader,
     };
-    use ethers::types::{Block, H256, U64};
+    use alloy_primitives::{B256, U64};
+    use alloy_rpc_types_eth::Block;
     use serde_json::json;
     use std::sync::Arc;
+
+    fn block(number: u64) -> Block {
+        let mut block: Block = Block::default();
+        block.header.hash = B256::with_last_byte(number as u8);
+        block.header.inner.number = number;
+        block
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_fee_history() {
         let method = "eth_feeHistory";
         let params = json!([4, "latest", [25, 75]]);
 
-        let head_block = Block {
-            number: Some(1.into()),
-            hash: Some(H256::random()),
-            ..Default::default()
-        };
+        let head_block = block(1);
 
-        let head_block = BlockHeader::try_new(Arc::new(head_block)).unwrap();
+        let head_block = BlockHeader::new(Arc::new(head_block));
 
         let id = LooseId::Number(9);
 
@@ -550,13 +551,9 @@ mod test {
 
         let params = json!([{"data": "0xdeadbeef", "to": "0x0000000000000000000000000000000000000000"}, "latest"]);
 
-        let head_block = Block {
-            number: Some(18173997.into()),
-            hash: Some(H256::random()),
-            ..Default::default()
-        };
+        let head_block = block(18_173_997);
 
-        let head_block = BlockHeader::try_new(Arc::new(head_block)).unwrap();
+        let head_block = BlockHeader::new(Arc::new(head_block));
 
         let id = LooseId::Number(99);
 
@@ -586,13 +583,9 @@ mod test {
 
         let params = json!([{"data": "0xdeadbeef", "to": "0x0000000000000000000000000000000000000000"}, future_block_num]);
 
-        let head_block: Block<H256> = Block {
-            number: Some(head_block_num.into()),
-            hash: Some(H256::random()),
-            ..Default::default()
-        };
+        let head_block = block(head_block_num);
 
-        let head_block = BlockHeader::try_new(Arc::new(head_block)).unwrap();
+        let head_block = BlockHeader::new(Arc::new(head_block));
 
         let mut request = SingleRequest::new(99.into(), method.into(), params).unwrap();
 
@@ -603,8 +596,8 @@ mod test {
         // future blocks should get an error
         match x {
             Web3ProxyError::UnknownBlockNumber { known, unknown } => {
-                assert_eq!(known.as_u64(), head_block_num);
-                assert_eq!(unknown.as_u64(), future_block_num);
+                assert_eq!(known.to::<u64>(), head_block_num);
+                assert_eq!(unknown.to::<u64>(), future_block_num);
             }
             x => panic!("{:?}", x),
         }

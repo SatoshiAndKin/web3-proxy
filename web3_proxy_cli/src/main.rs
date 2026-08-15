@@ -1,8 +1,8 @@
 use web3_proxy::prelude::*;
 
+use alloy_primitives::U256;
 use anyhow::Context;
 use argh::FromArgs;
-use ethers::types::U256;
 use pagerduty_rs::eventsv2async::EventsV2 as PagerdutyAsyncEventsV2;
 use pagerduty_rs::eventsv2sync::EventsV2 as PagerdutySyncEventsV2;
 use sentry::types::Dsn;

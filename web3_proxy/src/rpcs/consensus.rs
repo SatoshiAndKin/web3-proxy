@@ -5,9 +5,9 @@ use super::request::OpenRequestHandle;
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::jsonrpc::ValidatedRequest;
 use crate::rpcs::request::OpenRequestResult;
+use alloy_primitives::{B256, U64};
 use async_stream::stream;
 use base64::engine::general_purpose;
-use ethers::prelude::{H256, U64};
 use futures::future::select_all;
 use futures::Stream;
 use hashbrown::{HashMap, HashSet};
@@ -352,7 +352,7 @@ impl Web3Rpcs {
     }
 }
 
-type FirstSeenCache = Cache<H256, Instant>;
+type FirstSeenCache = Cache<B256, Instant>;
 
 /// A ConsensusConnections builder that tracks all connection heads across multiple groups of servers
 pub struct ConsensusFinder {

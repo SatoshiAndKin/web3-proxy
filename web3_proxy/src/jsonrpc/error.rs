@@ -1,4 +1,4 @@
-use ethers::providers::{HttpClientError, JsonRpcError, ProviderError, WsClientError};
+use alloy_provider::transport::TransportError;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -48,48 +48,22 @@ impl From<String> for JsonRpcErrorData {
     }
 }
 
-impl From<&JsonRpcError> for JsonRpcErrorData {
-    fn from(value: &JsonRpcError) -> Self {
-        Self {
-            code: value.code,
-            message: value.message.clone().into(),
-            data: value.data.clone(),
-        }
-    }
-}
+impl<'a> TryFrom<&'a TransportError> for JsonRpcErrorData {
+    type Error = &'a TransportError;
 
-impl<'a> TryFrom<&'a ProviderError> for JsonRpcErrorData {
-    type Error = &'a ProviderError;
+    fn try_from(error: &'a TransportError) -> Result<Self, Self::Error> {
+        if let Some(payload) = error.as_error_resp() {
+            let data = payload.data.as_deref().map(|raw| {
+                serde_json::from_str(raw.get()).expect("Alloy error data must contain valid JSON")
+            });
 
-    fn try_from(error: &'a ProviderError) -> Result<Self, Self::Error> {
-        match error {
-            provider_error @ ProviderError::JsonRpcClientError(client_error) => client_error
-                .as_error_response()
-                .map(Self::from)
-                .ok_or(provider_error),
-            error => Err(error),
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a HttpClientError> for JsonRpcErrorData {
-    type Error = &'a HttpClientError;
-
-    fn try_from(error: &'a HttpClientError) -> Result<Self, Self::Error> {
-        match error {
-            HttpClientError::JsonRpcError(error) => Ok(error.into()),
-            error => Err(error),
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a WsClientError> for JsonRpcErrorData {
-    type Error = &'a WsClientError;
-
-    fn try_from(error: &'a WsClientError) -> Result<Self, Self::Error> {
-        match error {
-            WsClientError::JsonRpcError(error) => Ok(error.into()),
-            error => Err(error),
+            Ok(Self {
+                code: payload.code,
+                message: payload.message.clone(),
+                data,
+            })
+        } else {
+            Err(error)
         }
     }
 }

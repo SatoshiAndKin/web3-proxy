@@ -99,7 +99,8 @@ impl<T> From<JsonRpcErrorData> for ResponseData<T> {
 }
 
 pub trait JsonRpcParams = fmt::Debug + serde::Serialize + Send + Sync + 'static;
-pub trait JsonRpcResultData = serde::Serialize + serde::de::DeserializeOwned + fmt::Debug + Send;
+pub trait JsonRpcResultData =
+    serde::Serialize + serde::de::DeserializeOwned + fmt::Debug + Send + Sync + Unpin + 'static;
 
 /// TODO: borrow values to avoid allocs if possible
 /// TODO: reduce overlap with `SingleResponse`.

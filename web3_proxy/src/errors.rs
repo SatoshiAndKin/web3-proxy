@@ -7,7 +7,7 @@ use crate::jsonrpc::{
 };
 use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::one::Web3Rpc;
-use crate::rpcs::provider::EthersHttpProvider;
+use alloy_primitives::{B256, U64};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::Message;
 use axum::{
@@ -16,8 +16,6 @@ use axum::{
     Json,
 };
 use derive_more::{Display, Error, From};
-use ethers::prelude::ContractError;
-use ethers::types::{H256, U64};
 use http::header::InvalidHeaderValue;
 use http::uri::InvalidUri;
 use reqwest::header::ToStrError;
@@ -42,7 +40,6 @@ impl From<Web3ProxyError> for Web3ProxyResult<()> {
 
 #[derive(Debug, Display, Error, From)]
 pub enum Web3ProxyError {
-    Abi(ethers::abi::Error),
     #[error(ignore)]
     #[from(ignore)]
     AccessDenied(Cow<'static, str>),
@@ -62,10 +59,7 @@ pub enum Web3ProxyError {
     #[from(ignore)]
     BadResponse(Cow<'static, str>),
     BadRouting,
-    Contract(ContractError<EthersHttpProvider>),
-    EthersHttpClient(ethers::providers::HttpClientError),
-    EthersProvider(ethers::prelude::ProviderError),
-    EthersWsClient(ethers::prelude::WsClientError),
+    AlloyTransport(alloy_provider::transport::TransportError),
     #[display("{:?} < {}", head, requested)]
     #[from(ignore)]
     FarFutureBlock {
@@ -117,9 +111,6 @@ pub enum Web3ProxyError {
     #[from(ignore)]
     #[display("{} @ {}", _0, _1)]
     OldHead(Arc<Web3Rpc>, BlockHeader),
-    #[display("{:?}", _0)]
-    #[error(ignore)]
-    ParseBytesError(Option<ethers::types::ParseBytesError>),
     #[display("{:?} > {:?}", from, to)]
     RangeInvalid {
         from: BlockNumOrHash,
@@ -148,7 +139,7 @@ pub enum Web3ProxyError {
     #[error(ignore)]
     Timeout(Option<Duration>),
     #[error(ignore)]
-    UnknownBlockHash(H256),
+    UnknownBlockHash(B256),
     #[display("known: {known}, unknown: {unknown}")]
     #[error(ignore)]
     UnknownBlockNumber {
@@ -212,20 +203,6 @@ impl Web3ProxyError {
 
         // TODO: include a unique request id in the data
         let (code, err): (StatusCode, JsonRpcErrorData) = match self {
-            Self::Abi(err) => {
-                warn!(?err, "abi error");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    JsonRpcErrorData {
-                        message: "abi error".into(),
-                        code: StatusCode::INTERNAL_SERVER_ERROR.as_u16().into(),
-                        data: Some(json!({
-                            "request": request_for_error,
-                            "err": err.to_string(),
-                        })),
-                    },
-                )
-            }
             Self::AccessDenied(msg) => {
                 // TODO: attach something to this trace. probably don't include much in the message though. don't want to leak creds by accident
                 trace!(%msg, "access denied");
@@ -316,71 +293,17 @@ impl Web3ProxyError {
                     },
                 )
             }
-            Self::Contract(err) => {
-                warn!(?err, "Contract Error: {}", err);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    JsonRpcErrorData {
-                        message: "contract error".into(),
-                        code: StatusCode::INTERNAL_SERVER_ERROR.as_u16().into(),
-                        data: Some(json!({
-                            "request": request_for_error,
-                            "err": err.to_string(),
-                        })),
-                    },
-                )
-            }
-            Self::EthersHttpClient(err) => match JsonRpcErrorData::try_from(err) {
+            Self::AlloyTransport(err) => match JsonRpcErrorData::try_from(err) {
                 Ok(err) => {
-                    trace!(?err, "EthersHttpClient jsonrpc error");
+                    trace!(?err, "Alloy JSON-RPC error");
                     (StatusCode::OK, err)
                 }
                 Err(err) => {
-                    warn!(?err, "EthersHttpClient");
+                    warn!(?err, "Alloy transport error");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         JsonRpcErrorData {
-                            message: "ethers http client error".into(),
-                            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16().into(),
-                            data: Some(json!({
-                                "request": request_for_error,
-                                "err": err.to_string(),
-                            })),
-                        },
-                    )
-                }
-            },
-            Self::EthersProvider(err) => match JsonRpcErrorData::try_from(err) {
-                Ok(err) => {
-                    trace!(?err, "EthersProvider jsonrpc error");
-                    (StatusCode::OK, err)
-                }
-                Err(err) => {
-                    warn!(?err, "EthersProvider");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        JsonRpcErrorData {
-                            message: "ethers provider error".into(),
-                            code: StatusCode::INTERNAL_SERVER_ERROR.as_u16().into(),
-                            data: Some(json!({
-                                "request": request_for_error,
-                                "err": err.to_string(),
-                            })),
-                        },
-                    )
-                }
-            },
-            Self::EthersWsClient(err) => match JsonRpcErrorData::try_from(err) {
-                Ok(err) => {
-                    trace!(?err, "EthersWsClient jsonrpc error");
-                    (StatusCode::OK, err)
-                }
-                Err(err) => {
-                    warn!(?err, "EthersWsClient");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        JsonRpcErrorData {
-                            message: "ethers ws client error".into(),
+                            message: "Alloy transport error".into(),
                             code: StatusCode::INTERNAL_SERVER_ERROR.as_u16().into(),
                             data: Some(json!({
                                 "request": request_for_error,
@@ -718,22 +641,6 @@ impl Web3ProxyError {
                     },
                 )
             }
-            Self::ParseBytesError(err) => {
-                trace!(?err, "ParseBytesError");
-
-                let data = err
-                    .as_ref()
-                    .map(|x| serde_json::Value::String(x.to_string()));
-
-                (
-                    StatusCode::BAD_REQUEST,
-                    JsonRpcErrorData {
-                        message: "parse bytes error!".into(),
-                        code: StatusCode::BAD_REQUEST.as_u16().into(),
-                        data,
-                    },
-                )
-            }
             Self::RangeInvalid { from, to } => {
                 trace!(?from, ?to, "RangeInvalid");
                 (
@@ -958,12 +865,6 @@ impl Web3ProxyError {
         let response = ParsedResponse::from_response_data(response_data, id);
 
         (status_code, Json(response)).into_response()
-    }
-}
-
-impl From<ethers::types::ParseBytesError> for Web3ProxyError {
-    fn from(err: ethers::types::ParseBytesError) -> Self {
-        Self::ParseBytesError(Some(err))
     }
 }
 

@@ -4,9 +4,9 @@ use crate::frontend::authorization::AuthorizationType;
 use crate::jsonrpc::{
     self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
 };
+use alloy_provider::Provider;
 use anyhow::Context;
 use derive_more::From;
-use ethers::providers::ProviderError;
 use futures::Future;
 use reqwest::StatusCode;
 use std::pin::Pin;
@@ -198,24 +198,14 @@ impl OpenRequestHandle {
             let method = self.web3_request.inner.method();
             let params = self.web3_request.inner.params();
 
-            // some ethers::ProviderError need to be converted to JsonRpcErrorData. the rest to Web3ProxyError
-            let response = match p.request::<_, R>(method, params).await {
+            let response = match p.raw_request(method.to_string().into(), params).await {
                 Ok(x) => jsonrpc::ParsedResponse::from_result(x, self.web3_request.id()),
-                Err(provider_error) => match JsonRpcErrorData::try_from(&provider_error) {
+                Err(transport_error) => match JsonRpcErrorData::try_from(&transport_error) {
                     Ok(x) => jsonrpc::ParsedResponse::from_error(x, self.web3_request.id()),
-                    Err(ProviderError::HTTPError(error)) => {
-                        if let Some(status_code) = error.status() {
-                            if status_code == StatusCode::TOO_MANY_REQUESTS {
-                                // TODO: how much should we actually rate limit?
-                                self.rate_limit_for(Duration::from_secs(1));
-                            }
-                        }
-                        return Err(provider_error.into());
-                    }
                     Err(err) => {
                         warn!(?err, "error from {}", self.rpc);
 
-                        return Err(provider_error.into());
+                        return Err(transport_error.into());
                     }
                 },
             };

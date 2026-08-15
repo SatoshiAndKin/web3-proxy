@@ -15,7 +15,8 @@ pub use self::response::{
 pub use request_builder::ValidatedRequest;
 
 pub trait JsonRpcParams = fmt::Debug + serde::Serialize + Send + Sync + 'static;
-pub trait JsonRpcResultData = serde::Serialize + serde::de::DeserializeOwned + fmt::Debug + Send;
+pub trait JsonRpcResultData =
+    serde::Serialize + serde::de::DeserializeOwned + fmt::Debug + Send + Sync + Unpin + 'static;
 
 #[cfg(test)]
 mod tests {

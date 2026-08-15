@@ -1,6 +1,6 @@
 //! Rate-limited communication with a web3 provider.
 use super::blockchain::{ArcBlock, BlockHeader, BlocksByHashCache};
-use super::provider::{connect_ws, EthersWsProvider};
+use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
 use crate::config::{BlockAndRpc, Web3RpcConfig};
@@ -9,10 +9,13 @@ use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
 use crate::jsonrpc::{self, JsonRpcParams, JsonRpcResultData};
 use crate::rpcs::request::RequestErrorHandler;
+use alloy_consensus::Transaction as _;
+use alloy_primitives::{Address, Bytes, TxHash, U256, U64};
+use alloy_provider::Provider;
+use alloy_rpc_types_eth::Transaction;
 use anyhow::{anyhow, Context};
 use arc_swap::ArcSwapOption;
 use deduped_broadcast::DedupedBroadcaster;
-use ethers::prelude::{Address, Bytes, Middleware, Transaction, TxHash, U256, U64};
 use futures::future::select_all;
 use futures::StreamExt;
 use latency::{EwmaLatency, PeakEwmaLatency, RollingQuantileLatency};
@@ -57,7 +60,7 @@ pub struct Web3Rpc {
     /// the websocket url is only used for subscriptions
     pub(super) ws_url: Option<Url>,
     /// the websocket provider is only used for subscriptions
-    pub(super) ws_provider: ArcSwapOption<EthersWsProvider>,
+    pub(super) ws_provider: ArcSwapOption<AlloyWsProvider>,
     /// most all requests prefer the ipc provider.
     /// TODO: ArcSwapOption?
     pub(super) ipc_path: Option<PathBuf>,
@@ -355,7 +358,8 @@ impl Web3Rpc {
                 .await
                 .context("head_block_num error during check_block_data_limit")?;
 
-            let maybe_archive_block = head_block_num.saturating_sub((block_data_limit).into());
+            let maybe_archive_block =
+                head_block_num.saturating_sub(U256::from_limbs([block_data_limit, 0, 0, 0]));
 
             if last == maybe_archive_block {
                 // we already checked it. exit early
@@ -419,7 +423,7 @@ impl Web3Rpc {
 
     /// TODO: this might be too simple. different nodes can prune differently. its possible we will have a block range
     pub fn block_data_limit(&self) -> U64 {
-        self.block_data_limit.load(atomic::Ordering::SeqCst).into()
+        U64::from_limbs([self.block_data_limit.load(atomic::Ordering::SeqCst)])
     }
 
     /// TODO: get rid of this now that consensus rpcs does it
@@ -510,7 +514,7 @@ impl Web3Rpc {
 
         trace!("found_chain_id: {:#?}", found_chain_id);
 
-        if self.chain_id != found_chain_id.as_u64() {
+        if self.chain_id != found_chain_id.to::<u64>() {
             return Err(anyhow::anyhow!(
                 "incorrect chain id! Config has {}, but RPC has {}",
                 self.chain_id,
@@ -541,7 +545,7 @@ impl Web3Rpc {
 
         let new_head_block = match new_head_block {
             Ok(x) => {
-                let x = x.and_then(BlockHeader::try_new);
+                let x = x.map(BlockHeader::new);
 
                 match x {
                     None => {
@@ -634,7 +638,7 @@ impl Web3Rpc {
                         .context("no transaction")?;
 
                     // TODO: what default? something real?
-                    tx.to.unwrap_or_else(|| {
+                    tx.to().unwrap_or_else(|| {
                         "0xdead00000000000000000000000000000000beef"
                             .parse::<Address>()
                             .expect("deafbeef")
@@ -704,7 +708,7 @@ impl Web3Rpc {
         if let Some(url) = self.ws_url.clone() {
             trace!("starting websocket provider on {}", self);
 
-            let x = connect_ws(url, usize::MAX).await?;
+            let x = connect_ws(url).await?;
 
             let x = Arc::new(x);
 
@@ -887,7 +891,6 @@ impl Web3Rpc {
             a.abort();
         }
 
-        // TODO: tell ethers to disconnect? i think dropping will do that
         self.ws_provider.store(None);
 
         Ok(())
@@ -904,7 +907,8 @@ impl Web3Rpc {
                 .await?;
 
             // TODO: only subscribe if a user has subscribed
-            let mut pending_txs_sub = ws_provider.subscribe_pending_txs().await?;
+            let subscription = ws_provider.subscribe_pending_transactions().await?;
+            let mut pending_txs_sub = subscription.into_stream();
 
             while let Some(x) = pending_txs_sub.next().await {
                 pending_txid_firehose.send(x).await;
@@ -933,7 +937,11 @@ impl Web3Rpc {
             self.wait_for_throttle(Instant::now() + Duration::from_secs(5))
                 .await?;
 
-            let mut blocks = ws_provider.subscribe_blocks().await?;
+            let mut blocks = ws_provider
+                .subscribe_full_blocks()
+                .hashes()
+                .into_stream()
+                .await?;
 
             // query the block once since the subscription doesn't send the current block
             // there is a very small race condition here where the stream could send us a new block right now
@@ -950,6 +958,7 @@ impl Web3Rpc {
             self.send_head_block_result(latest_block).await?;
 
             while let Some(block) = blocks.next().await {
+                let block = block?;
                 let block = Ok(Some(Arc::new(block)));
 
                 self.send_head_block_result(block).await?;
@@ -1384,25 +1393,30 @@ impl fmt::Display for Web3Rpc {
     }
 }
 
+#[cfg(test)]
 mod tests {
     #![allow(unused_imports)]
     use super::*;
-    use ethers::types::{Block, H256, U256};
+    use alloy_primitives::{B256, U256};
+    use alloy_rpc_types_eth::Block;
+
+    fn block(number: u64, timestamp: u64) -> Block {
+        let mut block: Block = Block::default();
+        block.header.hash = B256::with_last_byte(number as u8);
+        block.header.inner.number = number;
+        block.header.inner.timestamp = timestamp;
+        block
+    }
 
     #[test]
     fn test_archive_node_has_block_data() {
-        let now = chrono::Utc::now().timestamp().into();
+        let now = chrono::Utc::now().timestamp() as u64;
 
-        let random_block = Block {
-            hash: Some(H256::random()),
-            number: Some(1_000_000.into()),
-            timestamp: now,
-            ..Default::default()
-        };
+        let random_block = block(1_000_000, now);
 
         let random_block = Arc::new(random_block);
 
-        let head_block = BlockHeader::try_new(random_block).unwrap();
+        let head_block = BlockHeader::new(random_block);
         let block_data_limit = u64::MAX;
 
         let (tx, _) = watch::channel(Some(head_block.clone()));
@@ -1417,25 +1431,18 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(x.has_block_data(0.into()));
-        assert!(x.has_block_data(1.into()));
+        assert!(x.has_block_data(U64::ZERO));
+        assert!(x.has_block_data(U64::from(1)));
         assert!(x.has_block_data(head_block.number()));
-        assert!(!x.has_block_data(head_block.number() + 1));
-        assert!(!x.has_block_data(head_block.number() + 1000));
+        assert!(!x.has_block_data(head_block.number() + U64::from(1)));
+        assert!(!x.has_block_data(head_block.number() + U64::from(1000)));
     }
 
     #[test]
     fn test_pruned_node_has_block_data() {
-        let now = chrono::Utc::now().timestamp().into();
+        let now = chrono::Utc::now().timestamp() as u64;
 
-        let head_block: BlockHeader = Arc::new(Block {
-            hash: Some(H256::random()),
-            number: Some(1_000_000.into()),
-            timestamp: now,
-            ..Default::default()
-        })
-        .try_into()
-        .unwrap();
+        let head_block = BlockHeader::new(Arc::new(block(1_000_000, now)));
 
         let block_data_limit = 64;
 
@@ -1451,13 +1458,15 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!x.has_block_data(0.into()));
-        assert!(!x.has_block_data(1.into()));
-        assert!(!x.has_block_data(head_block.number() - block_data_limit - 1));
-        assert!(x.has_block_data(head_block.number() - block_data_limit));
+        assert!(!x.has_block_data(U64::ZERO));
+        assert!(!x.has_block_data(U64::from(1)));
+        assert!(
+            !x.has_block_data(head_block.number() - U64::from(block_data_limit) - U64::from(1),)
+        );
+        assert!(x.has_block_data(head_block.number() - U64::from(block_data_limit),));
         assert!(x.has_block_data(head_block.number()));
-        assert!(!x.has_block_data(head_block.number() + 1));
-        assert!(!x.has_block_data(head_block.number() + 1000));
+        assert!(!x.has_block_data(head_block.number() + U64::from(1)));
+        assert!(!x.has_block_data(head_block.number() + U64::from(1000)));
     }
 
     /*

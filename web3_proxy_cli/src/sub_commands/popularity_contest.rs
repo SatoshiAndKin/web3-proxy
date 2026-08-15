@@ -1,8 +1,8 @@
 use prettytable::{row, Table};
 use std::{cmp::Reverse, str::FromStr};
+use web3_proxy::prelude::alloy_primitives::U64;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
-use web3_proxy::prelude::ethers::types::U64;
 use web3_proxy::prelude::ordered_float::OrderedFloat;
 use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::serde_json;
@@ -94,7 +94,7 @@ impl PopularityContestSubCommand {
                 .and_then(|x| x.get("block"))
                 .and_then(|x| x.get("number"))
                 .and_then(|x| U64::from_str(x.as_str().unwrap()).ok())
-                .map(|x| x.as_u64())
+                .map(|x| x.to::<u64>())
                 .unwrap_or_default();
 
             highest_block = highest_block.max(head_block);
