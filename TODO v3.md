@@ -12,3 +12,5 @@
     - formatting
 - [ ] do we actually want parkinglot?
 - [ ] make sure we are using fast modes for hashbrown (hash algos have changed over the years)
+- [ ] inspect streamed JSON-RPC envelopes before forwarding bytes. stream successful results and route large JSON-RPC errors through retry and failover
+- [ ] make response streaming transport-neutral so HTTP, IPC, and WebSocket backends can stream large responses without buffering complete messages

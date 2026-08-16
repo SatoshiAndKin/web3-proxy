@@ -316,14 +316,21 @@ impl<T> StreamResponse<T> {
 
 impl<T> IntoResponse for StreamResponse<T> {
     fn into_response(self) -> axum::response::Response {
-        let stream = stream::once(async { Ok::<_, reqwest::Error>(self.buffer) })
-            .chain(self.response.bytes_stream())
-            .map_ok(move |x| {
-                let len = x.len() as u64;
+        let Self {
+            buffer,
+            response,
+            web3_request,
+            ..
+        } = self;
+        let mut total_bytes = 0u64;
+        let stream = stream::once(async { Ok::<_, reqwest::Error>(buffer) })
+            .chain(response.bytes_stream())
+            .map_ok(move |chunk| {
+                total_bytes = total_bytes.saturating_add(chunk.len() as u64);
 
-                self.web3_request.set_response(len);
+                web3_request.set_response(total_bytes);
 
-                x
+                chunk
             });
         let body = Body::from_stream(stream);
         body.into_response()
@@ -494,10 +501,41 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedResponse, ResponseData};
-    use crate::jsonrpc::JsonRpcErrorData;
+    use super::{ParsedResponse, ResponseData, StreamResponse};
+    use crate::jsonrpc::{JsonRpcErrorData, ValidatedRequest};
+    use axum::{body::to_bytes, response::IntoResponse};
+    use bytes::Bytes;
+    use futures_util::stream;
     use sonic_rs::OwnedLazyValue;
-    use std::sync::Arc;
+    use std::{marker::PhantomData, sync::Arc};
+
+    #[tokio::test]
+    async fn streamed_response_counts_all_bytes() {
+        let web3_request = ValidatedRequest::new_internal("test".into(), &(), None, None)
+            .await
+            .unwrap();
+        let upstream_body = reqwest::Body::wrap_stream(stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"defg")),
+            Ok(Bytes::from_static(b"hi")),
+        ]));
+        let upstream_response = http::Response::builder()
+            .body(upstream_body)
+            .unwrap()
+            .into();
+        let response = StreamResponse::<Arc<OwnedLazyValue>> {
+            _t: PhantomData,
+            buffer: Bytes::from_static(b"abc"),
+            num_bytes: None,
+            response: upstream_response,
+            web3_request: web3_request.clone(),
+        }
+        .into_response();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        assert_eq!(body, Bytes::from_static(b"abcdefghi"));
+        assert_eq!(web3_request.response.lock().response_bytes, 9);
+    }
 
     #[test]
     fn parsed_success_converts_to_response_data() {
