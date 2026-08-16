@@ -66,6 +66,7 @@ serde = { version = "1.0.229", features = ["rc"] }
 serde-inline-default = "1.0.2"
 # Alloy requires this raw type for type-erased WebSocket requests.
 serde_json = { version = "1.0.151", default-features = false, features = ["raw_value"] }
+shellexpand = { version = "3.1.2", default-features = false, features = ["base-0"] }
 sonic-rs = "0.5.8"
 strum = { version = "0.28.0", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full", "tracing"] }

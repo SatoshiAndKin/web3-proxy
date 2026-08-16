@@ -2,7 +2,6 @@ use std::fs;
 use web3_proxy::config::TopConfig;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
-use web3_proxy::prelude::toml;
 use web3_proxy::prelude::tracing::info;
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
@@ -18,7 +17,7 @@ impl CheckConfigSubCommand {
     pub async fn main(self) -> anyhow::Result<()> {
         info!("Loading config @ {}", self.path);
         let top_config: String = fs::read_to_string(self.path)?;
-        let mut top_config: TopConfig = toml::from_str(&top_config)?;
+        let mut top_config = TopConfig::from_toml_str(&top_config)?;
 
         top_config.clean();
 

@@ -12,8 +12,9 @@ Each server has different limits that can be configured. The `soft_limit` is the
 
 ## Quick development
 
-1. Copy `./config/example.toml` to `./config/development.toml` and change settings to match your setup.
-2. Run `cargo` commands:
+1. Copy `.env.example` to `.env` and set local secrets.
+2. Copy `./config/example.toml` to `./config/development.toml` and change settings to match your setup. Config values can use `${VARIABLE_NAME}` references from `.env`.
+3. Run `cargo` commands:
 
 ```
 $ cargo run --release -- --help

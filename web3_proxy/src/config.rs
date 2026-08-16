@@ -30,6 +30,11 @@ pub struct TopConfig {
 }
 
 impl TopConfig {
+    pub fn from_toml_str(input: &str) -> anyhow::Result<Self> {
+        let expanded = shellexpand::env(input)?;
+        Ok(toml::from_str(&expanded)?)
+    }
+
     /// TODO: this should probably be part of Deserialize
     pub fn clean(&mut self) {
         if !self.extra.is_empty() {
@@ -222,7 +227,7 @@ impl From<BlockDataLimit> for AtomicU64 {
 
 /// Configuration for a backend web3 RPC server
 #[serde_inline_default]
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct Web3RpcConfig {
     /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
     #[serde(default = "Default::default")]
@@ -256,6 +261,24 @@ pub struct Web3RpcConfig {
 impl Default for Web3RpcConfig {
     fn default() -> Self {
         sonic_rs::from_str("{}").unwrap()
+    }
+}
+
+impl fmt::Debug for Web3RpcConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Web3RpcConfig")
+            .field("backup", &self.backup)
+            .field("block_data_limit", &self.block_data_limit)
+            .field("disabled", &self.disabled)
+            .field("display_name", &self.display_name)
+            .field("http_url", &self.http_url.as_ref().map(|_| "[REDACTED]"))
+            .field("ipc_path", &self.ipc_path)
+            .field("soft_limit", &self.soft_limit)
+            .field("subscribe_txs", &self.subscribe_txs)
+            .field("ws_url", &self.ws_url.as_ref().map(|_| "[REDACTED]"))
+            .field("extra", &self.extra)
+            .finish()
     }
 }
 
@@ -296,8 +319,9 @@ impl Web3RpcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, Web3RpcConfig};
+    use super::{AppConfig, TopConfig, Web3RpcConfig};
     use sonic_rs::json;
+    use std::env;
 
     #[test]
     fn expected_app_defaults() {
@@ -328,5 +352,74 @@ mod tests {
         assert_eq!(b.soft_limit, 1);
 
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rpc_debug_output_redacts_urls() {
+        let config = Web3RpcConfig {
+            http_url: Some("https://example.com/http-secret".to_string()),
+            ws_url: Some("wss://example.com/ws-secret".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            format!("{config:?}"),
+            "Web3RpcConfig { backup: false, block_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
+        );
+    }
+
+    #[test]
+    fn top_config_expands_environment_variables() {
+        const VARIABLE: &str = "WEB3_PROXY_TEST_RPC_URL";
+        let previous_value = env::var_os(VARIABLE);
+        env::set_var(VARIABLE, "http://127.0.0.1:8545");
+
+        let config = TopConfig::from_toml_str(
+            r#"
+                [app]
+                chain_id = 1
+
+                [balanced_rpcs.local]
+                http_url = "${WEB3_PROXY_TEST_RPC_URL}"
+            "#,
+        )
+        .unwrap();
+
+        match previous_value {
+            Some(value) => env::set_var(VARIABLE, value),
+            None => env::remove_var(VARIABLE),
+        }
+
+        assert_eq!(
+            config.balanced_rpcs["local"].http_url.as_deref(),
+            Some("http://127.0.0.1:8545")
+        );
+    }
+
+    #[test]
+    fn top_config_rejects_missing_environment_variables() {
+        const VARIABLE: &str = "WEB3_PROXY_TEST_MISSING_RPC_URL";
+        let previous_value = env::var_os(VARIABLE);
+        env::remove_var(VARIABLE);
+
+        let error = TopConfig::from_toml_str(
+            r#"
+                [app]
+                chain_id = 1
+
+                [balanced_rpcs.local]
+                http_url = "${WEB3_PROXY_TEST_MISSING_RPC_URL}"
+            "#,
+        )
+        .unwrap_err();
+
+        if let Some(value) = previous_value {
+            env::set_var(VARIABLE, value);
+        }
+
+        assert_eq!(
+            error.to_string(),
+            "error looking key 'WEB3_PROXY_TEST_MISSING_RPC_URL' up: environment variable not found"
+        );
     }
 }

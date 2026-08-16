@@ -18,6 +18,7 @@ tokio-console = ["dep:tokio-console", "dep:console-subscriber"]
 web3_proxy = { path = "../web3_proxy" }
 
 console-subscriber = { version = "0.5.0", features = ["env-filter", "parking_lot"], optional = true }
+dotenvy = "0.15.7"
 mimalloc = { version = "0.1.52", optional = true }
 parking_lot = { version = "0.12.5", features = ["arc_lock", "nightly"] }
 prettytable = { version = "0.10.0", default-features = false }

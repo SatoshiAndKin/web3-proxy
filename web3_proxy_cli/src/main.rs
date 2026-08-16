@@ -56,6 +56,8 @@ enum SubCommand {
 }
 
 fn main() -> anyhow::Result<()> {
+    load_dotenv()?;
+
     // this probably won't matter for us in docker, but better safe than sorry
     fdlimit::raise_fd_limit()?;
 
@@ -132,7 +134,7 @@ fn main() -> anyhow::Result<()> {
 
         let top_config: String = fs::read_to_string(top_config_path.clone())?;
 
-        let mut top_config: TopConfig = toml::from_str(&top_config)?;
+        let mut top_config = TopConfig::from_toml_str(&top_config)?;
 
         if let Some(sentry_url) = top_config.app.sentry_url.clone() {
             cli_config.sentry_url = Some(sentry_url);
@@ -257,4 +259,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
     })
+}
+
+fn load_dotenv() -> anyhow::Result<()> {
+    match dotenvy::dotenv() {
+        Ok(_) => Ok(()),
+        Err(error) if error.not_found() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }

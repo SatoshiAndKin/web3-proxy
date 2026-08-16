@@ -16,7 +16,6 @@ use web3_proxy::prelude::tokio::signal::unix::SignalKind;
 use web3_proxy::prelude::tokio::sync::broadcast;
 use web3_proxy::prelude::tokio::time::{sleep_until, Instant};
 use web3_proxy::prelude::tokio::{select, signal};
-use web3_proxy::prelude::toml;
 use web3_proxy::{frontend, prometheus};
 
 /// start the main proxy daemon
@@ -96,7 +95,7 @@ impl ProxydSubCommand {
 
                     match fs::read_to_string(&top_config_path) {
                         Ok(new_top_config) => {
-                            match toml::from_str::<TopConfig>(&new_top_config) {
+                            match TopConfig::from_toml_str(&new_top_config) {
                                 Ok(mut new_top_config) => {
                                     new_top_config.clean();
 
