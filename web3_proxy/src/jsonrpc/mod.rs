@@ -12,7 +12,7 @@ pub use self::request::{JsonRpcRequestEnum, SingleRequest};
 pub use self::response::{
     ParsedResponse, Response, ResponseData, ResponsePayload, SingleResponse, StreamResponse,
 };
-pub use request_builder::ValidatedRequest;
+pub use request_builder::{RequestOrMethod, ValidatedRequest};
 
 pub trait JsonRpcParams = fmt::Debug + serde::Serialize + Send + Sync + 'static;
 pub trait JsonRpcResultData =

@@ -2,7 +2,6 @@
 members = [
   "deduped_broadcast",
   "latency",
-  "rate-counter",
   "web3_proxy",
   "web3_proxy_cli",
 ]

@@ -3,137 +3,95 @@ use crate::{
     app::App,
     block_number::RequestBlocks,
     errors::{Web3ProxyError, Web3ProxyResult},
-    frontend::{
-        authorization::{Authorization, RequestOrMethod, ResponseOrBytes},
-        rpc_proxy_ws::ProxyMode,
-    },
+    frontend::rpc_proxy_ws::ProxyMode,
     globals::APP,
     rpcs::{blockchain::BlockHeader, one::Web3Rpc},
 };
 use alloy::primitives::U64;
-use anyhow::Context;
 use chrono::Utc;
 use derivative::Derivative;
+use derive_more::From;
 use parking_lot::Mutex;
 use serde::{ser::SerializeStruct, Serialize};
-use sonic_rs::{json, OwnedLazyValue};
+use sonic_rs::{json, OwnedLazyValue, Value};
 use std::time::Duration;
 use std::{borrow::Cow, sync::Arc};
 use std::{
     fmt::{self, Display},
-    net::IpAddr,
+    sync::OnceLock,
 };
-use tokio::{sync::OwnedSemaphorePermit, time::Instant};
+use tokio::time::Instant;
 
-#[derive(Derivative)]
-#[derivative(Default)]
-pub struct RequestBuilder {
-    app: Option<Arc<App>>,
-    archive_request: bool,
-    head_block: Option<BlockHeader>,
-    authorization: Option<Arc<Authorization>>,
-    request_or_method: RequestOrMethod,
+#[derive(Clone, Debug, Default, From, Serialize)]
+pub enum RequestOrMethod {
+    Request(SingleRequest),
+    Method(Cow<'static, str>, usize),
+    #[default]
+    None,
 }
 
-impl RequestBuilder {
-    pub fn new(app: Arc<App>) -> Self {
-        let head_block = app.head_block_receiver().borrow().clone();
-
-        Self {
-            app: Some(app),
-            head_block,
-            ..Default::default()
+impl RequestOrMethod {
+    pub fn id(&self) -> OwnedLazyValue {
+        match self {
+            Self::Request(request) => request.id.clone(),
+            Self::Method(_, _) | Self::None => Default::default(),
         }
     }
 
-    pub fn authorize_internal(self) -> Web3ProxyResult<Self> {
-        // TODO: allow passing proxy_mode to internal?
-        let authorization = Authorization::internal();
-
-        Ok(Self {
-            authorization: Some(Arc::new(authorization)),
-            ..self
-        })
-    }
-
-    /// TODO: this takes a lot more things
-    pub fn authorize_public(self, ip: &IpAddr, proxy_mode: ProxyMode) -> Web3ProxyResult<Self> {
-        let app = self
-            .app
-            .as_ref()
-            .context("app is required for public requests")?;
-
-        let authorization =
-            Authorization::external(ip, proxy_mode, app.config.public_max_concurrent_requests);
-
-        let head_block = app.watch_consensus_head_receiver.borrow().clone();
-
-        Ok(Self {
-            authorization: Some(Arc::new(authorization)),
-            head_block,
-            ..self
-        })
-    }
-
-    pub fn set_archive_request(self, archive_request: bool) -> Self {
-        Self {
-            archive_request,
-            ..self
+    pub fn method(&self) -> &str {
+        match self {
+            Self::Request(request) => request.method.as_ref(),
+            Self::Method(method, _) => method,
+            Self::None => "unknown",
         }
     }
 
-    /// replace 'latest' in the json and figure out the minimum and maximum blocks.
-    /// also tarpit invalid methods.
-    pub async fn set_request(self, request: SingleRequest) -> Web3ProxyResult<Self> {
-        Ok(Self {
-            request_or_method: RequestOrMethod::Request(request),
-            ..self
-        })
-    }
+    pub fn params(&self) -> &Value {
+        static NULL: OnceLock<Value> = OnceLock::new();
 
-    pub fn set_method(self, method: Cow<'static, str>, size: usize) -> Self {
-        Self {
-            request_or_method: RequestOrMethod::Method(method, size),
-            ..self
+        match self {
+            Self::Request(request) => &request.params,
+            Self::Method(..) | Self::None => NULL.get_or_init(Value::default),
         }
     }
 
-    pub async fn build(
-        &self,
-        max_wait: Option<Duration>,
-    ) -> Web3ProxyResult<Arc<ValidatedRequest>> {
-        // TODO: make this work without app being set?
-        let app = self.app.as_ref().context("app is required")?;
-
-        let authorization = self
-            .authorization
-            .clone()
-            .context("authorization is required")?;
-
-        let permit = authorization.permit(app).await?;
-
-        let x = ValidatedRequest::new_with_app(
-            app,
-            authorization,
-            max_wait,
-            permit,
-            self.request_or_method.clone(),
-            self.head_block.clone(),
-            None,
-        )
-        .await;
-
-        if let Ok(x) = &x {
-            if self.archive_request {
-                let mut response_lock = x.response.lock();
-
-                response_lock.archive_request = true;
-            }
+    pub fn jsonrpc_request(&self) -> Option<&SingleRequest> {
+        match self {
+            Self::Request(request) => Some(request),
+            Self::Method(..) | Self::None => None,
         }
+    }
 
-        // todo!(anything else to set?)
+    pub fn num_bytes(&self) -> usize {
+        match self {
+            Self::Request(request) => request.num_bytes(),
+            Self::Method(_, num_bytes) => *num_bytes,
+            Self::None => 0,
+        }
+    }
+}
 
-        x
+#[derive(From)]
+pub(crate) enum ResponseOrBytes<'a> {
+    Json(&'a Value),
+    Response(&'a super::SingleResponse),
+    Error(&'a Web3ProxyError),
+    Bytes(u64),
+}
+
+impl ResponseOrBytes<'_> {
+    fn num_bytes(&self) -> u64 {
+        match self {
+            Self::Json(value) => sonic_rs::to_string(value)
+                .expect("JSON values must serialize")
+                .len() as u64,
+            Self::Response(response) => response.num_bytes(),
+            Self::Bytes(num_bytes) => *num_bytes,
+            Self::Error(error) => error
+                .as_response_parts(None::<crate::errors::RequestForError>)
+                .1
+                .num_bytes(),
+        }
     }
 }
 
@@ -170,21 +128,11 @@ pub struct ValidatedResponse {
     pub user_error_response: bool,
 }
 
-impl ValidatedResponse {
-    /// True if the response required querying a backup RPC
-    /// RPC aggregators that query multiple providers to compare response may use this header to ignore our response.
-    pub fn response_from_backup_rpc(&self) -> bool {
-        self.backend_rpcs.last().map(|x| x.backup).unwrap_or(false)
-    }
-}
-
 /// TODO:
 /// TODO: instead of a bunch of atomics, this should probably use a RwLock. need to think more about how parallel requests are going to work though
 #[derive(Debug, Derivative)]
 #[derivative(Default)]
 pub struct ValidatedRequest {
-    pub authorization: Arc<Authorization>,
-
     pub request_blocks: RequestBlocks,
 
     /// TODO: this should probably be in a global config. although maybe if we run multiple chains in one process this will be useful
@@ -195,6 +143,8 @@ pub struct ValidatedRequest {
     pub response: Mutex<ValidatedResponse>,
 
     pub inner: RequestOrMethod,
+
+    pub proxy_mode: ProxyMode,
 
     // TODO: everything under here should be behind a single lock. all these atomics need to be updated together!
     /// Instant that the request was received (or at least close to it)
@@ -207,9 +157,6 @@ pub struct ValidatedRequest {
     /// How long to spend waiting for an rpc to respond to this request
     /// TODO: this should start once the connection is established
     pub expire_timeout: Duration,
-
-    /// Limit the number of concurrent requests from a client.
-    pub permit: Option<OwnedSemaphorePermit>,
 
     /// RequestId from x-amzn-trace-id or generated
     pub request_id: Option<String>,
@@ -262,18 +209,16 @@ impl Serialize for ValidatedRequest {
     }
 }
 
-/// TODO: move all of this onto RequestBuilder
 impl ValidatedRequest {
     #[allow(clippy::too_many_arguments)]
     async fn new_with_options(
         app: Option<&App>,
-        authorization: Arc<Authorization>,
         chain_id: u64,
         head_block: Option<BlockHeader>,
         max_wait: Option<Duration>,
-        permit: Option<OwnedSemaphorePermit>,
         mut request: RequestOrMethod,
         request_id: Option<String>,
+        proxy_mode: ProxyMode,
     ) -> Web3ProxyResult<Arc<Self>> {
         let start_instant = Instant::now();
 
@@ -298,14 +243,13 @@ impl ValidatedRequest {
 
         let x = Self {
             response: Mutex::new(Default::default()),
-            authorization,
             request_blocks,
             chain_id,
             connect_timeout,
             expire_timeout,
             head_block: head_block.clone(),
             inner: request,
-            permit,
+            proxy_mode,
             start_instant,
             request_id,
         };
@@ -313,12 +257,10 @@ impl ValidatedRequest {
         Ok(Arc::new(x))
     }
 
-    /// todo!(this shouldn't be public. use the RequestBuilder)
     pub async fn new_with_app(
         app: &App,
-        authorization: Arc<Authorization>,
+        proxy_mode: ProxyMode,
         max_wait: Option<Duration>,
-        permit: Option<OwnedSemaphorePermit>,
         request: RequestOrMethod,
         head_block: Option<BlockHeader>,
         request_id: Option<String>,
@@ -327,13 +269,12 @@ impl ValidatedRequest {
 
         Self::new_with_options(
             Some(app),
-            authorization,
             chain_id,
             head_block,
             max_wait,
-            permit,
             request,
             request_id,
+            proxy_mode,
         )
         .await
     }
@@ -344,8 +285,6 @@ impl ValidatedRequest {
         head_block: Option<BlockHeader>,
         max_wait: Option<Duration>,
     ) -> Web3ProxyResult<Arc<Self>> {
-        let authorization = Arc::new(Authorization::internal());
-
         // todo!(we need a real id! increment a counter on the app or websocket-only providers are going to have a problem)
         let id = LooseId::Number(1);
 
@@ -355,9 +294,8 @@ impl ValidatedRequest {
         if let Some(app) = APP.get() {
             Self::new_with_app(
                 app,
-                authorization,
+                ProxyMode::Best,
                 max_wait,
-                None,
                 request.into(),
                 head_block,
                 None,
@@ -366,13 +304,12 @@ impl ValidatedRequest {
         } else {
             Self::new_with_options(
                 None,
-                authorization,
                 0,
                 head_block,
                 max_wait,
-                None,
                 request.into(),
                 None,
+                ProxyMode::Best,
             )
             .await
         }
@@ -453,7 +390,7 @@ impl ValidatedRequest {
         self.set_response(0);
     }
 
-    pub fn set_response<'a, R: Into<ResponseOrBytes<'a>>>(&'a self, response: R) {
+    pub(crate) fn set_response<'a, R: Into<ResponseOrBytes<'a>>>(&'a self, response: R) {
         // TODO: fetch? set? should it be None in a Mutex? or a OnceCell?
         let response = response.into();
 
@@ -478,7 +415,7 @@ impl ValidatedRequest {
 
     #[inline]
     pub fn proxy_mode(&self) -> ProxyMode {
-        self.authorization.checks.proxy_mode
+        self.proxy_mode
     }
 
     // TODO: helper function to duplicate? needs to clear request_bytes, and all the atomics tho...

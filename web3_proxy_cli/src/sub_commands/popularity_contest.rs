@@ -21,14 +21,13 @@ struct BackendRpcData<'a> {
     active_requests: u64,
     backup: bool,
     block_data_limit: u64,
-    external_requests: u64,
     head_block: u64,
     head_delay_ms: f64,
-    internal_requests: u64,
     median_latency_ms: f64,
     name: &'a str,
     peak_latency_ms: f64,
     tier: u64,
+    total_requests: u64,
     weighted_latency_ms: f64,
 }
 
@@ -60,7 +59,7 @@ impl PopularityContestSubCommand {
 
         let mut highest_block = 0;
         let mut rpc_data = vec![];
-        let mut total_external_requests = 0;
+        let mut all_requests = 0;
 
         for conn in conns {
             let conn = conn.as_object().unwrap();
@@ -80,13 +79,8 @@ impl PopularityContestSubCommand {
                 .and_then(|x| x.as_u64())
                 .unwrap_or(u64::MAX);
 
-            let internal_requests = conn
-                .get(&"internal_requests")
-                .and_then(|x| x.as_u64())
-                .unwrap_or_default();
-
-            let external_requests = conn
-                .get(&"external_requests")
+            let total_requests = conn
+                .get(&"total_requests")
                 .and_then(|x| x.as_u64())
                 .unwrap_or_default();
 
@@ -124,36 +118,29 @@ impl PopularityContestSubCommand {
                 active_requests,
                 backup,
                 block_data_limit,
-                external_requests,
                 head_block,
                 head_delay_ms,
-                internal_requests,
                 median_latency_ms,
                 name,
                 peak_latency_ms,
                 tier,
+                total_requests,
                 weighted_latency_ms,
             };
 
-            total_external_requests += x.external_requests;
+            all_requests += x.total_requests;
 
             rpc_data.push(x);
         }
 
-        rpc_data.sort_by_key(|x| {
-            (
-                Reverse(x.external_requests),
-                OrderedFloat(x.median_latency_ms),
-            )
-        });
+        rpc_data.sort_by_key(|x| (Reverse(x.total_requests), OrderedFloat(x.median_latency_ms)));
 
         let mut table = Table::new();
 
         table.add_row(row![
             "name",
-            "external %",
-            "external",
-            "internal",
+            "request %",
+            "requests",
             "active",
             "lag",
             "block_data_limit",
@@ -165,10 +152,10 @@ impl PopularityContestSubCommand {
         ]);
 
         for rpc in rpc_data.into_iter() {
-            let external_request_pct = if total_external_requests == 0 {
+            let request_pct = if all_requests == 0 {
                 0.0
             } else {
-                (rpc.external_requests as f32) / (total_external_requests as f32) * 100.0
+                (rpc.total_requests as f32) / (all_requests as f32) * 100.0
             };
 
             let block_data_limit = if rpc.block_data_limit == u64::MAX {
@@ -187,9 +174,8 @@ impl PopularityContestSubCommand {
 
             table.add_row(row![
                 rpc.name,
-                format!("{:.3}", external_request_pct),
-                rpc.external_requests,
-                rpc.internal_requests,
+                format!("{:.3}", request_pct),
+                rpc.total_requests,
                 rpc.active_requests,
                 lag,
                 block_data_limit,

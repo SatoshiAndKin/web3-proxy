@@ -4,7 +4,6 @@
 //!
 //! There are a lot of things in tower/axum that i should have used instead of implementing here.
 // TODO: these are only public so docs are generated. What's a better way to do this?
-pub mod authorization;
 pub mod errors;
 pub mod request_id;
 pub mod rpc_proxy_http;

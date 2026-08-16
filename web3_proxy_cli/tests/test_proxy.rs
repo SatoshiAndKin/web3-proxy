@@ -56,6 +56,23 @@ async fn it_starts_and_stops() {
     assert_eq!(status_response.unwrap().status(), StatusCode::OK);
 
     let client = reqwest::Client::new();
+    for path in ["", "fastest", "versus"] {
+        let response = client
+            .post(format!("{}{}", proxy_url, path))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(
+                sonic_rs::to_vec(&json!({"jsonrpc": "2.0", "method": "eth_chainId", "id": 1}))
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "route /{path}");
+
+        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(body["result"], json!("0x7a69"), "route /{path}");
+    }
+
     let removed_key_route = client
         .post(format!("{}rpc/removed-key", proxy_url))
         .header(header::CONTENT_TYPE, "application/json")
@@ -79,6 +96,13 @@ async fn it_starts_and_stops() {
         .unwrap();
 
     assert_eq!(anvil_result, proxy_result);
+
+    let status_response = reqwest::get(format!("{}status", proxy_url)).await.unwrap();
+    let status: Value = serde_json::from_slice(&status_response.bytes().await.unwrap()).unwrap();
+    let backend = &status["balanced_rpcs"]["conns"][0];
+    assert!(backend["total_requests"].as_u64().unwrap() > 0);
+    assert!(backend.get("internal_requests").is_none());
+    assert!(backend.get("external_requests").is_none());
 
     let first_block_num = anvil_result.number();
 

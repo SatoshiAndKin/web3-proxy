@@ -89,13 +89,11 @@ pub struct Web3Rpc {
     pub(super) peak_latency: Option<PeakEwmaLatency>,
     /// Automatically set priority based on request latency and active requests
     pub(super) tier: AtomicU32,
-    /// Track total internal requests served
-    pub(super) internal_requests: AtomicUsize,
-    /// Track total external requests served
-    pub(super) external_requests: AtomicUsize,
+    /// Track total requests served.
+    pub(super) total_requests: AtomicUsize,
     /// If the head block is too old, it is ignored.
     pub(super) max_head_block_age: Duration,
-    /// Track time used by external requests served
+    /// Track request latency.
     /// request_ms_histogram is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) median_latency: Option<RollingQuantileLatency>,
     /// disconnect_watch is only inside an Option so that the "Default" derive works. it will always be set.
@@ -754,8 +752,7 @@ impl Web3Rpc {
                         break;
                     }
 
-                    // new_total_requests = rpc.internal_requests.load(atomic::Ordering::SeqCst)
-                    //     + rpc.external_requests.load(atomic::Ordering::SeqCst);
+                    // new_total_requests = rpc.total_requests.load(atomic::Ordering::Relaxed);
 
                     // let detailed_healthcheck = new_total_requests - old_total_requests < 5;
 
@@ -1273,7 +1270,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 16)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 15)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
@@ -1306,13 +1303,8 @@ impl Serialize for Web3Rpc {
         }
 
         state.serialize_field(
-            "external_requests",
-            &self.external_requests.load(atomic::Ordering::SeqCst),
-        )?;
-
-        state.serialize_field(
-            "internal_requests",
-            &self.internal_requests.load(atomic::Ordering::SeqCst),
+            "total_requests",
+            &self.total_requests.load(atomic::Ordering::Relaxed),
         )?;
 
         state.serialize_field(

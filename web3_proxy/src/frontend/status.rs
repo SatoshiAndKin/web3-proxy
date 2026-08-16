@@ -13,7 +13,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use axum_client_ip::RightmostXForwardedFor as ClientIp;
 use axum_macros::debug_handler;
 use hashbrown::HashMap;
 use http::HeaderMap;
@@ -34,11 +33,7 @@ static CONTENT_TYPE_JSON: &str = "application/json";
 static CONTENT_TYPE_PLAIN: &str = "text/plain";
 
 #[debug_handler]
-pub async fn debug_request(
-    State(app): State<Arc<App>>,
-    ip: ClientIp,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn debug_request(State(app): State<Arc<App>>, headers: HeaderMap) -> impl IntoResponse {
     let (_, _, status) = _status(app).await;
 
     let status: Value = sonic_rs::from_slice(&status).unwrap();
@@ -63,7 +58,6 @@ pub async fn debug_request(
         .collect();
 
     let x = json!({
-        "ip": format!("{:?}", ip),
         "status": status,
         "headers": headers,
     });
@@ -164,9 +158,6 @@ async fn _status(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
     let body = json!({
         "balanced_rpcs": app.balanced_rpcs,
         "bundler_4337_rpcs": app.bundler_4337_rpcs,
-        "caches": [
-            MokaCacheSerializer(&app.ip_semaphores),
-        ],
         "chain_id": app.config.chain_id,
         "head_block_hash": head_block.as_ref().map(|x| x.hash()),
         "head_block_num": head_block.as_ref().map(|x| x.number()),

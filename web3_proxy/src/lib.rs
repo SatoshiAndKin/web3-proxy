@@ -9,6 +9,5 @@ pub mod frontend;
 pub mod globals;
 pub mod jsonrpc;
 pub mod prelude;
-pub mod prometheus;
 pub mod rpcs;
 pub mod test_utils;

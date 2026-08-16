@@ -18,9 +18,6 @@ redirect_public_url = "https://llamanodes.com/public-rpc"
 # sentry is optional. it is used for browsing error logs
 # sentry_url = "https://SENTRY_KEY_A.ingest.sentry.io/SENTRY_KEY_B"
 
-# Public concurrency limits group clients by IP address.
-public_max_concurrent_requests = 3
-
 [balanced_rpcs]
 
     [balanced_rpcs.llamanodes]

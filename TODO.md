@@ -39,7 +39,6 @@ These are roughly in order of completition
 - [x] if web3 proxy gets an http error back, retry another node
 - [x] endpoint for health checks. if no synced servers, give a 502 error
 - [x] rpc errors propagate too far. one subscription failing ends the app. isolate the providers more (might already be fixed)
-- [x] incoming rate limiting (by ip)
 - [x] automatically route to archive server when necessary
   - originally, no processing was done to params; they were raw JSON. this is probably fastest, but we need to look for "latest" and count elements, so we have to use sonic_rs::Value
   - when getting the next server, filtering on "archive" isn't going to work well. need to check inner instead
@@ -136,8 +135,6 @@ These are roughly in order of completition
   - we weren't calling sync. now we are
 - [x] ip blocking logs a warn. we don't need that
 - [x] get to /, when not serving a websocket, should have a simple welcome page. maybe with a button to update your wallet. 
-- [x] instead of giving a rate limit error code, delay the connection's response at the start. reject if incoming requests is super high?
-  - [x] did this by checking an IP-specific semaphore before checking rate limits
 - [x] improve `web3_proxy_cli check_config`
   - print out warnings if important settings are missing
 - [x] if unknown config items, error
@@ -156,7 +153,6 @@ These are roughly in order of completition
 - [x] include if archive query or not in the stats
 - [x] fix test not shutting down
 - [x] /status should include the server weights
-- [x] improve rate limiting anon ips
 - [x] test that runs check_config against example.toml
 - [x] improve sorting servers by weight. don't force to lower weights, still have a probability that smaller weights might be 
 - [x] flamegraphs show 52% of the time to be in tracing. replace with simpler logging
@@ -214,7 +210,6 @@ These are not yet ordered. There might be duplicates. We might not actually need
 - [x] standalone healthcheck daemon (sentryd)
 - [x] status page should show version
 - [x] combine the proxy and cli into one bin
-- [x] improve rate limiting on websockets
 - [x] retry another server if we get a jsonrpc response error about rate limits
 - [x] major refactor to only use backup servers when absolutely necessary
 - [x] remove allowed lag
@@ -256,7 +251,6 @@ These are not yet ordered. There might be duplicates. We might not actually need
         }
 - [x] add a "failover" tier that is only used if balanced_rpcs has "no servers synced"
   - use this tier (and private tier) to check timestamp on latest block. if we are behind that by more than a few seconds, something is wrong
-- [x] cli flag to set prometheus port
 - [x] eth_getLogs is going to unsynced nodes because it only checks start block and not the end block
 - [x] have multiple providers on each backend rpc. one websocket for newHeads. and then http providers for handling requests
   - erigon only streams the JSON over HTTP. that code isn't enabled for websockets. so this should save memory on the erigon servers
@@ -507,11 +501,6 @@ in another repo: event subscriber
 - [ ] tarpit instead of reject requests (unless theres a lot)
 - [ ] archive servers should be lowest priority
 - [ ] docker build context is really big. we must be including target or something
-- [ ] fix ip detection when running in dev
-- [ ] rate limit thoughts:
-  - if someone subscribes to all pending transactions, how should that count against rate limits
-  - when those rate limits are hit, what should happen?
-  - missing pending transactions might be okay, but not missing confirmed blocks 
 - [ ] this query always times out, but erigon can serve it quickly: `curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"debug_traceBlockByNumber","params":["latest"],"id":1}' 127.0.0.1:8544' 127.0.0.1:8544`
   {"jsonrpc":"2.0","id":null,"error":{"code":-32099,"message":"deadline has elapsed"}}
   - [ ] figure out rate limits for private rpcs. eden v1 gives 500 error instead of a code for rate limits
@@ -530,7 +519,6 @@ in another repo: event subscriber
 - [ ] failsafe. if no blocks or transactions in some time, warn and reset the connection
 - [ ] having tons of worker threads can actually make us slower if they keep waking to steal work from eachother. need benchmarks
 - [ ] change the wrk data to log requests and errors to a file
-- [ ] allow passing the authorization header to the anonymous rpc endpoint
 - [ ] sentry profiling
 - [ ] support alchemy_minedTransactions
 - [ ] we need to use docker-compose's proper environment variable handling. because now if someone tries to start dev containers in their prod, remove orphans stops and removes them

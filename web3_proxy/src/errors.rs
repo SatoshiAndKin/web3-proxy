@@ -158,14 +158,11 @@ pub enum Web3ProxyError {
 #[derive(Default, From, Serialize)]
 pub enum RequestForError<'a> {
     /// sometimes we don't have a request object at all
-    /// TODO: attach Authorization to this, too
     #[default]
     None,
     /// sometimes parsing the request fails. Give them the original string
-    /// TODO: attach Authorization to this, too
     Unparsed(&'a str),
     /// sometimes we have json
-    /// TODO: attach Authorization to this, too
     SingleRequest(&'a SingleRequest),
     // sometimes we have json for a batch of requests
     // Batch(&'a BatchRequest),

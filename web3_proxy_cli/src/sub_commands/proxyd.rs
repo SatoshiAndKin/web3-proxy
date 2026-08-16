@@ -6,6 +6,7 @@ use std::{fs, thread};
 use tracing::{error, info, trace, warn};
 use web3_proxy::app::App;
 use web3_proxy::config::TopConfig;
+use web3_proxy::frontend;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::futures::StreamExt;
@@ -16,7 +17,6 @@ use web3_proxy::prelude::tokio::signal::unix::SignalKind;
 use web3_proxy::prelude::tokio::sync::broadcast;
 use web3_proxy::prelude::tokio::time::{sleep_until, Instant};
 use web3_proxy::prelude::tokio::{select, signal};
-use web3_proxy::{frontend, prometheus};
 
 /// start the main proxy daemon
 #[derive(FromArgs, PartialEq, Debug, Eq)]
@@ -26,10 +26,6 @@ pub struct ProxydSubCommand {
     /// what port the proxy should listen on
     #[argh(option, default = "8544")]
     pub port: u16,
-
-    /// what port the proxy should expose prometheus stats on
-    #[argh(option, default = "8543")]
-    pub prometheus_port: u16,
 }
 
 impl ProxydSubCommand {
@@ -38,12 +34,10 @@ impl ProxydSubCommand {
         // TODO: i think there is a small race. if config_path changes
 
         let frontend_port = Arc::new(self.port.into());
-        let prometheus_port = Arc::new(self.prometheus_port.into());
         Self::_main(
             top_config,
             Some(top_config_path),
             frontend_port,
-            prometheus_port,
             frontend_shutdown_sender,
         )
         .await
@@ -54,7 +48,6 @@ impl ProxydSubCommand {
         top_config: TopConfig,
         top_config_path: Option<PathBuf>,
         frontend_port: Arc<AtomicU16>,
-        prometheus_port: Arc<AtomicU16>,
         frontend_shutdown_sender: broadcast::Sender<()>,
     ) -> anyhow::Result<()> {
         let mut terminate_stream = signal::unix::signal(SignalKind::terminate())?;
@@ -65,7 +58,6 @@ impl ProxydSubCommand {
         let (app_shutdown_sender, _app_shutdown_receiver) = broadcast::channel(1);
 
         let frontend_shutdown_receiver = frontend_shutdown_sender.subscribe();
-        let prometheus_shutdown_receiver = app_shutdown_sender.subscribe();
 
         // TODO: should we use a watch or broadcast for these?
         let (frontend_shutdown_complete_sender, mut frontend_shutdown_complete_receiver) =
@@ -74,7 +66,6 @@ impl ProxydSubCommand {
         // start the main app
         let mut spawned_app = App::spawn(
             frontend_port,
-            prometheus_port,
             top_config.clone(),
             app_shutdown_sender.clone(),
         )
@@ -132,12 +123,6 @@ impl ProxydSubCommand {
                 });
             }
         }
-
-        // start the prometheus metrics port
-        let prometheus_handle = tokio::spawn(prometheus::serve(
-            spawned_app.app.clone(),
-            prometheus_shutdown_receiver,
-        ));
 
         info!("waiting up to 60 seconds for a head block");
         let max_wait_until = Instant::now() + Duration::from_secs(60);
@@ -229,20 +214,6 @@ impl ProxydSubCommand {
                     }
                     Err(e) => {
                         error!(?e, "join on frontend failed");
-                        exited_with_err = true;
-
-                    }
-                }
-            }
-            x = prometheus_handle => {
-                match x {
-                    Ok(Ok(_)) => info!("prometheus exited"),
-                    Ok(Err(e)) => {
-                        error!("prometheus exited: {:#?}", e);
-                        exited_with_err = true;
-                    }
-                    Err(e) => {
-                        error!(?e, "join on prometheus failed");
                         exited_with_err = true;
 
                     }

@@ -1,9 +1,4 @@
 use super::LooseId;
-use crate::app::App;
-use crate::errors::{RequestForError, Web3ProxyError};
-use crate::frontend::authorization::{Authorization, RequestOrMethod};
-use crate::jsonrpc::ValidatedRequest;
-use axum::response::Response as AxumResponse;
 use derive_more::From;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -11,9 +6,6 @@ use serde_inline_default::serde_inline_default;
 use sonic_rs::{OwnedLazyValue, Value};
 use std::borrow::Cow;
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::sleep;
 
 // TODO: &str here instead of String should save a lot of allocations
 // TODO: generic type for params?
@@ -97,53 +89,6 @@ impl JsonRpcRequestEnum {
                 }
             }
         }
-    }
-
-    /// returns the id of the first invalid result (if any). None is good
-    pub async fn tarpit_invalid(
-        &self,
-        app: &Arc<App>,
-        authorization: &Arc<Authorization>,
-        duration: Duration,
-    ) -> Result<(), Box<AxumResponse>> {
-        let err_id = match self.validate() {
-            None => return Ok(()),
-            Some(x) => x,
-        };
-
-        let size = sonic_rs::to_string(&self)
-            .expect("JsonRpcRequestEnum should always serialize")
-            .len();
-
-        // TODO: this probably needs a permit
-        let request = ValidatedRequest::new_with_app(
-            app,
-            authorization.clone(),
-            None,
-            None,
-            RequestOrMethod::Method("invalid_method".into(), size),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        {
-            let mut response_lock = request.response.lock();
-
-            response_lock.user_error_response = true;
-        }
-
-        let response = Web3ProxyError::BadRequest("request failed validation".into());
-
-        request.set_response(&response);
-
-        let response = response.into_response_with_id(Some(err_id), None::<RequestForError>);
-
-        // TODO: variable duration depending on the IP
-        sleep(duration).await;
-
-        Err(Box::new(response))
     }
 }
 

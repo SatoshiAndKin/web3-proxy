@@ -4,7 +4,6 @@ pub use argh;
 pub use chrono;
 pub use fdlimit;
 pub use futures;
-pub use glob;
 pub use hashbrown;
 pub use http;
 pub use moka;

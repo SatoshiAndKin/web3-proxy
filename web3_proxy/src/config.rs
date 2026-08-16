@@ -79,11 +79,6 @@ pub struct AppConfig {
     #[serde_inline_default(1usize)]
     pub min_synced_rpcs: usize,
 
-    /// Concurrent request limit for anonymous users.
-    /// Some(0) = block all requests
-    /// None = allow all requests
-    pub public_max_concurrent_requests: Option<usize>,
-
     /// the stats page url for an anonymous user.
     pub redirect_public_url: Option<String>,
 

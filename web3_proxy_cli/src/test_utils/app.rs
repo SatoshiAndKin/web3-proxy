@@ -6,7 +6,7 @@ use web3_proxy::config::{AppConfig, TopConfig, Web3RpcConfig};
 use web3_proxy::prelude::alloy::providers::ProviderBuilder;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::hashbrown::HashMap;
-use web3_proxy::prelude::reqwest::{self, header::HeaderMap};
+use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::sonic_rs::{self, json};
 use web3_proxy::prelude::tokio::{
     runtime::Builder,
@@ -57,7 +57,6 @@ impl TestApp {
 
         let (shutdown_sender, _) = broadcast::channel(1);
         let frontend_port = Arc::new(AtomicU16::new(0));
-        let prometheus_port = Arc::new(AtomicU16::new(0));
 
         let proxy_handle = {
             let frontend_port = frontend_port.clone();
@@ -72,7 +71,6 @@ impl TestApp {
                         top_config,
                         None,
                         frontend_port,
-                        prometheus_port,
                         shutdown_sender,
                     ))
             })
@@ -90,12 +88,7 @@ impl TestApp {
         let proxy_url: Url = format!("http://127.0.0.1:{}", frontend_port.load(Ordering::SeqCst))
             .parse()
             .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .unwrap();
+        let client = reqwest::Client::new();
         let proxy_provider = ProviderBuilder::default().connect_reqwest(client, proxy_url.clone());
 
         Self {

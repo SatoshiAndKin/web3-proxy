@@ -2,7 +2,6 @@
 //!
 //! WebSockets are the preferred method of receiving requests, but not all clients have good support.
 
-use super::authorization::{ip_is_authorized, Authorization};
 use crate::errors::{RequestForError, Web3ProxyError, Web3ProxyResponse};
 use crate::jsonrpc::{self, ParsedResponse, ValidatedRequest};
 use crate::{app::App, errors::Web3ProxyResult, jsonrpc::SingleRequest};
@@ -12,7 +11,6 @@ use axum::{
     extract::State,
     response::{IntoResponse, Redirect},
 };
-use axum_client_ip::RightmostXForwardedFor as ClientIp;
 use axum_macros::debug_handler;
 use futures::SinkExt;
 use futures::{
@@ -21,12 +19,11 @@ use futures::{
 };
 use hashbrown::HashMap;
 use sonic_rs::{json, JsonValueTrait};
-use std::net::IpAddr;
 use std::str::from_utf8;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::select;
-use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, RwLock as AsyncRwLock};
+use tokio::sync::{broadcast, mpsc, RwLock as AsyncRwLock};
 use tracing::trace;
 
 /// How to select backend servers for a request
@@ -37,8 +34,6 @@ pub enum ProxyMode {
     Best,
     /// send to all synced servers and return the fastest non-error response (reverts do not count as errors here)
     Fastest(usize),
-    /// send to k servers and return the best response common between at least n servers
-    Quorum(usize, usize),
     /// send to all servers for benchmarking. return the fastest non-error response
     Versus,
 }
@@ -48,10 +43,9 @@ pub enum ProxyMode {
 #[debug_handler]
 pub async fn websocket_handler(
     State(app): State<Arc<App>>,
-    ClientIp(ip): ClientIp,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
-    _websocket_handler(ProxyMode::Best, app, &ip, ws_upgrade).await
+    _websocket_handler(ProxyMode::Best, app, ws_upgrade).await
 }
 
 /// Public entrypoint for WebSocket JSON-RPC requests that uses all synced servers.
@@ -59,12 +53,11 @@ pub async fn websocket_handler(
 // #[debug_handler]
 pub async fn fastest_websocket_handler(
     State(app): State<Arc<App>>,
-    ClientIp(ip): ClientIp,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     // TODO: get the fastest number from the url params (default to 0/all)
     // TODO: config to disable this
-    _websocket_handler(ProxyMode::Fastest(0), app, &ip, ws_upgrade).await
+    _websocket_handler(ProxyMode::Fastest(0), app, ws_upgrade).await
 }
 
 /// Public entrypoint for WebSocket JSON-RPC requests that uses all synced servers.
@@ -72,26 +65,20 @@ pub async fn fastest_websocket_handler(
 #[debug_handler]
 pub async fn versus_websocket_handler(
     State(app): State<Arc<App>>,
-    ClientIp(ip): ClientIp,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
     // TODO: config to disable this
-    _websocket_handler(ProxyMode::Versus, app, &ip, ws_upgrade).await
+    _websocket_handler(ProxyMode::Versus, app, ws_upgrade).await
 }
 
 async fn _websocket_handler(
     proxy_mode: ProxyMode,
     app: Arc<App>,
-    ip: &IpAddr,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
-    let authorization = ip_is_authorized(&app, ip, proxy_mode).await?;
-
-    let authorization = Arc::new(authorization);
-
     match ws_upgrade {
         Ok(ws) => Ok(ws
-            .on_upgrade(move |socket| proxy_web3_socket(app, authorization, socket))
+            .on_upgrade(move |socket| proxy_web3_socket(app, proxy_mode, socket))
             .into_response()),
         Err(_) => {
             if let Some(redirect) = &app.config.redirect_public_url {
@@ -104,23 +91,23 @@ async fn _websocket_handler(
     }
 }
 
-async fn proxy_web3_socket(app: Arc<App>, authorization: Arc<Authorization>, socket: WebSocket) {
+async fn proxy_web3_socket(app: Arc<App>, proxy_mode: ProxyMode, socket: WebSocket) {
     // split the websocket so we can read and write concurrently
     let (ws_tx, ws_rx) = socket.split();
 
-    let buffer = authorization.checks.max_concurrent_requests.unwrap_or(2048);
+    let buffer = 2048;
 
     // create a channel for our reader and writer can communicate. todo: benchmark different channels
     // TODO: this should be bounded. async blocking on too many messages would be fine
     let (response_sender, response_receiver) = mpsc::channel::<Message>(buffer);
 
     tokio::spawn(write_web3_socket(response_receiver, ws_tx));
-    tokio::spawn(read_web3_socket(app, authorization, ws_rx, response_sender));
+    tokio::spawn(read_web3_socket(app, proxy_mode, ws_rx, response_sender));
 }
 
 async fn websocket_proxy_web3_rpc(
     app: &Arc<App>,
-    authorization: Arc<Authorization>,
+    proxy_mode: ProxyMode,
     json_request: SingleRequest,
     response_sender: &mpsc::Sender<Message>,
     subscription_count: &AtomicU64,
@@ -128,11 +115,9 @@ async fn websocket_proxy_web3_rpc(
 ) -> Web3ProxyResult<jsonrpc::Response> {
     match &json_request.method[..] {
         "eth_subscribe" => {
-            // todo!(this needs a permit)
             let web3_request = ValidatedRequest::new_with_app(
                 app,
-                authorization,
-                None,
+                proxy_mode,
                 None,
                 json_request.into(),
                 None,
@@ -164,11 +149,9 @@ async fn websocket_proxy_web3_rpc(
             }
         }
         "eth_unsubscribe" => {
-            // todo!(this needs a permit)
             let web3_request = ValidatedRequest::new_with_app(
                 app,
-                authorization,
-                None,
+                proxy_mode,
                 None,
                 json_request.into(),
                 None,
@@ -217,7 +200,7 @@ async fn websocket_proxy_web3_rpc(
             Ok(response.into())
         }
         _ => app
-            .proxy_web3_rpc(authorization, json_request.into(), None)
+            .proxy_web3_rpc(proxy_mode, json_request.into(), None)
             .await
             .map(|(_, response, _)| response),
     }
@@ -226,14 +209,12 @@ async fn websocket_proxy_web3_rpc(
 /// websockets support a few more methods than http clients
 async fn handle_socket_payload(
     app: &Arc<App>,
-    authorization: &Arc<Authorization>,
+    proxy_mode: ProxyMode,
     payload: &str,
     response_sender: &mpsc::Sender<Message>,
     subscription_count: &AtomicU64,
     subscriptions: Arc<AsyncRwLock<HashMap<U64, AbortHandle>>>,
-) -> Web3ProxyResult<(Message, Option<OwnedSemaphorePermit>)> {
-    let (authorization, semaphore) = authorization.check_again(app).await?;
-
+) -> Web3ProxyResult<Message> {
     // TODO: handle batched requests
     let (response_id, response) = match sonic_rs::from_str::<SingleRequest>(payload) {
         Ok(json_request) => {
@@ -242,7 +223,7 @@ async fn handle_socket_payload(
             // TODO: move this to a seperate function so we can use the try operator
             let x = websocket_proxy_web3_rpc(
                 app,
-                authorization.clone(),
+                proxy_mode,
                 json_request,
                 response_sender,
                 subscription_count,
@@ -266,12 +247,12 @@ async fn handle_socket_payload(
         }
     };
 
-    Ok((Message::Text(response_str.into()), semaphore))
+    Ok(Message::Text(response_str.into()))
 }
 
 async fn read_web3_socket(
     app: Arc<App>,
-    authorization: Arc<Authorization>,
+    proxy_mode: ProxyMode,
     mut ws_rx: SplitStream<WebSocket>,
     response_sender: mpsc::Sender<Message>,
 ) {
@@ -287,35 +268,33 @@ async fn read_web3_socket(
                     // clone things so we can handle multiple messages in parallel
                     let close_sender = close_sender.clone();
                     let app = app.clone();
-                    let authorization = authorization.clone();
                     let response_sender = response_sender.clone();
                     let subscriptions = subscriptions.clone();
                     let subscription_count = subscription_count.clone();
 
                     let f = async move {
                         // new message from our client. forward to a backend and then send it through response_sender
-                        let (response_msg, _semaphore) = match msg {
+                        let response_msg = match msg {
                             Message::Text(payload) => {
                                 match handle_socket_payload(
                                     &app,
-                                    &authorization,
+                                    proxy_mode,
                                     &payload,
                                     &response_sender,
                                     &subscription_count,
                                     subscriptions,
                                 )
                                 .await {
-                                    Ok((m, s)) => (m, Some(s)),
+                                    Ok(message) => message,
                                     Err(err) => {
                                         // TODO: how can we get the id out of the payload?
-                                        let m = err.into_message(None, None::<RequestForError>);
-                                        (m, None)
+                                        err.into_message(None, None::<RequestForError>)
                                     }
                                 }
                             }
                             Message::Ping(x) => {
                                 trace!("ping: {:?}", x);
-                                (Message::Pong(x), None)
+                                Message::Pong(x)
                             }
                             Message::Pong(x) => {
                                 trace!("pong: {:?}", x);
@@ -330,20 +309,19 @@ async fn read_web3_socket(
                             Message::Binary(payload) => {
                                 let payload = from_utf8(&payload).unwrap();
 
-                                let (m, s) = match handle_socket_payload(
+                                let m = match handle_socket_payload(
                                     &app,
-                                    &authorization,
+                                    proxy_mode,
                                     payload,
                                     &response_sender,
                                     &subscription_count,
                                     subscriptions,
                                 )
                                 .await {
-                                    Ok((m, s)) => (m, Some(s)),
+                                    Ok(message) => message,
                                     Err(err) => {
                                         // TODO: how can we get the id out of the payload?
-                                        let m = err.into_message(None, None::<RequestForError>);
-                                        (m, None)
+                                        err.into_message(None, None::<RequestForError>)
                                     }
                                 };
 
@@ -354,7 +332,7 @@ async fn read_web3_socket(
                                     unimplemented!();
                                 };
 
-                                (m, s)
+                                m
                             }
                         };
 
@@ -383,8 +361,6 @@ async fn write_web3_socket(
 
     while let Some(msg) = response_rx.recv().await {
         // a response is ready
-
-        // we do not check rate limits here. they are checked before putting things into response_sender;
 
         // forward the response to through the websocket
         if let Err(err) = ws_tx.send(msg).await {

@@ -46,12 +46,6 @@ Quickly run tests:
 RUST_BACKTRACE=1 RUST_LOG=web3_proxy=trace,info cargo nextest run
 ```
 
-Run more tests:
-
-```
-RUST_BACKTRACE=1 RUST_LOG=web3_proxy=trace,info cargo nextest run --features tests-needing-docker
-```
-
 ## Common commands
 
 Check that the proxy is working:

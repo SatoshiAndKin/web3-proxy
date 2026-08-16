@@ -1,6 +1,5 @@
 use super::one::Web3Rpc;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
-use crate::frontend::authorization::AuthorizationType;
 use crate::jsonrpc::{
     self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
 };
@@ -195,7 +194,7 @@ impl OpenRequestHandle {
 
             let response = response.error_for_status()?;
 
-            // cache 128kb responses
+            // Buffer responses up to 128 KiB. Stream larger responses.
             jsonrpc::SingleResponse::read_if_short(response, 131_072, &self.web3_request).await
         } else if let Some(p) = self.rpc.ws_provider.load().as_ref() {
             // use the websocket provider if no other provider is available
@@ -244,22 +243,9 @@ impl OpenRequestHandle {
         // trace!(rpc=%self.rpc, %method, "request");
         trace!("requesting from {}", self.rpc);
 
-        let authorization = &self.web3_request.authorization;
-
-        match &authorization.authorization_type {
-            AuthorizationType::Remote => {
-                // this is just a debug counter, so Relaxed is probably fine
-                self.rpc
-                    .external_requests
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            AuthorizationType::Internal => {
-                // this is just a debug counter, so Relaxed is probably fine
-                self.rpc
-                    .internal_requests
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
+        self.rpc
+            .total_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // we used to fetch_add the active_request count here, but sometimes a request is made without going through this function (like with subscriptions)
 

@@ -344,14 +344,6 @@ impl Web3Rpcs {
         self.min_synced_rpcs
     }
 
-    /// TODO: i think this RpcsForRequest should be stored on the ValidatedRequest when its made. that way any waiting for sync happens early and we don't need waiting anywhere else in the app
-    pub async fn wait_for_rpcs_for_request(
-        &self,
-        web3_request: &Arc<ValidatedRequest>,
-    ) -> Web3ProxyResult<RpcsForRequest> {
-        self.try_rpcs_for_request(web3_request).await
-    }
-
     /// get all rpc servers that are not rate limited
     /// this prefers synced servers, but it will return servers even if they aren't fully in sync.
     /// this does not gaurentee you won't be rate limited. we don't increment our counters until you try to send. so you might have to wait to be able to send
@@ -542,7 +534,6 @@ impl Web3Rpcs {
         match proxy_mode {
             ProxyMode::Best => self.request_with_metadata(web3_request).await,
             ProxyMode::Fastest(_x) => todo!("Fastest"),
-            ProxyMode::Quorum(_x, _y) => todo!("Quorum"),
             ProxyMode::Versus => todo!("Versus"),
         }
     }

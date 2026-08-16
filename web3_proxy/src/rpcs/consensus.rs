@@ -947,8 +947,6 @@ impl RpcsForRequest {
     pub fn to_stream(self) -> impl Stream<Item = OpenRequestHandle> {
         stream! {
             trace!("entered stream");
-            // TODO: get error_handler out of the web3_request? probably the authorization
-            // let error_handler = web3_request.authorization.error_handler;
             let error_handler = None;
 
             // todo!("be sure to set server_error if we exit without any rpcs!");

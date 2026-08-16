@@ -2,9 +2,8 @@
 
 use super::App;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
-use crate::frontend::authorization::RequestOrMethod;
 use crate::jsonrpc::ResponseData;
-use crate::jsonrpc::{self, ValidatedRequest};
+use crate::jsonrpc::{self, RequestOrMethod, ValidatedRequest};
 use alloy::primitives::U64;
 use axum::extract::ws::Message;
 use futures::future::AbortHandle;
@@ -51,7 +50,7 @@ impl App {
                 // TODO: watch receivers can miss a block. is that okay?
                 let head_block_receiver = self.watch_consensus_head_receiver.clone();
                 let app = self.clone();
-                let authorization = web3_request.authorization.clone();
+                let proxy_mode = web3_request.proxy_mode();
 
                 tokio::spawn(async move {
                     trace!("newHeads subscription {:?}", subscription_id);
@@ -68,11 +67,9 @@ impl App {
                             continue;
                         };
 
-                        // todo!(this needs a permit)
                         let subscription_web3_request = ValidatedRequest::new_with_app(
                             &app,
-                            authorization.clone(),
-                            None,
+                            proxy_mode,
                             None,
                             RequestOrMethod::Method("eth_subscribe(newHeads)".into(), 0),
                             Some(new_head),
@@ -128,7 +125,7 @@ impl App {
                 // we subscribe before spawning so that theres less chance of missing anything
                 let pending_txid_firehose = self.pending_txid_firehose.subscribe();
                 let app = self.clone();
-                let authorization = web3_request.authorization.clone();
+                let proxy_mode = web3_request.proxy_mode();
 
                 tokio::spawn(async move {
                     let mut pending_txid_firehose = Abortable::new(
@@ -147,11 +144,9 @@ impl App {
                             }
                             Ok(new_txid) => {
                                 // TODO: include the head_block here?
-                                // todo!(this needs a permit)
                                 match ValidatedRequest::new_with_app(
                                     &app,
-                                    authorization.clone(),
-                                    None,
+                                    proxy_mode,
                                     None,
                                     RequestOrMethod::Method(
                                         "eth_subscribe(newPendingTransactions)".into(),

@@ -2,11 +2,11 @@ mod ws;
 
 use crate::config::{AppConfig, TopConfig};
 use crate::errors::{RequestForError, Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
-use crate::frontend::authorization::Authorization;
+use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::globals::APP;
 use crate::jsonrpc::{
-    self, JsonRpcErrorData, JsonRpcParams, JsonRpcRequestEnum, JsonRpcResultData, LooseId,
-    ResponseData, SingleRequest, SingleResponse, ValidatedRequest,
+    self, JsonRpcErrorData, JsonRpcRequestEnum, ResponseData, SingleRequest, SingleResponse,
+    ValidatedRequest,
 };
 use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::consensus::RankedRpcs;
@@ -20,10 +20,8 @@ use deduped_broadcast::DedupedBroadcaster;
 use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use hashbrown::HashSet;
-use moka::future::{Cache, CacheBuilder};
 use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, OwnedLazyValue};
 use std::fmt;
-use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
@@ -65,11 +63,8 @@ pub struct App {
     pub pending_txid_firehose: Arc<DedupedBroadcaster<TxHash>>,
     pub hostname: Option<String>,
     pub frontend_port: Arc<AtomicU16>,
-    /// Concurrent request limits for public IP addresses.
-    pub ip_semaphores: Cache<IpAddr, Arc<Semaphore>>,
     /// Send private requests (like eth_sendRawTransaction) to all these servers
     pub protected_rpcs: Arc<Web3Rpcs>,
-    pub prometheus_port: Arc<AtomicU16>,
     /// when the app started
     pub start: Instant,
     /// limit the number of tx subscriptions
@@ -98,7 +93,6 @@ impl App {
     /// The main entrypoint.
     pub async fn spawn(
         frontend_port: Arc<AtomicU16>,
-        prometheus_port: Arc<AtomicU16>,
         mut top_config: TopConfig,
         shutdown_sender: broadcast::Sender<()>,
     ) -> anyhow::Result<Web3ProxyAppSpawn> {
@@ -110,10 +104,6 @@ impl App {
         let (new_top_config_sender, mut new_top_config_receiver) =
             watch::channel(top_config.clone());
         new_top_config_receiver.borrow_and_update();
-
-        // TODO: take this from config
-        // TODO: how should we handle hitting this max?
-        let max_clients = 20_000;
 
         // we must wait for these to end on their own (and they need to subscribe to shutdown_sender)
         // TODO: is FuturesUnordered what we need? I want to return when the first one returns
@@ -136,10 +126,6 @@ impl App {
         );
 
         let (watch_consensus_head_sender, watch_consensus_head_receiver) = watch::channel(None);
-
-        // create semaphores for concurrent connection limits
-        // TODO: time-to-idle on these. need to make sure the arcs aren't anywhere though. so maybe arc isn't correct and it should be refs
-        let ip_semaphores = CacheBuilder::new(max_clients).name("ip_semaphores").build();
 
         let chain_id = top_config.app.chain_id;
 
@@ -206,10 +192,8 @@ impl App {
             frontend_port: frontend_port.clone(),
             hostname,
             http_client,
-            ip_semaphores,
             pending_txid_firehose: deduped_txid_firehose,
             protected_rpcs: private_rpcs,
-            prometheus_port: prometheus_port.clone(),
             start: Instant::now(),
             watch_consensus_head_receiver,
             tx_subscriptions,
@@ -322,54 +306,10 @@ impl App {
         self.watch_consensus_head_receiver.clone()
     }
 
-    pub async fn prometheus_metrics(&self) -> String {
-        String::new()
-    }
-
-    /// Make an internal request.
-    pub async fn internal_request<P: JsonRpcParams, R: JsonRpcResultData>(
-        self: &Arc<Self>,
-        method: &str,
-        params: P,
-    ) -> Web3ProxyResult<R> {
-        let authorization = Arc::new(Authorization::internal());
-
-        self.authorized_request(method, params, authorization, None)
-            .await
-    }
-
-    /// Route an internal request through the same validation path as external requests.
-    pub async fn authorized_request<P: JsonRpcParams, R: JsonRpcResultData>(
-        self: &Arc<Self>,
-        method: &str,
-        params: P,
-        authorization: Arc<Authorization>,
-        request_id: Option<String>,
-    ) -> Web3ProxyResult<R> {
-        // TODO: proper ids
-        let request =
-            SingleRequest::new(LooseId::Number(1), method.to_string().into(), json!(params))?;
-
-        let (_, response, _) = self
-            .proxy_request(request, authorization, None, request_id)
-            .await;
-
-        // TODO: error handling?
-        match response.parsed().await?.payload {
-            jsonrpc::ResponsePayload::Success { result } => {
-                let result = sonic_rs::to_value(result.as_ref())?;
-                Ok(sonic_rs::from_value(&result)?)
-            }
-            jsonrpc::ResponsePayload::Error { error } => {
-                Err(Web3ProxyError::JsonRpcErrorData(error))
-            }
-        }
-    }
-
     /// send the request or batch of requests to the approriate RPCs
     pub async fn proxy_web3_rpc(
         self: &Arc<Self>,
-        authorization: Arc<Authorization>,
+        proxy_mode: ProxyMode,
         request: JsonRpcRequestEnum,
         request_id: Option<String>,
     ) -> Web3ProxyResult<(StatusCode, jsonrpc::Response, Vec<Arc<Web3Rpc>>)> {
@@ -378,14 +318,14 @@ impl App {
         let response = match request {
             JsonRpcRequestEnum::Single(request) => {
                 let (status_code, response, rpcs) = self
-                    .proxy_request(request, authorization.clone(), None, request_id)
+                    .proxy_request(request, proxy_mode, None, request_id)
                     .await;
 
                 (status_code, jsonrpc::Response::Single(response), rpcs)
             }
             JsonRpcRequestEnum::Batch(requests) => {
                 let (responses, rpcs) = self
-                    .proxy_web3_rpc_requests(&authorization, requests, request_id)
+                    .proxy_web3_rpc_requests(proxy_mode, requests, request_id)
                     .await?;
 
                 // TODO: real status code. if an error happens, i don't think we are following the spec here
@@ -400,7 +340,7 @@ impl App {
     /// TODO: make sure this isn't a problem
     async fn proxy_web3_rpc_requests(
         self: &Arc<Self>,
-        authorization: &Arc<Authorization>,
+        proxy_mode: ProxyMode,
         requests: Vec<SingleRequest>,
         request_id: Option<String>,
     ) -> Web3ProxyResult<(Vec<jsonrpc::ParsedResponse>, Vec<Arc<Web3Rpc>>)> {
@@ -424,7 +364,7 @@ impl App {
                 .map(|request| {
                     self.proxy_request(
                         request,
-                        authorization.clone(),
+                        proxy_mode,
                         Some(head_block.clone()),
                         request_id.clone(),
                     )
@@ -570,7 +510,7 @@ impl App {
     async fn proxy_request(
         self: &Arc<Self>,
         request: SingleRequest,
-        authorization: Arc<Authorization>,
+        proxy_mode: ProxyMode,
         head_block: Option<BlockHeader>,
         request_id: Option<String>,
     ) -> (StatusCode, jsonrpc::SingleResponse, Vec<Arc<Web3Rpc>>) {
@@ -590,8 +530,7 @@ impl App {
 
         let web3_request = match ValidatedRequest::new_with_app(
             self,
-            authorization.clone(),
-            None,
+            proxy_mode,
             None,
             request.into(),
             head_block,
