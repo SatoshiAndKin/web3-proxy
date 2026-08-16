@@ -1,3 +1,4 @@
+use crate::DEFAULT_CONFIG_PATH;
 use std::fs;
 use web3_proxy::config::TopConfig;
 use web3_proxy::prelude::anyhow;
@@ -8,8 +9,8 @@ use web3_proxy::prelude::tracing::info;
 /// Check the config for any problems.
 #[argh(subcommand, name = "check_config")]
 pub struct CheckConfigSubCommand {
-    #[argh(positional)]
-    /// path to the configuration toml.
+    #[argh(positional, default = "DEFAULT_CONFIG_PATH.to_string()")]
+    /// path to the configuration toml; defaults to ./config/development.toml.
     path: String,
 }
 
@@ -40,6 +41,14 @@ mod tests {
     use web3_proxy::prelude::tokio;
 
     use super::*;
+
+    #[test]
+    fn defaults_to_development_toml() {
+        let check_config_command = CheckConfigSubCommand::from_args(&["check_config"], &[])
+            .expect("the command should use the default config path");
+
+        assert_eq!(check_config_command.path, DEFAULT_CONFIG_PATH);
+    }
 
     #[tokio::test]
     async fn check_example_toml() {

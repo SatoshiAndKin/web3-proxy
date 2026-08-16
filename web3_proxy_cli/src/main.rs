@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{prelude::*, EnvFilter};
 use web3_proxy::prelude::alloy::primitives::U256;
 use web3_proxy::{app::APP_USER_AGENT, config::TopConfig};
-use web3_proxy_cli::sub_commands;
+use web3_proxy_cli::{sub_commands, DEFAULT_CONFIG_PATH};
 
 #[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
@@ -124,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     if cli_config.config.is_none() && cli_config.sentry_url.is_none() {
         // TODO: default to example.toml if development.toml doesn't exist
         info!("defaulting to development config");
-        cli_config.config = Some("./config/development.toml".to_string());
+        cli_config.config = Some(DEFAULT_CONFIG_PATH.to_string());
     }
 
     let (top_config, top_config_path) = if let Some(top_config_path) = cli_config.config.clone() {
