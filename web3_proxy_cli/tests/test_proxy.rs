@@ -35,9 +35,9 @@ where
     anvil_result
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn it_starts_and_stops() {
-    let a = TestAnvil::spawn(31337).await;
+    let a = TestAnvil::spawn_chain(31337).await;
 
     let x = TestApp::spawn(&a).await;
 
@@ -123,8 +123,6 @@ async fn it_starts_and_stops() {
 
     assert_eq!(first_block_num, second_block_num - 1);
 
-    yield_now().await;
-
     let mut proxy_result = None;
 
     for _ in 0..10 {
@@ -160,11 +158,11 @@ async fn it_starts_and_stops() {
 
 /// TODO: have another test that queries mainnet so the state is more interesting
 /// TODO: have another test that makes sure error codes match
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn it_matches_anvil() {
     let chain_id = 31337;
 
-    let a = TestAnvil::spawn(chain_id).await;
+    let a = TestAnvil::spawn_chain(chain_id).await;
 
     let _: Value = a.provider.raw_request("evm_mine".into(), ()).await.unwrap();
 

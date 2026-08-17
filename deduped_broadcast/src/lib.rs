@@ -130,7 +130,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::task::yield_now;
 
     #[tokio::test]
     async fn test_deduped_broadcaster() {
@@ -148,13 +147,9 @@ mod tests {
         broadcaster.send(3).await;
         broadcaster.send(3).await;
 
-        yield_now().await;
-
         assert_eq!(receiver_1.recv().await.unwrap(), 1);
         assert_eq!(receiver_1.recv().await.unwrap(), 2);
         assert_eq!(receiver_1.recv().await.unwrap(), 3);
-
-        yield_now().await;
 
         assert_eq!(broadcaster.total_unfiltered.load(Ordering::SeqCst), 7);
         assert_eq!(broadcaster.total_filtered.load(Ordering::SeqCst), 3);

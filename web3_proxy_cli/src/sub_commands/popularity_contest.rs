@@ -31,6 +31,7 @@ struct BackendRpcData<'a> {
     weighted_latency_ms: f64,
 }
 
+/// TODO: i do not understand why we have this. we should be using alloy types
 fn head_block_number(conn: &Object) -> u64 {
     conn.get(&"head_block")
         .and_then(|x| x.get("block"))

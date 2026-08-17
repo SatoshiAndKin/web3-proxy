@@ -236,6 +236,7 @@ impl App {
                     }
 
                     // TODO: add a min time between config changes
+                    // TODO: is this yield actually helpful? i'm not so sure
                     yield_now().await;
                 }
 
