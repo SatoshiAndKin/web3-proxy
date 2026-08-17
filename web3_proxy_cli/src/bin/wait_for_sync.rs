@@ -24,6 +24,7 @@ pub struct CliConfig {
     pub check_url: String,
 
     /// the HTTP RPC to compare against. defaults to LlamaNodes public RPC
+    /// TODO: change this default
     #[argh(option)]
     pub compare_url: Option<String>,
 

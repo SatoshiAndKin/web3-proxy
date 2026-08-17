@@ -35,7 +35,7 @@ use tracing::{error, info, trace};
 // TODO: make this customizable?
 // TODO: include GIT_REF in here. i had trouble getting https://docs.rs/vergen/latest/vergen/ to work with a workspace. also .git is in .dockerignore
 pub static APP_USER_AGENT: &str = concat!(
-    "llamanodes_",
+    "ski_",
     env!("CARGO_PKG_NAME"),
     "/v",
     env!("CARGO_PKG_VERSION")

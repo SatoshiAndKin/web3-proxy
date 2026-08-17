@@ -525,7 +525,7 @@ impl Web3ProxyError {
                         code: -32601,
                         data: Some(json!({
                             "method": method,
-                            "extra": "this method is not currently supported. Come to discord and we can give you options. https://discord.llamanodes.com/",
+                            "extra": "this method is not currently supported.",
                         })),
                     },
                 )
@@ -539,7 +539,7 @@ impl Web3ProxyError {
                         code: StatusCode::INTERNAL_SERVER_ERROR.as_u16().into(),
                         data: Some(json!({
                             "err": "Blocks here must have a number or hash",
-                            "extra": "you found a bug. please contact us if you see this and we can help figure out what happened. https://discord.llamanodes.com/",
+                            "extra": "you found a bug. please contact us if you see this and we can help figure out what happened. https://farcaster.xyz/flashprofits.eth",
                             "request": request_for_error,
                         })),
                     },
