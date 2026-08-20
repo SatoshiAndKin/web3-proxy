@@ -459,6 +459,7 @@ impl RequestBlocks {
                 Ok(Self::None)
             }
             "eth_sendRawTransaction" => Ok(Self::None),
+            "eth_subscribe" => Ok(Self::None),
             "net_listening" => Ok(Self::None),
             "net_version" => Ok(Self::None),
             method => match get_block_param_id(method) {
