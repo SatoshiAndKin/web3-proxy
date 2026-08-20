@@ -425,7 +425,7 @@ impl ConsensusFinder {
         let worst_tier = self.worst_tier().unwrap_or_default();
         let backups_needed = new_ranked_rpcs.backups_needed;
         let consensus_head_block = new_ranked_rpcs.head_block.clone();
-        let num_consensus_rpcs = new_ranked_rpcs.num_active_rpcs();
+        let num_consensus_rpcs = new_ranked_rpcs.num_synced;
         let num_active_rpcs = self.len();
         let total_rpcs = web3_rpcs.len();
 
