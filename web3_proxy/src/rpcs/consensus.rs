@@ -877,6 +877,10 @@ impl ConsensusFinder {
                 backup_entry.0.insert(rpc);
                 backup_entry.1 += rpc.soft_limit;
 
+                if block_to_check.number() == max_lag_block_number {
+                    break;
+                }
+
                 let parent_hash = block_to_check.parent_hash();
 
                 match web3_rpcs.blocks_by_hash.get(parent_hash).await {
@@ -1066,5 +1070,159 @@ impl std::fmt::Display for MaybeBlockNum<'_> {
             Some(x) => write!(f, "{}", x),
             None => write!(f, "None"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConsensusFinder, RankedRpcs};
+    use crate::rpcs::blockchain::{BlockHeader, BlocksByHashCache};
+    use crate::rpcs::many::Web3Rpcs;
+    use crate::rpcs::one::Web3Rpc;
+    use alloy::primitives::{B256, U64};
+    use alloy::rpc::types::Block;
+    use hashbrown::HashMap;
+    use moka::future::Cache;
+    use parking_lot::RwLock;
+    use std::io::{self, Write};
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
+    use tracing::Level;
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log output lock should be valid")
+                .write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0
+                .lock()
+                .expect("log output lock should be valid")
+                .flush()
+        }
+    }
+
+    fn block(number: u64, hash: B256, parent_hash: B256) -> BlockHeader {
+        let mut block: Block = Block::default();
+        block.header.hash = hash;
+        block.header.inner.number = number;
+        block.header.inner.parent_hash = parent_hash;
+        BlockHeader::new(Arc::new(block))
+    }
+
+    fn web3_rpcs(blocks_by_hash: BlocksByHashCache) -> Web3Rpcs {
+        let (block_and_rpc_sender, _) = mpsc::unbounded_channel();
+        let (watch_ranked_rpcs, _) = watch::channel(None);
+
+        Web3Rpcs {
+            name: "test".into(),
+            chain_id: 1,
+            block_and_rpc_sender,
+            by_name: RwLock::new(HashMap::new()),
+            watch_ranked_rpcs,
+            watch_head_block: None,
+            blocks_by_hash,
+            blocks_by_number: Cache::new(16),
+            min_synced_rpcs: 1,
+            min_sum_soft_limit: 1,
+            max_head_block_lag: U64::from(1u64),
+            max_head_block_age: Duration::from_secs(60),
+            pending_txid_firehose: None,
+        }
+    }
+
+    async fn rank_with_debug_logs(
+        head: BlockHeader,
+        blocks_by_hash: BlocksByHashCache,
+    ) -> (RankedRpcs, String) {
+        let rpc = Arc::new(Web3Rpc {
+            name: "test-rpc".into(),
+            healthy: AtomicBool::new(true),
+            soft_limit: 1,
+            ..Default::default()
+        });
+        let web3_rpcs = web3_rpcs(blocks_by_hash);
+        let mut consensus_finder = ConsensusFinder::new(None, U64::from(1u64));
+        consensus_finder.rpc_heads.insert(rpc, head);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let ranked_rpcs = consensus_finder
+            .rank_rpcs(&web3_rpcs)
+            .await
+            .expect("consensus ranking should succeed")
+            .expect("the healthy RPC should reach consensus");
+
+        drop(subscriber_guard);
+        let output = output
+            .lock()
+            .expect("log output lock should be valid")
+            .clone();
+        let logs = String::from_utf8(output).expect("debug logs should be valid UTF-8");
+
+        (ranked_rpcs, logs)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rank_rpcs_does_not_request_parent_before_lag_boundary() {
+        let missing_parent_hash = B256::with_last_byte(9);
+        let boundary = block(9, B256::with_last_byte(10), missing_parent_hash);
+        let head = block(10, B256::with_last_byte(11), *boundary.hash());
+        let blocks_by_hash = Cache::new(16);
+        blocks_by_hash
+            .insert(*boundary.hash(), boundary.clone())
+            .await;
+
+        let (ranked_rpcs, logs) = rank_with_debug_logs(head.clone(), blocks_by_hash).await;
+
+        assert_eq!(
+            ranked_rpcs
+                .head_block
+                .as_ref()
+                .map(|block| (block.number(), *block.hash())),
+            Some((head.number(), *head.hash()))
+        );
+        assert_eq!(
+            logs.matches("Unknown hash").count(),
+            0,
+            "the scan requested the out-of-window parent {missing_parent_hash:?}: {logs}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rank_rpcs_logs_missing_parent_inside_lag_window() {
+        let missing_parent_hash = B256::with_last_byte(10);
+        let head = block(10, B256::with_last_byte(11), missing_parent_hash);
+
+        let (ranked_rpcs, logs) = rank_with_debug_logs(head.clone(), Cache::new(16)).await;
+
+        assert_eq!(
+            ranked_rpcs
+                .head_block
+                .as_ref()
+                .map(|block| (block.number(), *block.hash())),
+            Some((head.number(), *head.hash()))
+        );
+        assert_eq!(
+            logs.matches("Unknown hash").count(),
+            1,
+            "the scan did not report the required parent {missing_parent_hash:?}: {logs}"
+        );
     }
 }
