@@ -389,7 +389,7 @@ impl ConsensusFinder {
     }
 
     /// `connection_heads` is a mapping of rpc_names to head block hashes.
-    /// self.blockchain_map is a mapping of hashes to the complete ArcBlock.
+    /// self.blockchain_map is a mapping of hashes to block headers.
     /// TODO: return something?
     /// TODO: move this onto ConsensusFinder
     pub(super) async fn refresh(
@@ -1120,7 +1120,7 @@ mod tests {
     use crate::rpcs::many::Web3Rpcs;
     use crate::rpcs::one::Web3Rpc;
     use alloy::primitives::{B256, U64};
-    use alloy::rpc::types::Block;
+    use alloy::rpc::types::Header;
     use hashbrown::HashMap;
     use moka::future::Cache;
     use parking_lot::RwLock;
@@ -1150,11 +1150,13 @@ mod tests {
     }
 
     fn block(number: u64, hash: B256, parent_hash: B256) -> BlockHeader {
-        let mut block: Block = Block::default();
-        block.header.hash = hash;
-        block.header.inner.number = number;
-        block.header.inner.parent_hash = parent_hash;
-        BlockHeader::new(Arc::new(block))
+        let mut header: Header = Header {
+            hash,
+            ..Default::default()
+        };
+        header.inner.number = number;
+        header.inner.parent_hash = parent_hash;
+        BlockHeader::new(Arc::new(header))
     }
 
     fn web3_rpcs(blocks_by_hash: BlocksByHashCache, min_synced_rpcs: usize) -> Web3Rpcs {

@@ -502,15 +502,17 @@ mod test {
         rpcs::blockchain::BlockHeader,
     };
     use alloy::primitives::{B256, U64};
-    use alloy::rpc::types::Block;
+    use alloy::rpc::types::Header;
     use sonic_rs::{json, JsonValueTrait};
     use std::sync::Arc;
 
-    fn block(number: u64) -> Block {
-        let mut block: Block = Block::default();
-        block.header.hash = B256::with_last_byte(number as u8);
-        block.header.inner.number = number;
-        block
+    fn block(number: u64) -> Header {
+        let mut header: Header = Header {
+            hash: B256::with_last_byte(number as u8),
+            ..Default::default()
+        };
+        header.inner.number = number;
+        header
     }
 
     #[test_log::test(tokio::test)]

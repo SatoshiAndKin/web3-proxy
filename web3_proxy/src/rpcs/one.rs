@@ -1,5 +1,5 @@
 //! Rate-limited communication with a web3 provider.
-use super::blockchain::{ArcBlock, BlockHeader, BlocksByHashCache};
+use super::blockchain::{ArcHeader, BlockHeader, BlocksByHashCache};
 use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
@@ -9,10 +9,9 @@ use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
 use crate::jsonrpc::{self, JsonRpcParams, JsonRpcResultData};
 use crate::rpcs::request::RequestErrorHandler;
-use alloy::consensus::Transaction as _;
 use alloy::primitives::{Address, Bytes, TxHash, U256, U64};
 use alloy::providers::Provider;
-use alloy::rpc::types::Transaction;
+use alloy::rpc::types::Block;
 use anyhow::{anyhow, Context};
 use arc_swap::ArcSwapOption;
 use deduped_broadcast::DedupedBroadcaster;
@@ -534,7 +533,7 @@ impl Web3Rpc {
 
     pub(crate) async fn send_head_block_result(
         self: &Arc<Self>,
-        new_head_block: Web3ProxyResult<Option<ArcBlock>>,
+        new_head_block: Web3ProxyResult<Option<ArcHeader>>,
     ) -> Web3ProxyResult<()> {
         let head_block_sender = self
             .head_block_sender
@@ -623,34 +622,14 @@ impl Web3Rpc {
 
             if detailed_healthcheck {
                 let block_number = head_block.number();
-
-                let to = if let Some(txid) = head_block.transactions().last().cloned() {
-                    let tx = self
-                        .internal_request::<_, Option<Transaction>>(
-                            "eth_getTransactionByHash".into(),
-                            &(txid,),
-                            error_handler,
-                            Some(Duration::from_secs(5)),
-                        )
-                        .await?
-                        .context("no transaction")?;
-
-                    // TODO: what default? something real?
-                    tx.to().unwrap_or_else(|| {
-                        "0xdead00000000000000000000000000000000beef"
-                            .parse::<Address>()
-                            .expect("deafbeef")
-                    })
-                } else {
-                    "0xdead00000000000000000000000000000000beef"
-                        .parse::<Address>()
-                        .expect("deafbeef")
-                };
+                let probe_address = "0xdead00000000000000000000000000000000beef"
+                    .parse::<Address>()
+                    .expect("fixed health-check address must be valid");
 
                 let _code = self
                     .internal_request::<_, Option<Bytes>>(
                         "eth_getCode".into(),
-                        &(to, block_number),
+                        &(probe_address, block_number),
                         error_handler,
                         Some(Duration::from_secs(5)),
                     )
@@ -934,16 +913,13 @@ impl Web3Rpc {
             self.wait_for_throttle(Instant::now() + Duration::from_secs(5))
                 .await?;
 
-            let mut blocks = ws_provider
-                .subscribe_full_blocks()
-                .hashes()
-                .into_stream()
-                .await?;
+            let subscription = ws_provider.subscribe_blocks().await?;
+            let mut headers = subscription.into_stream();
 
             // query the block once since the subscription doesn't send the current block
             // there is a very small race condition here where the stream could send us a new block right now
             // but sending the same block twice won't break anything
-            let latest_block: Result<Option<ArcBlock>, _> = self
+            let latest_block: Result<Option<Block>, _> = self
                 .internal_request(
                     "eth_getBlockByNumber".into(),
                     &("latest", false),
@@ -952,13 +928,13 @@ impl Web3Rpc {
                 )
                 .await;
 
-            self.send_head_block_result(latest_block).await?;
+            let latest_header = latest_block.map(|block| block.map(|block| Arc::new(block.header)));
+            self.send_head_block_result(latest_header).await?;
 
-            while let Some(block) = blocks.next().await {
-                let block = block?;
-                let block = Ok(Some(Arc::new(block)));
+            while let Some(header) = headers.next().await {
+                let header = Ok(Some(Arc::new(header)));
 
-                self.send_head_block_result(block).await?;
+                self.send_head_block_result(header).await?;
             }
         } else if self.http_client.is_some() {
             // there is a "watch_blocks" function, but a lot of public nodes (including ones using web3_proxy) do not support the necessary rpc endpoints
@@ -968,7 +944,7 @@ impl Web3Rpc {
 
             loop {
                 let block_result = self
-                    .internal_request::<_, Option<ArcBlock>>(
+                    .internal_request::<_, Option<Block>>(
                         "eth_getBlockByNumber".into(),
                         &("latest", false),
                         error_handler,
@@ -976,7 +952,9 @@ impl Web3Rpc {
                     )
                     .await;
 
-                self.send_head_block_result(block_result).await?;
+                let header_result =
+                    block_result.map(|block| block.map(|block| Arc::new(block.header)));
+                self.send_head_block_result(header_result).await?;
 
                 // TODO: should this select be at the start or end of the loop?
                 i.tick().await;
@@ -1390,21 +1368,172 @@ mod tests {
     #![allow(unused_imports)]
     use super::*;
     use alloy::primitives::{B256, U256};
-    use alloy::rpc::types::Block;
+    use alloy::rpc::types::Header;
+    use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use axum::{routing::get, Router};
+    use futures::SinkExt;
+    use std::sync::Mutex;
+    use tokio::net::TcpListener;
 
-    fn block(number: u64, timestamp: u64) -> Block {
-        let mut block: Block = Block::default();
-        block.header.hash = B256::with_last_byte(number as u8);
-        block.header.inner.number = number;
-        block.header.inner.timestamp = timestamp;
-        block
+    #[derive(Clone)]
+    struct WebSocketStubState {
+        header: Header,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    async fn websocket_stub_upgrade(
+        State(state): State<WebSocketStubState>,
+        upgrade: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        upgrade.on_upgrade(move |socket| websocket_stub(socket, state))
+    }
+
+    async fn websocket_stub(mut socket: WebSocket, state: WebSocketStubState) {
+        while let Some(Ok(WsMessage::Text(request))) = socket.next().await {
+            let request: serde_json::Value = serde_json::from_str(request.as_str()).unwrap();
+            let method = request["method"].as_str().unwrap();
+
+            state.requests.lock().unwrap().push(request.clone());
+
+            let response = match method {
+                "eth_subscribe" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": "0x1",
+                }),
+                "eth_getBlockByNumber" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": null,
+                }),
+                _ => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32601, "message": "method not found"},
+                }),
+            };
+
+            socket
+                .send(WsMessage::Text(response.to_string().into()))
+                .await
+                .unwrap();
+
+            if method == "eth_getBlockByNumber" {
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_subscription",
+                    "params": {
+                        "subscription": "0x1",
+                        "result": &state.header,
+                    },
+                });
+                socket
+                    .send(WsMessage::Text(notification.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    fn header(number: u64, timestamp: u64) -> Header {
+        let mut header: Header = Header {
+            hash: B256::with_last_byte(number as u8),
+            ..Default::default()
+        };
+        header.inner.number = number;
+        header.inner.timestamp = timestamp;
+        header
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn websocket_new_head_does_not_fetch_block_by_hash() {
+        let expected_hash = B256::with_last_byte(0x42);
+        let expected_parent_hash = B256::with_last_byte(0x41);
+        let expected_number = 42;
+        let expected_timestamp = 1_234;
+
+        let mut expected_header = header(expected_number, expected_timestamp);
+        expected_header.hash = expected_hash;
+        expected_header.inner.parent_hash = expected_parent_hash;
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = WebSocketStubState {
+            header: expected_header,
+            requests: requests.clone(),
+        };
+        let router = Router::new()
+            .route("/", get(websocket_stub_upgrade))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let provider = connect_ws(format!("ws://{address}").parse().unwrap())
+            .await
+            .unwrap();
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let (head_block_sender, _) = watch::channel(None);
+        let (disconnect_watch, _) = watch::channel(false);
+        let (block_and_rpc_sender, mut block_and_rpc_receiver) = mpsc::unbounded_channel();
+        let rpc = Arc::new(Web3Rpc {
+            name: "websocket-stub".into(),
+            block_map: Some(moka::future::Cache::new(16)),
+            created_at: Some(Instant::now()),
+            hard_limit_until: Some(hard_limit_until),
+            block_and_rpc_sender: Some(block_and_rpc_sender),
+            head_block_sender: Some(head_block_sender),
+            peak_latency: Some(PeakEwmaLatency::spawn(
+                Duration::from_secs(1),
+                4,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(RollingQuantileLatency::spawn_median(4).await),
+            disconnect_watch: Some(disconnect_watch),
+            ..Default::default()
+        });
+        rpc.ws_provider.store(Some(Arc::new(provider)));
+
+        let rpc_for_subscription = rpc.clone();
+        let subscription =
+            tokio::spawn(async move { rpc_for_subscription.subscribe_new_heads().await });
+
+        let (new_head, source_rpc) =
+            tokio::time::timeout(Duration::from_secs(5), block_and_rpc_receiver.recv())
+                .await
+                .expect("new head must arrive before the test timeout")
+                .expect("new head channel must stay open");
+        let new_head = new_head.expect("the pushed head must not be empty");
+
+        assert!(Arc::ptr_eq(&source_rpc, &rpc));
+        assert_eq!(*new_head.hash(), expected_hash);
+        assert_eq!(*new_head.parent_hash(), expected_parent_hash);
+        assert_eq!(new_head.number(), U64::from(expected_number));
+        assert_eq!(new_head.timestamp(), expected_timestamp);
+
+        let methods = {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0]["params"], serde_json::json!(["newHeads"]));
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(methods, ["eth_subscribe", "eth_getBlockByNumber"]);
+        assert!(!methods.iter().any(|method| method == "eth_getBlockByHash"));
+
+        subscription.abort();
+        server.abort();
+        let _ = subscription.await;
+        let _ = server.await;
     }
 
     #[test]
     fn test_archive_node_has_block_data() {
         let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
 
-        let random_block = block(1_000_000, now);
+        let random_block = header(1_000_000, now);
 
         let random_block = Arc::new(random_block);
 
@@ -1434,7 +1563,7 @@ mod tests {
     fn test_pruned_node_has_block_data() {
         let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
 
-        let head_block = BlockHeader::new(Arc::new(block(1_000_000, now)));
+        let head_block = BlockHeader::new(Arc::new(header(1_000_000, now)));
 
         let block_data_limit = 64;
 

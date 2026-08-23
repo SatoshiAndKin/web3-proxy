@@ -47,8 +47,7 @@ pub struct Web3Rpcs {
     /// this is None if none of the child Rpcs are subscribed to newHeads
     pub(super) watch_head_block: Option<watch::Sender<Option<BlockHeader>>>,
     /// TODO: this map is going to grow forever unless we add pruning.
-    /// all blocks, including uncles
-    /// TODO: i think uncles should be excluded
+    /// All observed block headers, including noncanonical headers.
     pub(crate) blocks_by_hash: BlocksByHashCache,
     /// blocks on the heaviest chain
     pub(crate) blocks_by_number: BlocksByNumberCache,
@@ -111,8 +110,7 @@ impl Web3Rpcs {
         let (block_and_rpc_sender, block_and_rpc_receiver) =
             mpsc::unbounded_channel::<BlockAndRpc>();
 
-        // these blocks don't have full transactions, but they do have rather variable amounts of transaction hashes
-        // TODO: actual weighter on this
+        // TODO: use an actual weighter for block headers
         // TODO: time_to_idle instead?
         let blocks_by_hash: BlocksByHashCache = CacheBuilder::new(10_000)
             .name("blocks_by_hash")
@@ -640,7 +638,7 @@ mod tests {
     use crate::rpcs::blockchain::BlockHeader;
     use crate::rpcs::consensus::ConsensusFinder;
     use alloy::primitives::{B256, U256};
-    use alloy::rpc::types::Block;
+    use alloy::rpc::types::Header;
     use arc_swap::ArcSwap;
     use latency::PeakEwmaLatency;
     use moka::future::{Cache, CacheBuilder};
@@ -653,19 +651,21 @@ mod tests {
         PeakEwmaLatency::spawn(Duration::from_secs(1), 4, Duration::from_secs(1))
     }
 
-    fn block(number: u64, parent_hash: B256) -> Block {
-        let mut block: Block = Block::default();
-        block.header.hash = B256::with_last_byte((number + 1) as u8);
-        block.header.inner.number = number;
-        block.header.inner.parent_hash = parent_hash;
-        block
+    fn block(number: u64, parent_hash: B256) -> Header {
+        let mut header: Header = Header {
+            hash: B256::with_last_byte((number + 1) as u8),
+            ..Default::default()
+        };
+        header.inner.number = number;
+        header.inner.parent_hash = parent_hash;
+        header
     }
 
     #[test_log::test(tokio::test)]
     async fn test_sort_connections_by_sync_status() {
         let block_0 = block(0, B256::ZERO);
-        let block_1 = block(1, block_0.header.hash);
-        let block_2 = block(2, block_1.header.hash);
+        let block_1 = block(1, block_0.hash);
+        let block_2 = block(2, block_1.hash);
 
         let blocks: Vec<_> = [block_0, block_1, block_2]
             .into_iter()

@@ -3,8 +3,8 @@ use super::consensus::ConsensusFinder;
 use super::many::Web3Rpcs;
 use crate::config::{average_block_interval, BlockAndRpc};
 use crate::errors::Web3ProxyResult;
-use alloy::primitives::{TxHash, B256, U64};
-use alloy::rpc::types::Block;
+use alloy::primitives::{B256, U64};
+use alloy::rpc::types::{Block, Header};
 use moka::future::Cache;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
@@ -20,16 +20,15 @@ use tracing::{debug, error, warn};
 
 // TODO: type for Hydrated Blocks with their full transactions?
 pub type ArcBlock = Arc<Block>;
+pub type ArcHeader = Arc<Header>;
 
 pub type BlocksByHashCache = Cache<B256, BlockHeader>;
 pub type BlocksByNumberCache = Cache<U64, B256>;
 
-/// A block and its age with a less verbose serialized format
-/// This does **not** implement Default. We rarely want a block with number 0 and hash 0.
-/// TODO: make a newtype for this? this is leftover from ethers.
-/// alloy has two different types nwo because a header doesn't have all the same fields as a block
+/// A block header and its age with a less verbose serialized format.
+/// This does **not** implement Default. We rarely want a header with number 0 and hash 0.
 #[derive(Clone)]
-pub struct BlockHeader(pub ArcBlock);
+pub struct BlockHeader(pub ArcHeader);
 
 impl Debug for BlockHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,10 +50,10 @@ impl Serialize for BlockHeader {
         state.serialize_field("age", &self.age().as_secs_f32())?;
 
         let block = json!({
-            "hash": self.0.header.hash,
-            "parent_hash": self.0.header.parent_hash,
-            "number": self.0.header.number,
-            "timestamp": self.0.header.timestamp,
+            "hash": self.hash(),
+            "parent_hash": self.parent_hash(),
+            "number": self.number().to::<u64>(),
+            "timestamp": self.timestamp(),
         });
 
         state.serialize_field("block", &block)?;
@@ -65,7 +64,7 @@ impl Serialize for BlockHeader {
 
 impl PartialEq for BlockHeader {
     fn eq(&self, other: &Self) -> bool {
-        self.0.header.hash == other.0.header.hash
+        self.0.hash == other.0.hash
     }
 }
 
@@ -73,13 +72,13 @@ impl Eq for BlockHeader {}
 
 impl Hash for BlockHeader {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.header.hash.hash(state);
+        self.0.hash.hash(state);
     }
 }
 
 impl BlockHeader {
-    pub fn new(block: ArcBlock) -> Self {
-        Self(block)
+    pub fn new(header: ArcHeader) -> Self {
+        Self(header)
     }
 
     pub fn age(&self) -> Duration {
@@ -87,8 +86,7 @@ impl BlockHeader {
     }
 
     fn age_at(&self, now: SystemTime) -> Duration {
-        let Some(block_timestamp) =
-            UNIX_EPOCH.checked_add(Duration::from_secs(self.0.header.timestamp))
+        let Some(block_timestamp) = UNIX_EPOCH.checked_add(Duration::from_secs(self.timestamp()))
         else {
             return Duration::ZERO;
         };
@@ -98,27 +96,22 @@ impl BlockHeader {
 
     #[inline(always)]
     pub fn parent_hash(&self) -> &B256 {
-        &self.0.header.parent_hash
+        &self.0.parent_hash
     }
 
     #[inline(always)]
     pub fn hash(&self) -> &B256 {
-        &self.0.header.hash
+        &self.0.hash
     }
 
     #[inline(always)]
     pub fn number(&self) -> U64 {
-        U64::from(self.0.header.number)
+        U64::from(self.0.number)
     }
 
     #[inline(always)]
-    pub fn transactions(&self) -> &[TxHash] {
-        self.0.transactions.as_hashes().unwrap_or_default()
-    }
-
-    #[inline(always)]
-    pub fn uncles(&self) -> &[B256] {
-        &self.0.uncles
+    pub fn timestamp(&self) -> u64 {
+        self.0.timestamp
     }
 }
 
@@ -134,9 +127,9 @@ impl Display for BlockHeader {
     }
 }
 
-impl From<ArcBlock> for BlockHeader {
-    fn from(block: ArcBlock) -> Self {
-        Self::new(block)
+impl From<ArcHeader> for BlockHeader {
+    fn from(header: ArcHeader) -> Self {
+        Self::new(header)
     }
 }
 
@@ -163,11 +156,6 @@ impl Web3Rpcs {
             // TODO: if there is an existing entry with a different block_hash,
             // TODO: use entry api to handle changing existing entries
             self.blocks_by_number.insert(block_num, block_hash).await;
-
-            for uncle in block.uncles() {
-                self.blocks_by_hash.invalidate(uncle).await;
-                // TODO: save uncles somewhere?
-            }
 
             // loop to make sure parent hashes match our caches
             // set the first ancestor to the blocks' parent hash. but keep going up the chain
@@ -247,11 +235,12 @@ impl Web3Rpcs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sonic_rs::JsonValueTrait;
 
     fn block_header(timestamp: u64) -> BlockHeader {
-        let mut block: Block = Block::default();
-        block.header.inner.timestamp = timestamp;
-        BlockHeader::new(Arc::new(block))
+        let mut header: Header = Header::default();
+        header.inner.timestamp = timestamp;
+        BlockHeader::new(Arc::new(header))
     }
 
     #[test]
@@ -277,5 +266,39 @@ mod tests {
         assert_eq!(block_header(1_000).age_at(now), Duration::ZERO);
         assert_eq!(block_header(1_001).age_at(now), Duration::ZERO);
         assert_eq!(block_header(u64::MAX).age_at(now), Duration::ZERO);
+    }
+
+    #[test]
+    fn new_heads_payload_is_a_header_without_block_body_fields() {
+        let mut header: Header = Header {
+            hash: B256::with_last_byte(0x42),
+            ..Default::default()
+        };
+        header.inner.parent_hash = B256::with_last_byte(0x41);
+        header.inner.number = 42;
+        header.inner.timestamp = 1_234;
+        let head = BlockHeader::new(Arc::new(header));
+
+        let payload = sonic_rs::to_value(&head.0).unwrap();
+
+        assert_eq!(
+            payload.get("hash").and_then(|value| value.as_str()),
+            Some("0x0000000000000000000000000000000000000000000000000000000000000042")
+        );
+        assert_eq!(
+            payload.get("parentHash").and_then(|value| value.as_str()),
+            Some("0x0000000000000000000000000000000000000000000000000000000000000041")
+        );
+        assert_eq!(
+            payload.get("number").and_then(|value| value.as_str()),
+            Some("0x2a")
+        );
+        assert_eq!(
+            payload.get("timestamp").and_then(|value| value.as_str()),
+            Some("0x4d2")
+        );
+        assert_eq!(payload.get("transactions"), None);
+        assert_eq!(payload.get("uncles"), None);
+        assert_eq!(payload.get("withdrawals"), None);
     }
 }

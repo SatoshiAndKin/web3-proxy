@@ -90,7 +90,6 @@ impl App {
                                     "method":"eth_subscription",
                                     "params": {
                                         "subscription": subscription_id,
-                                        // TODO: option to include full transaction objects instead of just the hashes?
                                         "result": subscription_web3_request.head_block.as_ref().map(|x| &x.0),
                                     },
                                 });
