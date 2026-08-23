@@ -11,7 +11,7 @@ use serde::Serialize;
 use sonic_rs::json;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fmt::Display, sync::Arc};
 use tokio::select;
 use tokio::sync::mpsc;
@@ -82,19 +82,17 @@ impl BlockHeader {
     }
 
     pub fn age(&self) -> Duration {
-        let now = chrono::Utc::now().timestamp();
+        self.age_at(SystemTime::now())
+    }
 
-        let block_timestamp = self.0.header.timestamp as i64;
-
-        let x = if block_timestamp < now {
-            // this server is still syncing from too far away to serve requests
-            // u64 is safe because we checked equality above
-            (now - block_timestamp) as u64
-        } else {
-            0
+    fn age_at(&self, now: SystemTime) -> Duration {
+        let Some(block_timestamp) =
+            UNIX_EPOCH.checked_add(Duration::from_secs(self.0.header.timestamp))
+        else {
+            return Duration::ZERO;
         };
 
-        Duration::from_secs(x)
+        now.duration_since(block_timestamp).unwrap_or_default()
     }
 
     #[inline(always)]
@@ -242,5 +240,41 @@ impl Web3Rpcs {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_header(timestamp: u64) -> BlockHeader {
+        let mut block: Block = Block::default();
+        block.header.inner.timestamp = timestamp;
+        BlockHeader::new(Arc::new(block))
+    }
+
+    #[test]
+    fn block_age_preserves_subsecond_precision() {
+        let block = block_header(1_000);
+        let now = UNIX_EPOCH + Duration::from_millis(1_003_592);
+
+        assert_eq!(block.age_at(now), Duration::from_millis(3_592));
+    }
+
+    #[test]
+    fn block_age_is_exact_at_second_boundaries() {
+        let block = block_header(1_000);
+        let now = UNIX_EPOCH + Duration::from_secs(1_003);
+
+        assert_eq!(block.age_at(now), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn block_age_clamps_non_past_timestamps_to_zero() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+
+        assert_eq!(block_header(1_000).age_at(now), Duration::ZERO);
+        assert_eq!(block_header(1_001).age_at(now), Duration::ZERO);
+        assert_eq!(block_header(u64::MAX).age_at(now), Duration::ZERO);
     }
 }
