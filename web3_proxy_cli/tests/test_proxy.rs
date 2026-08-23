@@ -39,6 +39,8 @@ where
 async fn it_starts_and_stops() {
     let a = TestAnvil::spawn_chain(31337).await;
 
+    let _: Value = a.provider.raw_request("evm_mine".into(), ()).await.unwrap();
+
     let x = TestApp::spawn(&a).await;
 
     let anvil_provider = &a.provider;

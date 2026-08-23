@@ -423,6 +423,10 @@ impl Web3Rpc {
         U64::from_limbs([self.block_data_limit.load(atomic::Ordering::SeqCst)])
     }
 
+    fn health_status(&self, provider_health_check_passed: bool) -> bool {
+        provider_health_check_passed && self.block_data_limit.load(atomic::Ordering::SeqCst) > 0
+    }
+
     /// TODO: get rid of this now that consensus rpcs does it
     pub fn has_block_data(&self, needed_block_num: U64) -> bool {
         if let Some(head_block_sender) = self.head_block_sender.as_ref() {
@@ -742,19 +746,21 @@ impl Web3Rpc {
                     let detailed_healthcheck = false;
 
                     // TODO: if this fails too many times, reset the connection
-                    if let Err(err) = rpc.check_health(detailed_healthcheck, error_handler).await {
-                        rpc.healthy.store(false, atomic::Ordering::SeqCst);
+                    let provider_health_check_passed =
+                        match rpc.check_health(detailed_healthcheck, error_handler).await {
+                            Err(err) => {
+                                // TODO: different level depending on the error handler
+                                // TODO: if rate limit error, set "retry_at"
+                                if rpc.backup {
+                                    warn!(?err, "health check on {} failed", rpc);
+                                } else {
+                                    error!(?err, "health check on {} failed", rpc);
+                                }
 
-                        // TODO: different level depending on the error handler
-                        // TODO: if rate limit error, set "retry_at"
-                        if rpc.backup {
-                            warn!(?err, "health check on {} failed", rpc);
-                        } else {
-                            error!(?err, "health check on {} failed", rpc);
-                        }
-                    } else {
-                        rpc.healthy.store(true, atomic::Ordering::SeqCst);
-                    }
+                                false
+                            }
+                            Ok(()) => true,
+                        };
 
                     if rpc.automatic_block_limit
                         && rpc.block_data_limit.load(atomic::Ordering::SeqCst) == 0
@@ -767,6 +773,11 @@ impl Web3Rpc {
                         block_data_limit_refresh_at =
                             Instant::now() + block_data_limit_refresh_interval;
                     }
+
+                    rpc.healthy.store(
+                        rpc.health_status(provider_health_check_passed),
+                        atomic::Ordering::SeqCst,
+                    );
 
                     // TODO: should we count the requests done inside this health check
                     // old_total_requests = new_total_requests;
@@ -790,7 +801,8 @@ impl Web3Rpc {
                 true
             };
 
-            self.healthy.store(initial_check, atomic::Ordering::SeqCst);
+            self.healthy
+                .store(self.health_status(initial_check), atomic::Ordering::SeqCst);
 
             tokio::spawn(f)
         } else {
@@ -1460,6 +1472,21 @@ mod tests {
         header.inner.number = number;
         header.inner.timestamp = timestamp;
         header
+    }
+
+    #[test]
+    fn block_data_limit_is_part_of_health_status() {
+        let rpc = Web3Rpc {
+            block_data_limit: 0.into(),
+            ..Default::default()
+        };
+
+        assert!(!rpc.health_status(true));
+
+        rpc.block_data_limit.store(32, atomic::Ordering::SeqCst);
+
+        assert!(rpc.health_status(true));
+        assert!(!rpc.health_status(false));
     }
 
     #[test_log::test(tokio::test)]
