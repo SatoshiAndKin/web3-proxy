@@ -26,7 +26,8 @@ pub type BlocksByNumberCache = Cache<U64, B256>;
 
 /// A block and its age with a less verbose serialized format
 /// This does **not** implement Default. We rarely want a block with number 0 and hash 0.
-/// TODO: make a newtype for this? it doesn't have all the same fields as a block
+/// TODO: make a newtype for this? this is leftover from ethers.
+/// alloy has two different types nwo because a header doesn't have all the same fields as a block
 #[derive(Clone)]
 pub struct BlockHeader(pub ArcBlock);
 
