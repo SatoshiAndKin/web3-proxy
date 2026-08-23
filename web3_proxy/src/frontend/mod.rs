@@ -33,7 +33,7 @@ use tracing::{error, error_span, info, trace_span};
 #[cfg(feature = "listenfd")]
 use listenfd::ListenFd;
 
-const LISTEN_BACKLOG: u32 = 4096;
+const LISTEN_BACKLOG: u32 = i32::MAX as u32;
 
 fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     info!(%addr, requested_backlog = LISTEN_BACKLOG, "binding TCP listener");

@@ -79,7 +79,7 @@ You can copy `config/example.toml` to `config/production-$CHAINNAME.toml` and th
 
 ### Production TCP backlog
 
-The proxy requests a TCP accept queue backlog of 4096 for sockets that it creates. The operating system can silently cap this request. Linux uses `net.core.somaxconn` as the cap. See the [Linux `listen(2)` documentation](https://man7.org/linux/man-pages/man2/listen.2.html).
+The proxy requests the largest positive TCP accept queue backlog that Tokio can pass to `listen(2)`. The operating system selects the effective size and can silently cap the request. Linux uses `net.core.somaxconn` as the cap. See the [Linux `listen(2)` documentation](https://man7.org/linux/man-pages/man2/listen.2.html).
 
 The common Compose service sets `net.core.somaxconn` to 4096, so all services in `docker-compose.prod.yml` inherit that value. Docker applies this network setting inside each container network namespace. It does not change the host value. See the [Docker Compose `sysctls` documentation](https://docs.docker.com/reference/compose-file/services/#sysctls).
 
@@ -138,11 +138,18 @@ Test the proxy:
     wrk -s ./wrk/getBlockNumber.lua -t12 -c400 -d30s --latency http://127.0.0.1:8544/
     wrk -s ./wrk/getLatestBlockByNumber.lua -t12 -c400 -d30s --latency http://127.0.0.1:8544/
 
-Connect errors that occur only during the initial burst usually mean that the burst filled the TCP accept queue. Check the proxy's requested backlog and the operating-system cap before you investigate request handling. A successful run has zero connect, read, write, and timeout errors in both the one-second and 30-second tests.
+Before a high-concurrency test, make sure that the load generator can open enough file descriptors:
 
-On the current macOS development host, `sysctl kern.ipc.somaxconn` reports 128. The same local `wrk -c400` test can have initial connect errors until an administrator increases this limit. Inspect it with:
+    ulimit -n 4096
+
+If `wrk` has a soft limit of 256, `-c400` can report about 155 connect errors because `wrk` also needs descriptors for its threads and control files. An error count that stays constant when test duration increases is consistent with this client limit.
+
+Connect errors can also mean that the initial burst filled the server's TCP accept queue. Inspect the operating-system cap and the active queue before you investigate request handling. On macOS, use:
 
     sysctl kern.ipc.somaxconn
+    netstat -Lan -p tcp
+
+A successful run has zero connect, read, write, and timeout errors in both the one-second and 30-second tests.
 
 Test geth (assuming it is on 8545):
 
