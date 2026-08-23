@@ -474,6 +474,7 @@ impl RequestBlocks {
         }
     }
 
+    /// Returns None for a Point; a Point's block is in "to_block".
     #[inline]
     pub fn from_block(&self) -> Option<&BlockNumOrHash> {
         match self {
@@ -486,10 +487,7 @@ impl RequestBlocks {
     pub fn to_block(&self) -> Option<&BlockNumOrHash> {
         match self {
             Self::None => None,
-            Self::Point {
-                block_needed: block,
-                ..
-            } => Some(block),
+            Self::Point { block_needed } => Some(block_needed),
             Self::Range { to_block, .. } => Some(to_block),
         }
     }
