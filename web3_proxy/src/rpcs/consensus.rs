@@ -841,6 +841,46 @@ impl ConsensusFinder {
 
         let num_known = self.rpc_heads.len();
 
+        // No ancestor can produce a higher consensus block when the highest
+        // primary head already has enough direct votes.
+        let mut highest_primary_votes: HashMap<BlockHeader, (HashSet<&Arc<Web3Rpc>>, u32)> =
+            HashMap::with_capacity(num_known);
+
+        for (rpc, rpc_head) in self.rpc_heads.iter() {
+            if !rpc.healthy.load(atomic::Ordering::SeqCst)
+                || rpc.backup
+                || rpc_head.number() != highest_block_number
+            {
+                continue;
+            }
+
+            if let Some(max_age) = self.max_head_block_age {
+                if rpc_head.age() > max_age {
+                    continue;
+                }
+            }
+
+            let entry = highest_primary_votes.entry(rpc_head.clone()).or_default();
+            entry.0.insert(rpc);
+            entry.1 += rpc.soft_limit;
+        }
+
+        if highest_primary_votes
+            .values()
+            .any(|(rpcs, sum_soft_limit)| {
+                rpcs.len() >= web3_rpcs.min_synced_rpcs
+                    && *sum_soft_limit >= web3_rpcs.min_sum_soft_limit
+            })
+        {
+            return Ok(RankedRpcs::from_votes(
+                web3_rpcs.min_synced_rpcs,
+                web3_rpcs.min_sum_soft_limit,
+                max_lag_block_number,
+                highest_primary_votes,
+                self.rpc_heads.clone(),
+            ));
+        }
+
         // TODO: also track the sum of *available* hard_limits? if any servers have no hard limits, use their soft limit or no limit?
         // TODO: struct for the value of the votes hashmap?
         let mut primary_votes: HashMap<BlockHeader, (HashSet<&Arc<Web3Rpc>>, u32)> =
@@ -1117,7 +1157,7 @@ mod tests {
         BlockHeader::new(Arc::new(block))
     }
 
-    fn web3_rpcs(blocks_by_hash: BlocksByHashCache) -> Web3Rpcs {
+    fn web3_rpcs(blocks_by_hash: BlocksByHashCache, min_synced_rpcs: usize) -> Web3Rpcs {
         let (block_and_rpc_sender, _) = mpsc::unbounded_channel();
         let (watch_ranked_rpcs, _) = watch::channel(None);
 
@@ -1130,8 +1170,9 @@ mod tests {
             watch_head_block: None,
             blocks_by_hash,
             blocks_by_number: Cache::new(16),
-            min_synced_rpcs: 1,
-            min_sum_soft_limit: 1,
+            min_synced_rpcs,
+            min_sum_soft_limit: u32::try_from(min_synced_rpcs)
+                .expect("test RPC count should fit in a u32"),
             max_head_block_lag: U64::from(1u64),
             max_head_block_age: Duration::from_secs(60),
             pending_txid_firehose: None,
@@ -1139,18 +1180,22 @@ mod tests {
     }
 
     async fn rank_with_debug_logs(
-        head: BlockHeader,
+        heads: Vec<BlockHeader>,
         blocks_by_hash: BlocksByHashCache,
-    ) -> (RankedRpcs, String) {
-        let rpc = Arc::new(Web3Rpc {
-            name: "test-rpc".into(),
-            healthy: AtomicBool::new(true),
-            soft_limit: 1,
-            ..Default::default()
-        });
-        let web3_rpcs = web3_rpcs(blocks_by_hash);
+        min_synced_rpcs: usize,
+    ) -> (Option<RankedRpcs>, String) {
+        let web3_rpcs = web3_rpcs(blocks_by_hash, min_synced_rpcs);
         let mut consensus_finder = ConsensusFinder::new(None, U64::from(1u64));
-        consensus_finder.rpc_heads.insert(rpc, head);
+
+        for (index, head) in heads.into_iter().enumerate() {
+            let rpc = Arc::new(Web3Rpc {
+                name: format!("test-rpc-{index}"),
+                healthy: AtomicBool::new(true),
+                soft_limit: 1,
+                ..Default::default()
+            });
+            consensus_finder.rpc_heads.insert(rpc, head);
+        }
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = LogWriter(output.clone());
@@ -1166,8 +1211,7 @@ mod tests {
         let ranked_rpcs = consensus_finder
             .rank_rpcs(&web3_rpcs)
             .await
-            .expect("consensus ranking should succeed")
-            .expect("the healthy RPC should reach consensus");
+            .expect("consensus ranking should succeed");
 
         drop(subscriber_guard);
         let output = output
@@ -1189,14 +1233,14 @@ mod tests {
             .insert(*boundary.hash(), boundary.clone())
             .await;
 
-        let (ranked_rpcs, logs) = rank_with_debug_logs(head.clone(), blocks_by_hash).await;
+        let (ranked_rpcs, logs) =
+            rank_with_debug_logs(vec![head, boundary.clone()], blocks_by_hash, 2).await;
 
         assert_eq!(
             ranked_rpcs
-                .head_block
-                .as_ref()
+                .and_then(|ranked| ranked.head_block)
                 .map(|block| (block.number(), *block.hash())),
-            Some((head.number(), *head.hash()))
+            Some((boundary.number(), *boundary.hash()))
         );
         assert_eq!(
             logs.matches("Unknown hash").count(),
@@ -1206,23 +1250,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rank_rpcs_logs_missing_parent_inside_lag_window() {
+    async fn rank_rpcs_does_not_scan_parent_when_highest_head_has_consensus() {
         let missing_parent_hash = B256::with_last_byte(10);
         let head = block(10, B256::with_last_byte(11), missing_parent_hash);
 
-        let (ranked_rpcs, logs) = rank_with_debug_logs(head.clone(), Cache::new(16)).await;
+        let (ranked_rpcs, logs) =
+            rank_with_debug_logs(vec![head.clone(), head.clone()], Cache::new(16), 2).await;
 
         assert_eq!(
             ranked_rpcs
-                .head_block
                 .as_ref()
+                .and_then(|ranked| ranked.head_block.as_ref())
                 .map(|block| (block.number(), *block.hash())),
             Some((head.number(), *head.hash()))
         );
         assert_eq!(
+            ranked_rpcs.as_ref().map(|ranked| ranked.num_synced),
+            Some(2)
+        );
+        assert_eq!(
             logs.matches("Unknown hash").count(),
+            0,
+            "the scan requested unnecessary parent {missing_parent_hash:?}: {logs}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rank_rpcs_logs_missing_parent_needed_for_consensus() {
+        let first_missing_parent = B256::with_last_byte(8);
+        let second_missing_parent = B256::with_last_byte(9);
+        let first_head = block(10, B256::with_last_byte(10), first_missing_parent);
+        let second_head = block(10, B256::with_last_byte(11), second_missing_parent);
+
+        let (ranked_rpcs, logs) =
+            rank_with_debug_logs(vec![first_head, second_head], Cache::new(16), 2).await;
+
+        assert_eq!(ranked_rpcs.and_then(|ranked| ranked.head_block), None);
+        assert_eq!(logs.matches("Unknown hash").count(), 2, "{logs}");
+        assert_eq!(
+            logs.matches(&format!("{first_missing_parent:?}")).count(),
             1,
-            "the scan did not report the required parent {missing_parent_hash:?}: {logs}"
+            "{logs}"
+        );
+        assert_eq!(
+            logs.matches(&format!("{second_missing_parent:?}")).count(),
+            1,
+            "{logs}"
         );
     }
 }
