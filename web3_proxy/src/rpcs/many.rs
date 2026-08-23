@@ -1,12 +1,12 @@
 //! Load balanced communication with a group of web3 rpc providers
 use super::blockchain::{
-    new_block_response_cache, BlockHeader, BlockResponseCache, BlocksByHashCache,
-    BlocksByNumberCache,
+    new_block_response_cache, BlockHeader, BlockHydrationCoordinator, BlockResponseCache,
+    BlocksByHashCache, BlocksByNumberCache, HeadObservation,
 };
 use super::consensus::{RankedRpcs, RpcsForRequest};
 use super::one::Web3Rpc;
 use crate::app::{App, Web3ProxyJoinHandle};
-use crate::config::{average_block_interval, BlockAndRpc, Web3RpcConfig};
+use crate::config::{average_block_interval, Web3RpcConfig};
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::frontend::status::MokaCacheSerializer;
@@ -37,7 +37,7 @@ pub struct Web3Rpcs {
     pub(crate) name: Cow<'static, str>,
     pub(crate) chain_id: u64,
     /// if watch_head_block is some, Web3Rpc inside self will send blocks here when they get them
-    pub(crate) block_and_rpc_sender: mpsc::UnboundedSender<(Option<BlockHeader>, Arc<Web3Rpc>)>,
+    pub(crate) head_observation_sender: mpsc::UnboundedSender<HeadObservation>,
     /// any requests will be forwarded to one (or more) of these connections
     /// TODO: hopefully this not being an async lock will be okay. if you need it across awaits, clone the arc
     pub(crate) by_name: RwLock<HashMap<String, Arc<Web3Rpc>>>,
@@ -56,6 +56,7 @@ pub struct Web3Rpcs {
     pub(crate) blocks_by_number: BlocksByNumberCache,
     /// Raw block results keyed by hash and transaction form.
     pub(crate) block_responses: BlockResponseCache,
+    pub(crate) block_hydration: Arc<BlockHydrationCoordinator>,
     /// the number of rpcs required to agree on consensus for the head block (thundering herd protection)
     pub(super) min_synced_rpcs: usize,
     /// the soft limit required to agree on consensus for the head block. (thundering herd protection)
@@ -135,8 +136,8 @@ impl Web3Rpcs {
         Web3ProxyJoinHandle<()>,
         watch::Receiver<Option<Arc<RankedRpcs>>>,
     )> {
-        let (block_and_rpc_sender, block_and_rpc_receiver) =
-            mpsc::unbounded_channel::<BlockAndRpc>();
+        let (head_observation_sender, head_observation_receiver) =
+            mpsc::unbounded_channel::<HeadObservation>();
 
         // TODO: use an actual weighter for block headers
         // TODO: time_to_idle instead?
@@ -154,6 +155,7 @@ impl Web3Rpcs {
             .build();
 
         let block_responses = new_block_response_cache(config.block_cache_max_bytes);
+        let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
 
         let (watch_consensus_rpcs_sender, consensus_connections_watcher) =
             watch::channel(Default::default());
@@ -173,7 +175,8 @@ impl Web3Rpcs {
             block_interval.mul_f32((max_head_block_lag.to::<u64>() * 10) as f32);
 
         let connections = Arc::new(Self {
-            block_and_rpc_sender,
+            head_observation_sender,
+            block_hydration,
             blocks_by_hash,
             blocks_by_number,
             block_responses,
@@ -196,7 +199,7 @@ impl Web3Rpcs {
             // todo!(this task is waking itself ~50% of the time. that seems bad)
             tokio::spawn(async move {
                 connections
-                    .process_incoming_blocks(block_and_rpc_receiver)
+                    .process_incoming_blocks(head_observation_receiver)
                     .await
             })
         };
@@ -250,8 +253,8 @@ impl Web3Rpcs {
                 }
 
                 let http_client = app.http_client.clone();
-                let block_and_rpc_sender = if self.watch_head_block.is_some() {
-                    Some(self.block_and_rpc_sender.clone())
+                let head_observation_sender = if self.watch_head_block.is_some() {
+                    Some(self.head_observation_sender.clone())
                 } else {
                     None
                 };
@@ -272,7 +275,8 @@ impl Web3Rpcs {
                     blocks_by_hash_cache,
                     blocks_by_number_cache,
                     block_response_cache,
-                    block_and_rpc_sender,
+                    head_observation_sender,
+                    Some(self.block_hydration.clone()),
                     self.pending_txid_firehose.clone(),
                     self.max_head_block_age,
                 );

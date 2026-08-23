@@ -1,11 +1,13 @@
 //! Keep track of the blockchain as seen by a Web3Rpcs.
 use super::consensus::ConsensusFinder;
 use super::many::Web3Rpcs;
-use crate::config::{average_block_interval, BlockAndRpc};
+use super::one::Web3Rpc;
+use crate::config::average_block_interval;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::jsonrpc::{ParsedResponse, SingleRequest, SingleResponse};
 use alloy::primitives::{B256, U64};
 use alloy::rpc::types::{Block, Header};
+use hashbrown::HashMap;
 use moka::future::{Cache, CacheBuilder};
 use serde::ser::SerializeStruct;
 use serde::Serialize;
@@ -15,8 +17,9 @@ use std::hash::Hash;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fmt::Display, sync::Arc};
 use tokio::select;
-use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::AbortHandle;
+use tokio::time::{sleep, Instant};
 use tracing::{debug, error, warn};
 
 // TODO: type for Hydrated Blocks with their full transactions?
@@ -26,6 +29,124 @@ pub type ArcHeader = Arc<Header>;
 pub type BlocksByHashCache = Cache<B256, BlockHeader>;
 pub type BlocksByNumberCache = Cache<U64, B256>;
 pub type BlockResponseCache = Cache<BlockResponseCacheKey, CachedBlockResponse>;
+
+#[derive(Clone)]
+pub struct HeadObservation {
+    pub block: Option<BlockHeader>,
+    pub rpc: Arc<Web3Rpc>,
+    pub observed_at: Instant,
+}
+
+#[derive(Default)]
+struct HydrationRace {
+    attempts: HashMap<String, AbortHandle>,
+    winner: Option<String>,
+}
+
+pub struct BlockHydrationCoordinator {
+    block_responses: BlockResponseCache,
+    races: Mutex<HashMap<B256, HydrationRace>>,
+}
+
+impl BlockHydrationCoordinator {
+    pub fn new(block_responses: BlockResponseCache) -> Arc<Self> {
+        Arc::new(Self {
+            block_responses,
+            races: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub async fn announce(self: &Arc<Self>, rpc: Arc<Web3Rpc>, block_hash: B256) {
+        if self
+            .block_responses
+            .get(&BlockResponseCacheKey::new(block_hash, true))
+            .await
+            .is_some()
+        {
+            return;
+        }
+
+        let rpc_name = rpc.name.clone();
+        let mut races = self.races.lock().await;
+        let race = races.entry(block_hash).or_default();
+        if race.winner.is_some() || race.attempts.contains_key(&rpc_name) {
+            return;
+        }
+
+        let coordinator = self.clone();
+        let attempt_rpc_name = rpc_name.clone();
+        let attempt = tokio::spawn(async move {
+            match rpc.fetch_full_block(block_hash).await {
+                Ok((full, hashes)) => {
+                    coordinator
+                        .accept(block_hash, attempt_rpc_name, rpc, full, hashes)
+                        .await;
+                }
+                Err(err) => {
+                    debug!(?err, %block_hash, "unable to hydrate block from {}", rpc);
+                    coordinator
+                        .finish_failed_attempt(block_hash, &attempt_rpc_name)
+                        .await;
+                }
+            }
+        });
+        race.attempts.insert(rpc_name, attempt.abort_handle());
+    }
+
+    async fn accept(
+        &self,
+        block_hash: B256,
+        rpc_name: String,
+        rpc: Arc<Web3Rpc>,
+        full: CachedBlockResponse,
+        hashes: CachedBlockResponse,
+    ) {
+        {
+            let mut races = self.races.lock().await;
+            let Some(race) = races.get_mut(&block_hash) else {
+                return;
+            };
+            if race.winner.is_some() {
+                return;
+            }
+            race.winner = Some(rpc_name.clone());
+        }
+
+        self.block_responses
+            .insert(BlockResponseCacheKey::new(block_hash, true), full.clone())
+            .await;
+        self.block_responses
+            .insert(BlockResponseCacheKey::new(block_hash, false), hashes)
+            .await;
+        rpc.invalidate_uncle_headers_if_canonical(&full).await;
+
+        let loser_handles = {
+            let mut races = self.races.lock().await;
+            races
+                .remove(&block_hash)
+                .into_iter()
+                .flat_map(|race| race.attempts)
+                .filter_map(|(name, handle)| (name != rpc_name).then_some(handle))
+                .collect::<Vec<_>>()
+        };
+        for handle in loser_handles {
+            handle.abort();
+        }
+    }
+
+    async fn finish_failed_attempt(&self, block_hash: B256, rpc_name: &str) {
+        let mut races = self.races.lock().await;
+        let remove_race = if let Some(race) = races.get_mut(&block_hash) {
+            race.attempts.remove(rpc_name);
+            race.attempts.is_empty() && race.winner.is_none()
+        } else {
+            false
+        };
+        if remove_race {
+            races.remove(&block_hash);
+        }
+    }
+}
 
 pub fn new_block_response_cache(max_bytes: u64) -> BlockResponseCache {
     CacheBuilder::new(max_bytes)
@@ -431,7 +552,7 @@ impl Web3Rpcs {
 
     pub(super) async fn process_incoming_blocks(
         &self,
-        mut block_and_rpc_receiver: mpsc::UnboundedReceiver<BlockAndRpc>,
+        mut head_observation_receiver: mpsc::UnboundedReceiver<HeadObservation>,
     ) -> Web3ProxyResult<()> {
         if self.watch_head_block.is_none() {
             return Ok(());
@@ -446,14 +567,14 @@ impl Web3Rpcs {
 
         loop {
             select! {
-                x = block_and_rpc_receiver.recv() => {
+                x = head_observation_receiver.recv() => {
                     match x {
-                        Some((new_block, rpc)) => {
-                            let rpc_name = rpc.name.clone();
+                        Some(observation) => {
+                            let rpc_name = observation.rpc.name.clone();
 
                             // TODO: we used to have a timeout on this, but i think it was obscuring a bug
                             match consensus_finder
-                                .process_block_from_rpc(self, new_block, rpc)
+                                .process_block_from_rpc(self, observation)
                                 .await
                             {
                                 Ok(_) => {},
@@ -515,19 +636,22 @@ mod tests {
     }
 
     fn web3_rpcs(block_cache_max_bytes: u64) -> Web3Rpcs {
-        let (block_and_rpc_sender, _) = mpsc::unbounded_channel();
+        let (head_observation_sender, _) = mpsc::unbounded_channel();
         let (watch_ranked_rpcs, _) = watch::channel(None);
+        let block_responses = new_block_response_cache(block_cache_max_bytes);
+        let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
 
         Web3Rpcs {
             name: "block-cache-test".into(),
             chain_id: 1,
-            block_and_rpc_sender,
+            head_observation_sender,
             by_name: RwLock::new(HashMap::new()),
             watch_ranked_rpcs,
             watch_head_block: None,
             blocks_by_hash: Cache::new(16),
             blocks_by_number: Cache::new(16),
-            block_responses: new_block_response_cache(block_cache_max_bytes),
+            block_responses,
+            block_hydration,
             min_synced_rpcs: 1,
             min_sum_soft_limit: 1,
             max_head_block_lag: U64::from(1),

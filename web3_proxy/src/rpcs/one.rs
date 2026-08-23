@@ -1,12 +1,12 @@
 //! Rate-limited communication with a web3 provider.
 use super::blockchain::{
-    ArcHeader, BlockHeader, BlockResponseCache, BlockResponseCacheKey, BlocksByHashCache,
-    BlocksByNumberCache, CachedBlockResponse,
+    ArcHeader, BlockHeader, BlockHydrationCoordinator, BlockResponseCache, BlockResponseCacheKey,
+    BlocksByHashCache, BlocksByNumberCache, CachedBlockResponse, HeadObservation,
 };
 use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
-use crate::config::{BlockAndRpc, Web3RpcConfig};
+use crate::config::Web3RpcConfig;
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
@@ -80,7 +80,8 @@ pub struct Web3Rpc {
     /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
     pub backup: bool,
     /// if subscribed to new heads, blocks are sent through this channel to update a parent Web3Rpcs
-    pub(super) block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
+    pub(super) head_observation_sender: Option<mpsc::UnboundedSender<HeadObservation>>,
+    pub(super) block_hydration: Option<Arc<BlockHydrationCoordinator>>,
     /// TODO: have an enum for this so that "no limit" prints pretty?
     pub(super) block_data_limit: AtomicU64,
     /// head_block is only inside an Option so that the "Default" derive works. it will always be set.
@@ -123,7 +124,8 @@ impl Web3Rpc {
         block_map: BlocksByHashCache,
         block_number_map: BlocksByNumberCache,
         block_response_cache: BlockResponseCache,
-        block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
+        head_observation_sender: Option<mpsc::UnboundedSender<HeadObservation>>,
+        block_hydration: Option<Arc<BlockHydrationCoordinator>>,
         pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
         max_head_block_age: Duration,
     ) -> anyhow::Result<(Arc<Web3Rpc>, Web3ProxyJoinHandle<()>)> {
@@ -133,7 +135,7 @@ impl Web3Rpc {
 
         let block_data_limit: AtomicU64 = config.block_data_limit.into();
         let automatic_block_limit = (block_data_limit.load(atomic::Ordering::SeqCst) == 0)
-            && block_and_rpc_sender.is_some();
+            && head_observation_sender.is_some();
 
         // have a sender for tracking hard limit anywhere. we use this in case we
         // and track on servers that have a configured hard limit
@@ -212,7 +214,8 @@ impl Web3Rpc {
             median_latency: Some(median_request_latency),
             soft_limit: config.soft_limit,
             pending_txid_firehose,
-            block_and_rpc_sender,
+            head_observation_sender,
+            block_hydration,
             ws_url,
             disconnect_watch: Some(disconnect_watch),
             healthy,
@@ -550,10 +553,12 @@ impl Web3Rpc {
         self: &Arc<Self>,
         new_head_block: Web3ProxyResult<Option<ArcHeader>>,
     ) -> Web3ProxyResult<()> {
+        let observed_at = Instant::now();
         let head_block_sender = self
             .head_block_sender
             .as_ref()
             .expect("head_block_sender is always set");
+        let mut observation_sent = false;
 
         let new_head_block = match new_head_block {
             Ok(x) => {
@@ -577,6 +582,21 @@ impl Web3Rpc {
                     }
                     Some(new_head_block) => {
                         let new_hash = *new_head_block.hash();
+
+                        if let Some(head_observation_sender) = &self.head_observation_sender {
+                            head_observation_sender
+                                .send(HeadObservation {
+                                    block: Some(new_head_block.clone()),
+                                    rpc: self.clone(),
+                                    observed_at,
+                                })
+                                .context("head_observation_sender failed sending")?;
+                            observation_sent = true;
+                        }
+
+                        if let Some(block_hydration) = &self.block_hydration {
+                            block_hydration.announce(self.clone(), new_hash).await;
+                        }
 
                         // if we already have this block saved, set new_head_block to that arc. otherwise store this copy
                         let new_head_block = self
@@ -604,37 +624,28 @@ impl Web3Rpc {
             }
         };
 
-        if let Some(block_and_rpc_sender) = &self.block_and_rpc_sender {
-            // tell web3rpcs about this rpc having this block
-            // web3rpcs will do `self.head_block_sender.send_replace(new_head_block)`
-            block_and_rpc_sender
-                .send((new_head_block.clone(), self.clone()))
-                .context("block_and_rpc_sender failed sending")?;
-        } else {
-            head_block_sender.send_replace(new_head_block.clone());
+        if observation_sent {
+            return Ok(());
         }
 
-        if let Some(new_head_block) = new_head_block {
-            self.spawn_block_hydration(*new_head_block.hash());
+        if let Some(head_observation_sender) = &self.head_observation_sender {
+            // tell web3rpcs about this rpc having this block
+            // web3rpcs will do `self.head_block_sender.send_replace(new_head_block)`
+            head_observation_sender
+                .send(HeadObservation {
+                    block: new_head_block.clone(),
+                    rpc: self.clone(),
+                    observed_at,
+                })
+                .context("head_observation_sender failed sending")?;
+        } else {
+            head_block_sender.send_replace(new_head_block.clone());
         }
 
         Ok(())
     }
 
-    fn spawn_block_hydration(self: &Arc<Self>, block_hash: B256) {
-        if self.block_response_cache.is_none() {
-            return;
-        }
-
-        let rpc = self.clone();
-        tokio::spawn(async move {
-            if let Err(err) = rpc.hydrate_block(block_hash).await {
-                debug!(?err, %block_hash, "unable to hydrate block from {}", rpc);
-            }
-        });
-    }
-
-    async fn invalidate_uncle_headers_if_canonical(&self, block: &CachedBlockResponse) {
+    pub(super) async fn invalidate_uncle_headers_if_canonical(&self, block: &CachedBlockResponse) {
         let (Some(block_map), Some(block_number_map)) = (&self.block_map, &self.block_number_map)
         else {
             return;
@@ -670,45 +681,20 @@ impl Web3Rpc {
         }
     }
 
-    async fn hydrate_block(self: &Arc<Self>, block_hash: B256) -> Web3ProxyResult<()> {
-        let cache = self
-            .block_response_cache
-            .as_ref()
-            .expect("block response cache was checked before hydration")
-            .clone();
-        let cache_for_hydration = cache.clone();
-        let rpc = self.clone();
-        let full_key = BlockResponseCacheKey::new(block_hash, true);
-        let full = cache
-            .try_get_with(full_key, async move {
-                let result = rpc
-                    .internal_request::<_, Option<Arc<OwnedLazyValue>>>(
-                        "eth_getBlockByHash".into(),
-                        &(block_hash, true),
-                        None,
-                        Some(Duration::from_secs(5)),
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        Web3ProxyError::BadResponse("hydrated block result was null".into())
-                    })?;
-                let (full, hashes) = CachedBlockResponse::from_full(result, block_hash)?;
-                cache_for_hydration
-                    .insert(BlockResponseCacheKey::new(block_hash, false), hashes)
-                    .await;
-                Ok::<_, Web3ProxyError>(full)
-            })
-            .await
-            .map_err(Web3ProxyError::Arc)?;
-
-        let hashes_key = BlockResponseCacheKey::new(block_hash, false);
-        if cache.get(&hashes_key).await.is_none() {
-            let (_, hashes) = CachedBlockResponse::from_full(full.result(), block_hash)?;
-            cache.insert(hashes_key, hashes).await;
-        }
-
-        self.invalidate_uncle_headers_if_canonical(&full).await;
-        Ok(())
+    pub(super) async fn fetch_full_block(
+        self: &Arc<Self>,
+        block_hash: B256,
+    ) -> Web3ProxyResult<(CachedBlockResponse, CachedBlockResponse)> {
+        let result = self
+            .internal_request::<_, Option<Arc<OwnedLazyValue>>>(
+                "eth_getBlockByHash".into(),
+                &(block_hash, true),
+                None,
+                Some(Duration::from_secs(5)),
+            )
+            .await?
+            .ok_or_else(|| Web3ProxyError::BadResponse("hydrated block result was null".into()))?;
+        CachedBlockResponse::from_full(result, block_hash)
     }
 
     async fn latest_block_header(
@@ -844,7 +830,7 @@ impl Web3Rpc {
         let mut abort_handles = vec![];
 
         // health check that runs if there haven't been any recent requests
-        let health_handle = if self.block_and_rpc_sender.is_some() {
+        let health_handle = if self.head_observation_sender.is_some() {
             // TODO: move this into a proper function
             let rpc = self.clone();
 
@@ -972,7 +958,7 @@ impl Web3Rpc {
         futures.push(health_handle);
 
         // subscribe to new heads
-        if self.block_and_rpc_sender.is_some() {
+        if self.head_observation_sender.is_some() {
             let clone = self.clone();
 
             let f = async move { clone.subscribe_new_heads().await };
@@ -1196,7 +1182,7 @@ impl Web3Rpc {
                 return Ok(OpenRequestResult::Failed);
             }
 
-            if self.block_and_rpc_sender.is_some() {
+            if self.head_observation_sender.is_some() {
                 // make sure this rpc has the oldest block that this request needs
                 if let Some(block_needed) = web3_request.min_block_needed() {
                     if !self.has_block_data(block_needed) {
@@ -1520,6 +1506,7 @@ mod tests {
         full_block: Arc<Mutex<serde_json::Value>>,
         header: Header,
         hydration_release: Arc<Semaphore>,
+        hydration_sent: Arc<Notify>,
         hydration_started: Arc<Notify>,
         latest_block: serde_json::Value,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -1581,6 +1568,10 @@ mod tests {
                 .await
                 .unwrap();
 
+            if method == "eth_getBlockByHash" {
+                state.hydration_sent.notify_one();
+            }
+
             if method == "eth_getBlockByNumber" {
                 let notification = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -1608,6 +1599,231 @@ mod tests {
         header.inner.number = number;
         header.inner.timestamp = timestamp;
         header
+    }
+
+    struct HydrationStub {
+        rpc: Arc<Web3Rpc>,
+        full_block: Arc<Mutex<serde_json::Value>>,
+        hydration_release: Arc<Semaphore>,
+        hydration_sent: Arc<Notify>,
+        hydration_started: Arc<Notify>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl HydrationStub {
+        fn hydration_request_count(&self) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "eth_getBlockByHash")
+                .count()
+        }
+    }
+
+    impl Drop for HydrationStub {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn hydration_stub(name: &str, full_block: serde_json::Value) -> HydrationStub {
+        let full_block = Arc::new(Mutex::new(full_block));
+        let hydration_release = Arc::new(Semaphore::new(0));
+        let hydration_sent = Arc::new(Notify::new());
+        let hydration_started = Arc::new(Notify::new());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = WebSocketStubState {
+            full_block: full_block.clone(),
+            header: Header::default(),
+            hydration_release: hydration_release.clone(),
+            hydration_sent: hydration_sent.clone(),
+            hydration_started: hydration_started.clone(),
+            latest_block: serde_json::Value::Null,
+            requests: requests.clone(),
+        };
+        let router = Router::new()
+            .route("/", get(websocket_stub_upgrade))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let provider = connect_ws(format!("ws://{address}").parse().unwrap())
+            .await
+            .unwrap();
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let (head_block_sender, _) = watch::channel(None);
+        let (disconnect_watch, _) = watch::channel(false);
+        let rpc = Arc::new(Web3Rpc {
+            name: name.into(),
+            created_at: Some(Instant::now()),
+            hard_limit_until: Some(hard_limit_until),
+            head_block_sender: Some(head_block_sender),
+            peak_latency: Some(PeakEwmaLatency::spawn(
+                Duration::from_secs(1),
+                4,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(RollingQuantileLatency::spawn_median(4).await),
+            disconnect_watch: Some(disconnect_watch),
+            ..Default::default()
+        });
+        rpc.ws_provider.store(Some(Arc::new(provider)));
+
+        HydrationStub {
+            rpc,
+            full_block,
+            hydration_release,
+            hydration_sent,
+            hydration_started,
+            requests,
+            server,
+        }
+    }
+
+    fn full_block(block_hash: B256, source: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hash": block_hash,
+            "number": "0x2a",
+            "transactions": [{
+                "hash": B256::with_last_byte(0x11),
+                "source": source,
+            }],
+            "uncles": [],
+            "source": source,
+        })
+    }
+
+    async fn wait_for_cached_block(
+        cache: &BlockResponseCache,
+        block_hash: B256,
+        full_transactions: bool,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(block) = cache
+                    .get(&BlockResponseCacheKey::new(block_hash, full_transactions))
+                    .await
+                {
+                    break serde_json::from_str(&sonic_rs::to_string(&block.result()).unwrap())
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the hydration race must cache a block")
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn faster_announcer_wins_shared_hydration_race() {
+        let block_hash = B256::with_last_byte(0x42);
+        let cache = moka::future::Cache::new(16);
+        let coordinator = BlockHydrationCoordinator::new(cache.clone());
+        let slow = hydration_stub("slow", full_block(block_hash, "slow")).await;
+        let fast = hydration_stub("fast", full_block(block_hash, "fast")).await;
+
+        coordinator.announce(slow.rpc.clone(), block_hash).await;
+        slow.hydration_started.notified().await;
+        coordinator.announce(slow.rpc.clone(), block_hash).await;
+        tokio::task::yield_now().await;
+        assert_eq!(slow.hydration_request_count(), 1);
+        assert_eq!(slow.rpc.total_requests.load(atomic::Ordering::Relaxed), 1);
+        assert_eq!(fast.hydration_request_count(), 0);
+        assert_eq!(fast.rpc.total_requests.load(atomic::Ordering::Relaxed), 0);
+
+        coordinator.announce(fast.rpc.clone(), block_hash).await;
+        fast.hydration_started.notified().await;
+        fast.hydration_release.add_permits(1);
+
+        let cached_full = wait_for_cached_block(&cache, block_hash, true).await;
+        let cached_hashes = wait_for_cached_block(&cache, block_hash, false).await;
+        assert_eq!(cached_full["source"], "fast");
+        assert_eq!(cached_hashes["source"], "fast");
+        assert_eq!(fast.hydration_request_count(), 1);
+        assert_eq!(fast.rpc.total_requests.load(atomic::Ordering::Relaxed), 1);
+
+        slow.hydration_release.add_permits(1);
+        slow.hydration_sent.notified().await;
+        tokio::task::yield_now().await;
+        let cached_after_loser = wait_for_cached_block(&cache, block_hash, true).await;
+        assert_eq!(cached_after_loser["source"], "fast");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn invalid_hydration_results_do_not_cancel_a_valid_announcer() {
+        let block_hash = B256::with_last_byte(0x42);
+        let cache = moka::future::Cache::new(16);
+        let coordinator = BlockHydrationCoordinator::new(cache.clone());
+        let valid = hydration_stub("valid", full_block(block_hash, "valid")).await;
+        let invalid_results = [
+            serde_json::Value::Null,
+            serde_json::json!("rpc-error"),
+            serde_json::json!({"hash": block_hash, "number": "0x2a"}),
+            full_block(B256::with_last_byte(0x99), "wrong-hash"),
+        ];
+        let mut invalid = Vec::new();
+        for (index, result) in invalid_results.into_iter().enumerate() {
+            invalid.push(hydration_stub(&format!("invalid-{index}"), result).await);
+        }
+
+        coordinator.announce(valid.rpc.clone(), block_hash).await;
+        valid.hydration_started.notified().await;
+        for stub in &invalid {
+            coordinator.announce(stub.rpc.clone(), block_hash).await;
+            stub.hydration_started.notified().await;
+            stub.hydration_release.add_permits(1);
+            stub.hydration_sent.notified().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(cache
+            .get(&BlockResponseCacheKey::new(block_hash, true))
+            .await
+            .is_none());
+
+        valid.hydration_release.add_permits(1);
+        let cached = wait_for_cached_block(&cache, block_hash, true).await;
+        assert_eq!(cached["source"], "valid");
+        for stub in &invalid {
+            assert_eq!(stub.hydration_request_count(), 1);
+            assert_eq!(stub.rpc.total_requests.load(atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn failed_announcer_can_retry_after_another_announcement() {
+        let block_hash = B256::with_last_byte(0x42);
+        let cache = moka::future::Cache::new(16);
+        let coordinator = BlockHydrationCoordinator::new(cache.clone());
+        let retrying = hydration_stub("retrying", serde_json::Value::Null).await;
+
+        coordinator.announce(retrying.rpc.clone(), block_hash).await;
+        retrying.hydration_started.notified().await;
+        retrying.hydration_release.add_permits(1);
+        retrying.hydration_sent.notified().await;
+        *retrying.full_block.lock().unwrap() = full_block(block_hash, "retry");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                coordinator.announce(retrying.rpc.clone(), block_hash).await;
+                if retrying.hydration_request_count() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a failed announcer must be allowed to retry");
+        retrying.hydration_release.add_permits(1);
+
+        let cached = wait_for_cached_block(&cache, block_hash, true).await;
+        assert_eq!(cached["source"], "retry");
+        assert_eq!(retrying.hydration_request_count(), 2);
+        assert_eq!(
+            retrying.rpc.total_requests.load(atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]
@@ -1658,6 +1874,7 @@ mod tests {
             full_block: stub_full_block.clone(),
             header: expected_header,
             hydration_release: hydration_release.clone(),
+            hydration_sent: Arc::new(Notify::new()),
             hydration_started: hydration_started.clone(),
             latest_block: serde_json::Value::Null,
             requests: requests.clone(),
@@ -1675,8 +1892,9 @@ mod tests {
         let (hard_limit_until, _) = watch::channel(Instant::now());
         let (head_block_sender, _) = watch::channel(None);
         let (disconnect_watch, _) = watch::channel(false);
-        let (block_and_rpc_sender, mut block_and_rpc_receiver) = mpsc::unbounded_channel();
+        let (head_observation_sender, mut head_observation_receiver) = mpsc::unbounded_channel();
         let block_response_cache = moka::future::Cache::new(16);
+        let block_hydration = BlockHydrationCoordinator::new(block_response_cache.clone());
         let rpc = Arc::new(Web3Rpc {
             name: "websocket-stub".into(),
             block_map: Some(moka::future::Cache::new(16)),
@@ -1684,7 +1902,8 @@ mod tests {
             block_response_cache: Some(block_response_cache.clone()),
             created_at: Some(Instant::now()),
             hard_limit_until: Some(hard_limit_until),
-            block_and_rpc_sender: Some(block_and_rpc_sender),
+            head_observation_sender: Some(head_observation_sender),
+            block_hydration: Some(block_hydration),
             head_block_sender: Some(head_block_sender),
             peak_latency: Some(PeakEwmaLatency::spawn(
                 Duration::from_secs(1),
@@ -1701,14 +1920,16 @@ mod tests {
         let subscription =
             tokio::spawn(async move { rpc_for_subscription.subscribe_new_heads().await });
 
-        let (new_head, source_rpc) =
-            tokio::time::timeout(Duration::from_secs(5), block_and_rpc_receiver.recv())
+        let observation =
+            tokio::time::timeout(Duration::from_secs(5), head_observation_receiver.recv())
                 .await
                 .expect("new head must arrive before the test timeout")
                 .expect("new head channel must stay open");
-        let new_head = new_head.expect("the pushed head must not be empty");
+        let new_head = observation
+            .block
+            .expect("the pushed head must not be empty");
 
-        assert!(Arc::ptr_eq(&source_rpc, &rpc));
+        assert!(Arc::ptr_eq(&observation.rpc, &rpc));
         assert_eq!(*new_head.hash(), expected_hash);
         assert_eq!(*new_head.parent_hash(), expected_parent_hash);
         assert_eq!(new_head.number(), U64::from(expected_number));
@@ -1722,18 +1943,32 @@ mod tests {
             .await
             .is_none());
 
-        let (duplicate_head, _) =
-            tokio::time::timeout(Duration::from_secs(5), block_and_rpc_receiver.recv())
+        let duplicate_observation =
+            tokio::time::timeout(Duration::from_secs(5), head_observation_receiver.recv())
                 .await
                 .expect("duplicate pushed head must arrive before hydration finishes")
                 .expect("new head channel must stay open");
-        assert_eq!(duplicate_head.unwrap().hash(), &expected_hash);
+        assert_eq!(duplicate_observation.block.unwrap().hash(), &expected_hash);
 
         hydration_release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), rpc.hydrate_block(expected_hash))
-            .await
-            .expect("deduplicated hydration must finish")
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let has_full = block_response_cache
+                    .get(&BlockResponseCacheKey::new(expected_hash, true))
+                    .await
+                    .is_some();
+                let has_hashes = block_response_cache
+                    .get(&BlockResponseCacheKey::new(expected_hash, false))
+                    .await
+                    .is_some();
+                if has_full && has_hashes {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deduplicated hydration must finish");
 
         let cached_full = block_response_cache
             .get(&BlockResponseCacheKey::new(expected_hash, true))
@@ -1793,7 +2028,7 @@ mod tests {
             *stub_full_block.lock().unwrap() = bad_result;
             hydration_release.add_permits(1);
 
-            assert!(rpc.hydrate_block(expected_hash).await.is_err());
+            assert!(rpc.fetch_full_block(expected_hash).await.is_err());
             assert!(block_response_cache
                 .get(&BlockResponseCacheKey::new(expected_hash, true))
                 .await
@@ -1837,6 +2072,7 @@ mod tests {
             full_block: Arc::new(Mutex::new(serde_json::Value::Null)),
             header: expected_header,
             hydration_release: Arc::new(Semaphore::new(0)),
+            hydration_sent: Arc::new(Notify::new()),
             hydration_started: Arc::new(Notify::new()),
             latest_block: latest_block.clone(),
             requests: requests.clone(),

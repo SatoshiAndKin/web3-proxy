@@ -1,4 +1,4 @@
-use super::blockchain::BlockHeader;
+use super::blockchain::{BlockHeader, HeadObservation};
 use super::many::Web3Rpcs;
 use super::one::Web3Rpc;
 use super::request::OpenRequestHandle;
@@ -353,6 +353,7 @@ impl Web3Rpcs {
 }
 
 type FirstSeenCache = Cache<B256, Instant>;
+type SampledHeadsCache = Cache<(B256, String), ()>;
 
 /// A ConsensusConnections builder that tracks all connection heads across multiple groups of servers
 pub struct ConsensusFinder {
@@ -363,12 +364,15 @@ pub struct ConsensusFinder {
     max_head_block_lag: U64,
     /// Block Hash -> First Seen Instant. used to track rpc.head_delay. The same cache should be shared between all ConnectionsGroups
     first_seen: FirstSeenCache,
+    /// Block hash and RPC pairs that already contributed a head-delay sample.
+    sampled_heads: SampledHeadsCache,
 }
 
 impl ConsensusFinder {
     pub fn new(max_head_block_age: Option<Duration>, max_head_block_lag: U64) -> Self {
         // TODO: what's a good capacity for this? it shouldn't need to be very large
         let first_seen = Cache::new(16);
+        let sampled_heads = Cache::new(256);
 
         let rpc_heads = HashMap::new();
 
@@ -377,6 +381,7 @@ impl ConsensusFinder {
             max_head_block_age,
             max_head_block_lag,
             first_seen,
+            sampled_heads,
         }
     }
 
@@ -637,12 +642,16 @@ impl ConsensusFinder {
     pub(super) async fn process_block_from_rpc(
         &mut self,
         web3_rpcs: &Web3Rpcs,
-        new_block: Option<BlockHeader>,
-        rpc: Arc<Web3Rpc>,
+        observation: HeadObservation,
     ) -> Web3ProxyResult<bool> {
+        let HeadObservation {
+            block: new_block,
+            rpc,
+            observed_at,
+        } = observation;
         // TODO: how should we handle an error here?
         if !self
-            .update_rpc(new_block.clone(), rpc.clone(), web3_rpcs)
+            .update_rpc(new_block.clone(), rpc.clone(), observed_at, web3_rpcs)
             .await
             .web3_context("failed to update rpc")?
         {
@@ -658,17 +667,29 @@ impl ConsensusFinder {
         self.rpc_heads.remove(rpc)
     }
 
-    async fn insert(&mut self, rpc: Arc<Web3Rpc>, block: BlockHeader) -> Option<BlockHeader> {
-        let first_seen = self
-            .first_seen
-            .get_with_by_ref(block.hash(), async { Instant::now() })
-            .await;
+    async fn insert(
+        &mut self,
+        rpc: Arc<Web3Rpc>,
+        block: BlockHeader,
+        observed_at: Instant,
+    ) -> Option<BlockHeader> {
+        let block_hash = *block.hash();
+        let first_seen = match self.first_seen.get(&block_hash).await {
+            Some(first_seen) if first_seen <= observed_at => first_seen,
+            Some(_) | None => {
+                self.first_seen.insert(block_hash, observed_at).await;
+                observed_at
+            }
+        };
 
-        // calculate elapsed time before trying to lock
-        let latency = first_seen.elapsed();
-
-        // record the time behind the fastest node
-        rpc.head_delay.write().record_secs(latency.as_secs_f32());
+        let sample_key = (block_hash, rpc.name.clone());
+        if self.sampled_heads.get(&sample_key).await.is_none() {
+            self.sampled_heads.insert(sample_key, ()).await;
+            let latency = observed_at
+                .checked_duration_since(first_seen)
+                .unwrap_or_default();
+            rpc.head_delay.write().record_secs(latency.as_secs_f32());
+        }
 
         // update the local mapping of rpc -> block
         self.rpc_heads.insert(rpc, block)
@@ -679,6 +700,7 @@ impl ConsensusFinder {
         &mut self,
         rpc_head_block: Option<BlockHeader>,
         rpc: Arc<Web3Rpc>,
+        observed_at: Instant,
         // we need this so we can save the block to caches. i don't like it though. maybe we should use a lazy_static Cache wrapper that has a "save_block" method?. i generally dislike globals but i also dislike all the types having to pass eachother around
         web3_connections: &Web3Rpcs,
     ) -> Web3ProxyResult<bool> {
@@ -691,7 +713,9 @@ impl ConsensusFinder {
                     .await
                     .web3_context("failed caching block")?;
 
-                if let Some(prev_block) = self.insert(rpc, rpc_head_block.clone()).await {
+                if let Some(prev_block) =
+                    self.insert(rpc, rpc_head_block.clone(), observed_at).await
+                {
                     // false if this block was already sent by this rpc
                     // true if new block for this rpc
                     prev_block.hash() != rpc_head_block.hash()
@@ -1116,18 +1140,20 @@ impl std::fmt::Display for MaybeBlockNum<'_> {
 #[cfg(test)]
 mod tests {
     use super::{ConsensusFinder, RankedRpcs};
-    use crate::rpcs::blockchain::{BlockHeader, BlocksByHashCache};
+    use crate::rpcs::blockchain::{BlockHeader, BlockHydrationCoordinator, BlocksByHashCache};
     use crate::rpcs::many::Web3Rpcs;
     use crate::rpcs::one::Web3Rpc;
     use alloy::primitives::{B256, U64};
     use alloy::rpc::types::Header;
     use hashbrown::HashMap;
+    use latency::EwmaLatency;
     use moka::future::Cache;
     use parking_lot::RwLock;
     use std::io::{self, Write};
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
+    use tokio::time::Instant;
     use tracing::Level;
 
     #[derive(Clone)]
@@ -1160,19 +1186,22 @@ mod tests {
     }
 
     fn web3_rpcs(blocks_by_hash: BlocksByHashCache, min_synced_rpcs: usize) -> Web3Rpcs {
-        let (block_and_rpc_sender, _) = mpsc::unbounded_channel();
+        let (head_observation_sender, _) = mpsc::unbounded_channel();
         let (watch_ranked_rpcs, _) = watch::channel(None);
+        let block_responses = Cache::new(16);
+        let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
 
         Web3Rpcs {
             name: "test".into(),
             chain_id: 1,
-            block_and_rpc_sender,
+            head_observation_sender,
             by_name: RwLock::new(HashMap::new()),
             watch_ranked_rpcs,
             watch_head_block: None,
             blocks_by_hash,
             blocks_by_number: Cache::new(16),
-            block_responses: Cache::new(16),
+            block_responses,
+            block_hydration,
             min_synced_rpcs,
             min_sum_soft_limit: u32::try_from(min_synced_rpcs)
                 .expect("test RPC count should fit in a u32"),
@@ -1224,6 +1253,62 @@ mod tests {
         let logs = String::from_utf8(output).expect("debug logs should be valid UTF-8");
 
         (ranked_rpcs, logs)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn head_delay_uses_observation_time_and_ignores_duplicate_heads() {
+        let web3_rpcs = web3_rpcs(Cache::new(16), 1);
+        let mut consensus_finder = ConsensusFinder::new(None, U64::from(1));
+        let block_hash = B256::with_last_byte(0x42);
+        let head = block(42, block_hash, B256::with_last_byte(0x41));
+        let first_rpc = Arc::new(Web3Rpc {
+            name: "first".into(),
+            head_delay: RwLock::new(EwmaLatency::new(1.0, 0.0)),
+            ..Default::default()
+        });
+        let second_rpc = Arc::new(Web3Rpc {
+            name: "second".into(),
+            head_delay: RwLock::new(EwmaLatency::new(1.0, 0.0)),
+            ..Default::default()
+        });
+        let first_observed_at = Instant::now();
+
+        consensus_finder
+            .update_rpc(Some(head.clone()), first_rpc, first_observed_at, &web3_rpcs)
+            .await
+            .unwrap();
+
+        let second_observed_at = first_observed_at + Duration::from_millis(25);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        consensus_finder
+            .update_rpc(
+                Some(head.clone()),
+                second_rpc.clone(),
+                second_observed_at,
+                &web3_rpcs,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second_rpc.head_delay.read().latency(),
+            Duration::from_millis(25)
+        );
+
+        consensus_finder
+            .update_rpc(
+                Some(head),
+                second_rpc.clone(),
+                first_observed_at + Duration::from_secs(1),
+                &web3_rpcs,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second_rpc.head_delay.read().latency(),
+            Duration::from_millis(25)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
