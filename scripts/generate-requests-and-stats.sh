@@ -4,5 +4,5 @@
 # versus: https://github.com/INFURA/versus
 # Use a total request count for --stop-after. The duration form has a timer bug.
 
-ethspam --rpc=http://127.0.0.1:8544/ --ratelimit=50 --method=eth_call:1 \
-    | versus --concurrency=4 --stop-after=100 http://127.0.0.1:8544/
+ethspam --rpc=http://127.0.0.1:8544/ --method=eth_call:1 \
+    | versus --concurrency=200 --stop-after=20000 http://127.0.0.1:8544/
