@@ -22,12 +22,27 @@ use request_id::RequestId;
 
 use std::sync::Arc;
 use std::{net::SocketAddr, sync::atomic::Ordering};
-use tokio::{net::TcpListener, process::Command, sync::broadcast};
+use tokio::{
+    net::{TcpListener, TcpSocket},
+    process::Command,
+    sync::broadcast,
+};
 use tower_http::{cors::CorsLayer, normalize_path::NormalizePathLayer, trace::TraceLayer};
 use tracing::{error, error_span, info, trace_span};
 
 #[cfg(feature = "listenfd")]
 use listenfd::ListenFd;
+
+const LISTEN_BACKLOG: u32 = 4096;
+
+fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    info!(%addr, requested_backlog = LISTEN_BACKLOG, "binding TCP listener");
+
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_BACKLOG)
+}
 
 /// build our axum Router
 pub fn make_router(app: Arc<App>) -> Router<()> {
@@ -149,13 +164,13 @@ pub async fn serve(
         // TODO: allow only listening on localhost? top_config.app.host.parse()?
         let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
 
-        TcpListener::bind(addr).await?
+        bind_tcp_listener(addr)?
     };
     #[cfg(not(feature = "listenfd"))]
     let listener = {
         let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
 
-        TcpListener::bind(addr).await?
+        bind_tcp_listener(addr)?
     };
 
     // The frontend runs behind a trusted proxy. Client IP extraction uses the
@@ -196,4 +211,31 @@ pub async fn serve(
     let _ = shutdown_complete_sender.send(());
 
     server
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_tcp_listener;
+    use std::net::SocketAddr;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    #[tokio::test]
+    async fn bound_tcp_listener_accepts_connections() {
+        let listener = bind_tcp_listener(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|err| panic!("failed to connect to {addr}: {err}"));
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        client.write_all(b"ready").await.unwrap();
+
+        let mut received = [0; 5];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"ready");
+    }
 }

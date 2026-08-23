@@ -75,7 +75,20 @@ $ websocat ws://127.0.0.1:8544
 {"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["newPendingTransactions"]}
 ```
 
-You can copy `config/example.toml` to `config/production-$CHAINNAME.toml` and then run `docker-compose up --build -d` start proxies for many chains.
+You can copy `config/example.toml` to `config/production-$CHAINNAME.toml` and then run `docker compose -f docker-compose.prod.yml up --build -d` to start proxies for many chains.
+
+### Production TCP backlog
+
+The proxy requests a TCP accept queue backlog of 4096 for sockets that it creates. The operating system can silently cap this request. Linux uses `net.core.somaxconn` as the cap. See the [Linux `listen(2)` documentation](https://man7.org/linux/man-pages/man2/listen.2.html).
+
+The common Compose service sets `net.core.somaxconn` to 4096, so all services in `docker-compose.prod.yml` inherit that value. Docker applies this network setting inside each container network namespace. It does not change the host value. See the [Docker Compose `sysctls` documentation](https://docs.docker.com/reference/compose-file/services/#sysctls).
+
+Inspect the container and Linux host values:
+
+    docker compose -f docker-compose.prod.yml exec eth sysctl net.core.somaxconn
+    sysctl net.core.somaxconn
+
+The startup log shows the backlog that the proxy requests. If `listenfd` supplies a socket, the socket owner controls its backlog instead.
 
 Compare 3 RPCs:
 
@@ -119,10 +132,17 @@ TODO: also enable debug symbols in the release build by modifying the root Cargo
 
 Test the proxy:
 
+    wrk -t12 -c400 -d1s --latency http://127.0.0.1:8544/health
     wrk -t12 -c400 -d30s --latency http://127.0.0.1:8544/health
     wrk -t12 -c400 -d30s --latency http://127.0.0.1:8544/status
     wrk -s ./wrk/getBlockNumber.lua -t12 -c400 -d30s --latency http://127.0.0.1:8544/
     wrk -s ./wrk/getLatestBlockByNumber.lua -t12 -c400 -d30s --latency http://127.0.0.1:8544/
+
+Connect errors that occur only during the initial burst usually mean that the burst filled the TCP accept queue. Check the proxy's requested backlog and the operating-system cap before you investigate request handling. A successful run has zero connect, read, write, and timeout errors in both the one-second and 30-second tests.
+
+On the current macOS development host, `sysctl kern.ipc.somaxconn` reports 128. The same local `wrk -c400` test can have initial connect errors until an administrator increases this limit. Inspect it with:
+
+    sysctl kern.ipc.somaxconn
 
 Test geth (assuming it is on 8545):
 

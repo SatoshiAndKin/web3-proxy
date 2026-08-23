@@ -4,6 +4,8 @@ services:
     build: .
     init: true
     restart: unless-stopped
+    sysctls:
+      net.core.somaxconn: 4096
     command: --config /config.toml --workers 16 proxyd
     # rust's tokio crate expects a SIGINT https://tokio.rs/tokio/topics/shutdown
     stop_signal: SIGINT
