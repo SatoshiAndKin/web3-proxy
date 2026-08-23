@@ -8,9 +8,9 @@ use crate::{
     rpcs::{blockchain::BlockHeader, one::Web3Rpc},
 };
 use alloy::primitives::U64;
-use chrono::Utc;
 use derivative::Derivative;
 use derive_more::From;
+use jiff::Timestamp;
 use parking_lot::Mutex;
 use serde::{ser::SerializeStruct, Serialize};
 use sonic_rs::{json, OwnedLazyValue, Value};
@@ -398,7 +398,7 @@ impl ValidatedRequest {
 
         let response_millis = self.start_instant.elapsed().as_millis() as u64;
 
-        let now = Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
 
         {
             let mut response_lock = self.response.lock();

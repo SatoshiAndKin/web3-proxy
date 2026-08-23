@@ -1402,7 +1402,7 @@ mod tests {
 
     #[test]
     fn test_archive_node_has_block_data() {
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
 
         let random_block = block(1_000_000, now);
 
@@ -1432,7 +1432,7 @@ mod tests {
 
     #[test]
     fn test_pruned_node_has_block_data() {
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
 
         let head_block = BlockHeader::new(Arc::new(block(1_000_000, now)));
 
@@ -1465,7 +1465,7 @@ mod tests {
     // TODO: think about how to bring the concept of a "lagged" node back
     #[test]
     fn test_lagged_node_not_has_block_data() {
-        let now = chrono::Utc::now().timestamp().into();
+        let now = jiff::Timestamp::now().as_second().into();
 
         // head block is an hour old
         let head_block = Block {

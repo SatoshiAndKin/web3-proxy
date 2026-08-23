@@ -1,11 +1,11 @@
 use super::{SentrydErrorBuilder, SentrydResult};
+use jiff::Timestamp;
 use tracing::{debug, warn};
 use web3_proxy::jsonrpc::JsonRpcErrorData;
 use web3_proxy::prelude::alloy::primitives::B256;
 use web3_proxy::prelude::alloy::rpc::types::Block;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::anyhow::{anyhow, Context};
-use web3_proxy::prelude::chrono::{DateTime, Utc};
 use web3_proxy::prelude::futures::{stream::FuturesUnordered, StreamExt};
 use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::reqwest::header;
@@ -26,16 +26,20 @@ struct JsonRpcResponse<V> {
 #[derive(Serialize, Ord, PartialEq, PartialOrd, Eq)]
 struct AbbreviatedBlock {
     pub num: u64,
-    pub time: DateTime<Utc>,
+    pub time: Timestamp,
     pub hash: B256,
 }
 
 impl From<Block> for AbbreviatedBlock {
     fn from(x: Block) -> Self {
+        let timestamp = i64::try_from(x.header.timestamp)
+            .expect("block timestamp must fit in a signed 64-bit integer");
+
         Self {
             num: x.number(),
             hash: x.header.hash,
-            time: DateTime::from_timestamp(x.header.timestamp as i64, 0).unwrap(),
+            time: Timestamp::from_second(timestamp)
+                .expect("block timestamp must fit in Jiff's supported range"),
         }
     }
 }
@@ -129,10 +133,7 @@ pub async fn main(
     }
 
     if let Some(newest_other) = newest_other {
-        let duration_since = newest_other
-            .time
-            .signed_duration_since(rpc_block.time)
-            .num_seconds();
+        let duration_since = newest_other.time.duration_since(rpc_block.time).as_secs();
 
         match duration_since.abs().cmp(&max_lag) {
             std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {}
@@ -162,11 +163,11 @@ pub async fn main(
             },
         }
 
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         let block_age = now
-            .signed_duration_since(newest_other.max(&rpc_block).time)
-            .num_seconds();
+            .duration_since(newest_other.max(&rpc_block).time)
+            .as_secs();
 
         match block_age.abs().cmp(&max_age) {
             std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {}

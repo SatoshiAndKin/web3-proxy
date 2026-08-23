@@ -269,7 +269,7 @@ These are not yet ordered. There might be duplicates. We might not actually need
 - [-] if we subscribe to a server that is syncing, it gives us null block_data_limit. when it catches up, we don't ever send queries to it. we need to recheck block_data_limit
 - [ ] don't use new_head_provider anywhere except new head subscription
 - [x] remove the "metered" crate now that we save aggregate queries?
-- [x] don't use systemtime. use chrono
+- [x] don't use systemtime. use Jiff
 - [x] graceful shutdown
   - [x] frontend needs to shut down first. this will stop serving requests on /health and so new requests should quickly stop being routed to us
   - [x] when frontend has finished, tell all the other tasks to stop
@@ -329,7 +329,7 @@ These are not yet ordered. There might be duplicates. We might not actually need
   - if total difficulty is set and non-zero, use it for consensus instead of just the number
 - [ ] need debounce on reconnect. websockets are closing on us and then we reconnect twice. locks on ProviderState need more thought
 - [ ] having the whole block in /status is very verbose. trim it down
-- [ ] don't use systemtime. use chrono
+- [ ] don't use systemtime. use Jiff
 - [ ] soft limit needs more thought
     - it should be the min of total_sum_soft_limit (from only non-lagged servers) and min_sum_soft_limit
     - otherwise it won't track anything and will just give errors.

@@ -34,7 +34,7 @@ axum = { version = "0.8.9", features = ["http2", "tracing", "ws"] }
 axum-macros = "0.5.1"
 base64 = "0.23.1"
 bytes = "1.12.1"
-chrono = { version = "0.4.45", features = ["serde"] }
+jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 derivative = "2.2.0"
 derive_more = { version = "2.1.1", features = ["display", "error", "from"] }
 fdlimit = "0.3.0"

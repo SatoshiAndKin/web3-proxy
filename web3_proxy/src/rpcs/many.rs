@@ -740,7 +740,7 @@ mod tests {
 
     // #[test_log::test(tokio::test)]
     // async fn test_server_selection_by_height() {
-    //     let now = chrono::Utc::now().timestamp().into();
+    //     let now = jiff::Timestamp::now().as_second().into();
 
     //     let lagged_block = Block {
     //         hash: Some(H256::random()),
@@ -994,7 +994,7 @@ mod tests {
 
     // #[test_log::test(tokio::test)]
     // async fn test_server_selection_when_not_enough() {
-    //     let now = chrono::Utc::now().timestamp().into();
+    //     let now = jiff::Timestamp::now().as_second().into();
 
     //     let head_block = Block {
     //         hash: Some(H256::random()),
@@ -1076,7 +1076,7 @@ mod tests {
     // #[test_log::test(tokio::test)]
     // #[ignore = "refactor needed to make this work properly. it passes but only after waiting for long timeouts"]
     // async fn test_server_selection_by_archive() {
-    //     let now = chrono::Utc::now().timestamp().into();
+    //     let now = jiff::Timestamp::now().as_second().into();
 
     //     let head_block = Block {
     //         hash: Some(H256::random()),
@@ -1223,7 +1223,7 @@ mod tests {
     // #[test_log::test(tokio::test)]
     // #[ignore = "needs a rewrite that uses anvil or mocks the provider. i thought process_block_from_rpc was enough but i was wrong"]
     // async fn test_all_connections() {
-    //     // TODO: use chrono, not SystemTime
+    //     // TODO: use Jiff, not SystemTime
     //     let now: U256 = SystemTime::now()
     //         .duration_since(UNIX_EPOCH)
     //         .unwrap()

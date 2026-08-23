@@ -1,12 +1,12 @@
 // TODO: support websockets
 
+use jiff::Timestamp;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{info, warn};
 use web3_proxy::prelude::alloy::primitives::U64;
 use web3_proxy::prelude::alloy::rpc::types::Block;
 use web3_proxy::prelude::anyhow::{self, Context};
 use web3_proxy::prelude::argh::{self, FromArgs};
-use web3_proxy::prelude::chrono::{DateTime, Utc};
 use web3_proxy::prelude::fdlimit;
 use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::reqwest::{header, Client};
@@ -217,18 +217,17 @@ async fn main_loop(
 
     // TODO: check more. like that the hashes are on the same chain
 
-    let check_time = DateTime::from_timestamp(check_block.header.timestamp as i64, 0)
-        .context("parsing check time")?;
+    let timestamp = i64::try_from(check_block.header.timestamp)
+        .context("converting check time to a signed 64-bit integer")?;
+    let check_time = Timestamp::from_second(timestamp).context("parsing check time")?;
 
-    let now = Utc::now();
-
-    let ago = now.signed_duration_since(check_time);
+    let ago = Timestamp::now().duration_since(check_time);
 
     info!(
         "Synced on block {} @ {} ({} seconds old)",
         check_number,
-        check_time.to_rfc3339(),
-        ago.num_seconds()
+        check_time,
+        ago.as_secs()
     );
 
     Ok(())
