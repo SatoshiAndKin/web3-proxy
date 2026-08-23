@@ -67,6 +67,8 @@ impl ProxydSubCommand {
         let (frontend_shutdown_complete_sender, mut frontend_shutdown_complete_receiver) =
             broadcast::channel(1);
 
+        let mut head_block_receiver = watch_consensus_head_sender.subscribe();
+
         // start the main app
         let mut spawned_app = App::spawn(
             frontend_port,
@@ -75,8 +77,6 @@ impl ProxydSubCommand {
             watch_consensus_head_sender,
         )
         .await?;
-
-        let mut head_block_receiver = spawned_app.app.head_block_receiver();
 
         // start thread for watching config
         if let Some(top_config_path) = top_config_path {
