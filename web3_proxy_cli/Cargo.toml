@@ -7,7 +7,7 @@ default-run = "web3_proxy_cli"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["tokio-console"]
+default = []
 
 deadlock_detection = ["dep:parking_lot", "parking_lot/deadlock_detection"]
 mimalloc = ["dep:mimalloc"]
