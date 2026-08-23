@@ -471,7 +471,7 @@ in another repo: event subscriber
   - [ ] flashbots protect fast mode or not? probably fast matches most user's needs, but no reverts is nice.
 - [ ] i saw "WebSocket connection closed unexpectedly" but no log about reconnecting
   - need better logs on this because afaict it did reconnect
-- [ ] better document load tests: docker run --rm --name spam shazow/ethspam --rpc http://$LOCAL_IP:8544 | versus --concurrency=100 --stop-after=10000 http://$LOCAL_IP:8544; docker stop spam
+- [x] document ethspam and versus load tests in README.md and scripts/generate-requests-and-stats.sh
 - [ ] if the call is something simple like "symbol" or "decimals", cache that too. though i think this could bite us.
 - [ ] add a subscription that returns the head block number and hash but nothing else
 - [ ] if chain split detected, what should we do? don't send transactions?

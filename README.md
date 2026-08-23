@@ -136,8 +136,10 @@ Test erigon (assuming it is on 8945):
 
 Note: Testing with `getLatestBlockByNumber.lua` is not great because the latest block changes and so one run is likely to be very different than another.
 
-Run [ethspam](https://github.com/INFURA/versus) and [versus](https://github.com/shazow/ethspam) for a more realistic load test:
+Run [ethspam](https://github.com/shazow/ethspam) and [versus](https://github.com/INFURA/versus) for a more realistic load test. This command sends 100 `eth_call` requests through the proxy. These requests reach a backend:
 
-    ethspam --rpc http://127.0.0.1:8544 | versus --concurrency=10 --stop-after=1000 http://127.0.0.1:8544
+    ethspam --rpc=http://127.0.0.1:8544/ --ratelimit=50 --method=eth_call:1 | versus --concurrency=4 --stop-after=100 http://127.0.0.1:8544/
 
-    ethspam --rpc http://127.0.0.1:8544/ | versus --concurrency=100 --stop-after=10000 http://127.0.0.1:8544/
+Give `--stop-after` a total request count. The duration form, such as `--stop-after=10s`, has a timer bug in the current `versus` release. It exits with `context deadline exceeded` and does not print the test report.
+
+The `ethspam` `--rpc` endpoint supplies current chain data for generated requests. The final `versus` URL is the load-test target. To keep the initial `eth_getBlockByNumber` request out of the proxy results, give `ethspam` a direct RPC endpoint for the same chain. The `--method` option replaces the default method map, so specify each method that you want with a positive weight.
