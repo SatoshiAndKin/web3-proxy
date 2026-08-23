@@ -1,5 +1,7 @@
 use crate::app::Web3ProxyJoinHandle;
-use crate::rpcs::blockchain::{BlockHeader, BlocksByHashCache};
+use crate::rpcs::blockchain::{
+    BlockHeader, BlockResponseCache, BlocksByHashCache, BlocksByNumberCache,
+};
 use crate::rpcs::one::Web3Rpc;
 use alloy::primitives::{TxHash, U256, U64};
 use deduped_broadcast::DedupedBroadcaster;
@@ -56,6 +58,10 @@ pub struct AppConfig {
     /// erigon defaults to pruning beyond 90,000 blocks
     #[serde_inline_default(90_000u64)]
     pub archive_depth: u64,
+
+    /// Maximum combined size of cached block responses.
+    #[serde_inline_default(268_435_456u64)]
+    pub block_cache_max_bytes: u64,
 
     /// EVM chain id. 1 for ETH
     /// TODO: better type for chain_id? max of `u64::MAX / 2 - 36` <https://github.com/ethereum/EIPs/issues/2294>
@@ -288,6 +294,8 @@ impl Web3RpcConfig {
         block_interval: Duration,
         http_client: Option<reqwest::Client>,
         blocks_by_hash_cache: BlocksByHashCache,
+        blocks_by_number_cache: BlocksByNumberCache,
+        block_response_cache: BlockResponseCache,
         block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
         pending_txid_firehouse: Option<Arc<DedupedBroadcaster<TxHash>>>,
         max_head_block_age: Duration,
@@ -304,6 +312,8 @@ impl Web3RpcConfig {
             http_client,
             block_interval,
             blocks_by_hash_cache,
+            blocks_by_number_cache,
+            block_response_cache,
             block_and_rpc_sender,
             pending_txid_firehouse,
             max_head_block_age,
@@ -327,11 +337,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(a.min_synced_rpcs, 1);
+        assert_eq!(a.block_cache_max_bytes, 268_435_456);
 
         // b is from Default
         let b = AppConfig::default();
 
         assert_eq!(b.min_synced_rpcs, 1);
+        assert_eq!(b.block_cache_max_bytes, 268_435_456);
 
         assert_eq!(a, b);
     }

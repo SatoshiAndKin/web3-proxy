@@ -1,5 +1,8 @@
 //! Load balanced communication with a group of web3 rpc providers
-use super::blockchain::{BlockHeader, BlocksByHashCache, BlocksByNumberCache};
+use super::blockchain::{
+    new_block_response_cache, BlockHeader, BlockResponseCache, BlocksByHashCache,
+    BlocksByNumberCache,
+};
 use super::consensus::{RankedRpcs, RpcsForRequest};
 use super::one::Web3Rpc;
 use crate::app::{App, Web3ProxyJoinHandle};
@@ -51,6 +54,8 @@ pub struct Web3Rpcs {
     pub(crate) blocks_by_hash: BlocksByHashCache,
     /// blocks on the heaviest chain
     pub(crate) blocks_by_number: BlocksByNumberCache,
+    /// Raw block results keyed by hash and transaction form.
+    pub(crate) block_responses: BlockResponseCache,
     /// the number of rpcs required to agree on consensus for the head block (thundering herd protection)
     pub(super) min_synced_rpcs: usize,
     /// the soft limit required to agree on consensus for the head block. (thundering herd protection)
@@ -62,6 +67,32 @@ pub struct Web3Rpcs {
     pub(super) max_head_block_age: Duration,
     /// all of the pending txids for all of the rpcs. this still has duplicates
     pub(super) pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
+}
+
+pub struct Web3RpcsSpawnConfig {
+    chain_id: u64,
+    max_head_block_lag: Option<U64>,
+    min_head_rpcs: usize,
+    min_sum_soft_limit: u32,
+    block_cache_max_bytes: u64,
+}
+
+impl Web3RpcsSpawnConfig {
+    pub fn new(
+        chain_id: u64,
+        max_head_block_lag: Option<U64>,
+        min_head_rpcs: usize,
+        min_sum_soft_limit: u32,
+        block_cache_max_bytes: u64,
+    ) -> Self {
+        Self {
+            chain_id,
+            max_head_block_lag,
+            min_head_rpcs,
+            min_sum_soft_limit,
+            block_cache_max_bytes,
+        }
+    }
 }
 
 /// this is a RankedRpcs that should be ready to use
@@ -95,10 +126,7 @@ impl From<Option<RpcsForRequest>> for TryRpcsForRequest {
 impl Web3Rpcs {
     /// Spawn durable connections to multiple Web3 providers.
     pub async fn spawn(
-        chain_id: u64,
-        max_head_block_lag: Option<U64>,
-        min_head_rpcs: usize,
-        min_sum_soft_limit: u32,
+        config: Web3RpcsSpawnConfig,
         name: Cow<'static, str>,
         watch_consensus_head_sender: Option<watch::Sender<Option<BlockHeader>>>,
         pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
@@ -125,16 +153,18 @@ impl Web3Rpcs {
             .time_to_idle(Duration::from_secs(30 * 60))
             .build();
 
+        let block_responses = new_block_response_cache(config.block_cache_max_bytes);
+
         let (watch_consensus_rpcs_sender, consensus_connections_watcher) =
             watch::channel(Default::default());
 
         // by_name starts empty. self.apply_server_configs will add to it
         let by_name = RwLock::new(HashMap::new());
 
-        let block_interval = average_block_interval(chain_id);
+        let block_interval = average_block_interval(config.chain_id);
 
         // TODO: think about the max more for long block interval chains
-        let max_head_block_lag = max_head_block_lag.unwrap_or_else(|| {
+        let max_head_block_lag = config.max_head_block_lag.unwrap_or_else(|| {
             U64::from(5.max((60f32 / block_interval.as_secs_f32()).round() as u64))
         });
 
@@ -146,12 +176,13 @@ impl Web3Rpcs {
             block_and_rpc_sender,
             blocks_by_hash,
             blocks_by_number,
+            block_responses,
             by_name,
-            chain_id,
+            chain_id: config.chain_id,
             max_head_block_age,
             max_head_block_lag,
-            min_synced_rpcs: min_head_rpcs,
-            min_sum_soft_limit,
+            min_synced_rpcs: config.min_head_rpcs,
+            min_sum_soft_limit: config.min_sum_soft_limit,
             name,
             pending_txid_firehose,
             watch_head_block: watch_consensus_head_sender,
@@ -226,6 +257,8 @@ impl Web3Rpcs {
                 };
 
                 let blocks_by_hash_cache = self.blocks_by_hash.clone();
+                let blocks_by_number_cache = self.blocks_by_number.clone();
+                let block_response_cache = self.block_responses.clone();
 
                 debug!("spawning tasks for {}", server_name);
 
@@ -237,6 +270,8 @@ impl Web3Rpcs {
                     block_interval,
                     http_client,
                     blocks_by_hash_cache,
+                    blocks_by_number_cache,
+                    block_response_cache,
                     block_and_rpc_sender,
                     self.pending_txid_firehose.clone(),
                     self.max_head_block_age,
@@ -611,6 +646,7 @@ impl Serialize for Web3Rpcs {
             &(
                 MokaCacheSerializer(&self.blocks_by_hash),
                 MokaCacheSerializer(&self.blocks_by_number),
+                MokaCacheSerializer(&self.block_responses),
             ),
         )?;
 

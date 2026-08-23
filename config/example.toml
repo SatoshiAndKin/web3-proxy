@@ -1,6 +1,9 @@
 [app]
 chain_id = 1
 
+# combined byte limit for full and hash-only block responses (256 MiB)
+block_cache_max_bytes = 268435456
+
 kafka_urls = "127.0.0.1:19092"
 kafka_protocol = "plaintext"
 

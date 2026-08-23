@@ -1,5 +1,8 @@
 //! Rate-limited communication with a web3 provider.
-use super::blockchain::{ArcHeader, BlockHeader, BlocksByHashCache};
+use super::blockchain::{
+    ArcHeader, BlockHeader, BlockResponseCache, BlockResponseCacheKey, BlocksByHashCache,
+    BlocksByNumberCache, CachedBlockResponse,
+};
 use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
@@ -9,7 +12,7 @@ use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
 use crate::jsonrpc::{self, JsonRpcParams, JsonRpcResultData};
 use crate::rpcs::request::RequestErrorHandler;
-use alloy::primitives::{Address, Bytes, TxHash, U256, U64};
+use alloy::primitives::{Address, Bytes, TxHash, B256, U256, U64};
 use alloy::providers::Provider;
 use alloy::rpc::types::Block;
 use anyhow::{anyhow, Context};
@@ -23,7 +26,7 @@ use nanorand::Rng;
 use parking_lot::RwLock;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
-use sonic_rs::json;
+use sonic_rs::{json, OwnedLazyValue};
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::fmt;
@@ -51,6 +54,10 @@ pub struct Web3Rpc {
     pub(super) active_requests: AtomicUsize,
     /// mapping of block numbers and hashes
     pub(super) block_map: Option<BlocksByHashCache>,
+    /// canonical mapping of block numbers to hashes
+    pub(super) block_number_map: Option<BlocksByNumberCache>,
+    /// raw block responses keyed by hash and transaction form
+    pub(super) block_response_cache: Option<BlockResponseCache>,
     /// created_at is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) created_at: Option<Instant>,
     /// if no ipc_stream, most all requests prefer to use the http_provider
@@ -114,6 +121,8 @@ impl Web3Rpc {
         http_client: Option<reqwest::Client>,
         block_interval: Duration,
         block_map: BlocksByHashCache,
+        block_number_map: BlocksByNumberCache,
+        block_response_cache: BlockResponseCache,
         block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
         pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
         max_head_block_age: Duration,
@@ -187,6 +196,8 @@ impl Web3Rpc {
             block_data_limit,
             block_interval,
             block_map: Some(block_map),
+            block_number_map: Some(block_number_map),
+            block_response_cache: Some(block_response_cache),
             chain_id,
             created_at: Some(created_at),
             display_name: config.display_name,
@@ -597,13 +608,131 @@ impl Web3Rpc {
             // tell web3rpcs about this rpc having this block
             // web3rpcs will do `self.head_block_sender.send_replace(new_head_block)`
             block_and_rpc_sender
-                .send((new_head_block, self.clone()))
+                .send((new_head_block.clone(), self.clone()))
                 .context("block_and_rpc_sender failed sending")?;
         } else {
-            head_block_sender.send_replace(new_head_block);
+            head_block_sender.send_replace(new_head_block.clone());
+        }
+
+        if let Some(new_head_block) = new_head_block {
+            self.spawn_block_hydration(*new_head_block.hash());
         }
 
         Ok(())
+    }
+
+    fn spawn_block_hydration(self: &Arc<Self>, block_hash: B256) {
+        if self.block_response_cache.is_none() {
+            return;
+        }
+
+        let rpc = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = rpc.hydrate_block(block_hash).await {
+                debug!(?err, %block_hash, "unable to hydrate block from {}", rpc);
+            }
+        });
+    }
+
+    async fn invalidate_uncle_headers_if_canonical(&self, block: &CachedBlockResponse) {
+        let (Some(block_map), Some(block_number_map)) = (&self.block_map, &self.block_number_map)
+        else {
+            return;
+        };
+
+        if block_number_map.get(&block.block_number()).await != Some(block.block_hash()) {
+            return;
+        }
+
+        for uncle_hash in block.uncle_hashes() {
+            block_map.invalidate(uncle_hash).await;
+        }
+    }
+
+    async fn cache_hashes_block_response(&self, result: Arc<OwnedLazyValue>) {
+        let Some(cache) = &self.block_response_cache else {
+            return;
+        };
+
+        match CachedBlockResponse::from_hashes(result) {
+            Ok(block) => {
+                cache
+                    .insert(
+                        BlockResponseCacheKey::new(block.block_hash(), false),
+                        block.clone(),
+                    )
+                    .await;
+                self.invalidate_uncle_headers_if_canonical(&block).await;
+            }
+            Err(err) => {
+                debug!(?err, "not caching malformed hash-only block from {}", self);
+            }
+        }
+    }
+
+    async fn hydrate_block(self: &Arc<Self>, block_hash: B256) -> Web3ProxyResult<()> {
+        let cache = self
+            .block_response_cache
+            .as_ref()
+            .expect("block response cache was checked before hydration")
+            .clone();
+        let cache_for_hydration = cache.clone();
+        let rpc = self.clone();
+        let full_key = BlockResponseCacheKey::new(block_hash, true);
+        let full = cache
+            .try_get_with(full_key, async move {
+                let result = rpc
+                    .internal_request::<_, Option<Arc<OwnedLazyValue>>>(
+                        "eth_getBlockByHash".into(),
+                        &(block_hash, true),
+                        None,
+                        Some(Duration::from_secs(5)),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        Web3ProxyError::BadResponse("hydrated block result was null".into())
+                    })?;
+                let (full, hashes) = CachedBlockResponse::from_full(result, block_hash)?;
+                cache_for_hydration
+                    .insert(BlockResponseCacheKey::new(block_hash, false), hashes)
+                    .await;
+                Ok::<_, Web3ProxyError>(full)
+            })
+            .await
+            .map_err(Web3ProxyError::Arc)?;
+
+        let hashes_key = BlockResponseCacheKey::new(block_hash, false);
+        if cache.get(&hashes_key).await.is_none() {
+            let (_, hashes) = CachedBlockResponse::from_full(full.result(), block_hash)?;
+            cache.insert(hashes_key, hashes).await;
+        }
+
+        self.invalidate_uncle_headers_if_canonical(&full).await;
+        Ok(())
+    }
+
+    async fn latest_block_header(
+        self: &Arc<Self>,
+        error_handler: Option<RequestErrorHandler>,
+    ) -> Web3ProxyResult<Option<ArcHeader>> {
+        let result = self
+            .internal_request::<_, Option<Arc<OwnedLazyValue>>>(
+                "eth_getBlockByNumber".into(),
+                &("latest", false),
+                error_handler,
+                Some(Duration::from_secs(5)),
+            )
+            .await?;
+
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        let block: Block = sonic_rs::from_str(
+            &sonic_rs::to_string(&result).expect("latest block result must serialize"),
+        )?;
+        self.cache_hashes_block_response(result).await;
+
+        Ok(Some(Arc::new(block.header)))
     }
 
     #[inline(always)]
@@ -946,16 +1075,7 @@ impl Web3Rpc {
             // query the block once since the subscription doesn't send the current block
             // there is a very small race condition here where the stream could send us a new block right now
             // but sending the same block twice won't break anything
-            let latest_block: Result<Option<Block>, _> = self
-                .internal_request(
-                    "eth_getBlockByNumber".into(),
-                    &("latest", false),
-                    error_handler,
-                    Some(Duration::from_secs(5)),
-                )
-                .await;
-
-            let latest_header = latest_block.map(|block| block.map(|block| Arc::new(block.header)));
+            let latest_header = self.latest_block_header(error_handler).await;
             self.send_head_block_result(latest_header).await?;
 
             while let Some(header) = headers.next().await {
@@ -970,17 +1090,7 @@ impl Web3Rpc {
             i.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
-                let block_result = self
-                    .internal_request::<_, Option<Block>>(
-                        "eth_getBlockByNumber".into(),
-                        &("latest", false),
-                        error_handler,
-                        Some(Duration::from_secs(5)),
-                    )
-                    .await;
-
-                let header_result =
-                    block_result.map(|block| block.map(|block| Arc::new(block.header)));
+                let header_result = self.latest_block_header(error_handler).await;
                 self.send_head_block_result(header_result).await?;
 
                 // TODO: should this select be at the start or end of the loop?
@@ -1403,10 +1513,15 @@ mod tests {
     use futures::SinkExt;
     use std::sync::Mutex;
     use tokio::net::TcpListener;
+    use tokio::sync::{Notify, Semaphore};
 
     #[derive(Clone)]
     struct WebSocketStubState {
+        full_block: Arc<Mutex<serde_json::Value>>,
         header: Header,
+        hydration_release: Arc<Semaphore>,
+        hydration_started: Arc<Notify>,
+        latest_block: serde_json::Value,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
@@ -1433,8 +1548,27 @@ mod tests {
                 "eth_getBlockByNumber" => serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request["id"],
-                    "result": null,
+                    "result": &state.latest_block,
                 }),
+                "eth_getBlockByHash" => {
+                    state.hydration_started.notify_one();
+                    let permit = state.hydration_release.acquire().await.unwrap();
+                    permit.forget();
+                    let full_block = state.full_block.lock().unwrap().clone();
+                    if full_block == "rpc-error" {
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "error": {"code": -32000, "message": "hydration failed"},
+                        })
+                    } else {
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": full_block,
+                        })
+                    }
+                }
                 _ => serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request["id"],
@@ -1456,10 +1590,12 @@ mod tests {
                         "result": &state.header,
                     },
                 });
-                socket
-                    .send(WsMessage::Text(notification.to_string().into()))
-                    .await
-                    .unwrap();
+                for _ in 0..2 {
+                    socket
+                        .send(WsMessage::Text(notification.to_string().into()))
+                        .await
+                        .unwrap();
+                }
             }
         }
     }
@@ -1490,7 +1626,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn websocket_new_head_does_not_fetch_block_by_hash() {
+    async fn websocket_new_head_starts_one_background_block_hydration() {
         let expected_hash = B256::with_last_byte(0x42);
         let expected_parent_hash = B256::with_last_byte(0x41);
         let expected_number = 42;
@@ -1500,9 +1636,30 @@ mod tests {
         expected_header.hash = expected_hash;
         expected_header.inner.parent_hash = expected_parent_hash;
 
+        let transaction_hashes = [B256::with_last_byte(0x11), B256::with_last_byte(0x12)];
+        let uncle_hash = B256::with_last_byte(0x33);
+        let full_block = serde_json::json!({
+            "hash": expected_hash,
+            "number": "0x2a",
+            "transactions": [
+                {"hash": transaction_hashes[0], "providerTxField": "first"},
+                {"hash": transaction_hashes[1], "providerTxField": "second"},
+            ],
+            "uncles": [uncle_hash],
+            "withdrawals": [{"index": "0x1", "amount": "0x2"}],
+            "providerBlockField": {"preserved": true},
+        });
+
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let hydration_release = Arc::new(Semaphore::new(0));
+        let hydration_started = Arc::new(Notify::new());
+        let stub_full_block = Arc::new(Mutex::new(full_block.clone()));
         let state = WebSocketStubState {
+            full_block: stub_full_block.clone(),
             header: expected_header,
+            hydration_release: hydration_release.clone(),
+            hydration_started: hydration_started.clone(),
+            latest_block: serde_json::Value::Null,
             requests: requests.clone(),
         };
         let router = Router::new()
@@ -1519,9 +1676,12 @@ mod tests {
         let (head_block_sender, _) = watch::channel(None);
         let (disconnect_watch, _) = watch::channel(false);
         let (block_and_rpc_sender, mut block_and_rpc_receiver) = mpsc::unbounded_channel();
+        let block_response_cache = moka::future::Cache::new(16);
         let rpc = Arc::new(Web3Rpc {
             name: "websocket-stub".into(),
             block_map: Some(moka::future::Cache::new(16)),
+            block_number_map: Some(moka::future::Cache::new(16)),
+            block_response_cache: Some(block_response_cache.clone()),
             created_at: Some(Instant::now()),
             hard_limit_until: Some(hard_limit_until),
             block_and_rpc_sender: Some(block_and_rpc_sender),
@@ -1554,20 +1714,186 @@ mod tests {
         assert_eq!(new_head.number(), U64::from(expected_number));
         assert_eq!(new_head.timestamp(), expected_timestamp);
 
-        let methods = {
+        tokio::time::timeout(Duration::from_secs(5), hydration_started.notified())
+            .await
+            .expect("hydration must start after the head is sent");
+        assert!(block_response_cache
+            .get(&BlockResponseCacheKey::new(expected_hash, true))
+            .await
+            .is_none());
+
+        let (duplicate_head, _) =
+            tokio::time::timeout(Duration::from_secs(5), block_and_rpc_receiver.recv())
+                .await
+                .expect("duplicate pushed head must arrive before hydration finishes")
+                .expect("new head channel must stay open");
+        assert_eq!(duplicate_head.unwrap().hash(), &expected_hash);
+
+        hydration_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), rpc.hydrate_block(expected_hash))
+            .await
+            .expect("deduplicated hydration must finish")
+            .unwrap();
+
+        let cached_full = block_response_cache
+            .get(&BlockResponseCacheKey::new(expected_hash, true))
+            .await
+            .expect("full block response must be cached");
+        let cached_hashes = block_response_cache
+            .get(&BlockResponseCacheKey::new(expected_hash, false))
+            .await
+            .expect("hash-only block response must be cached");
+        let cached_full: serde_json::Value =
+            serde_json::from_str(&sonic_rs::to_string(&cached_full.result()).unwrap()).unwrap();
+        let cached_hashes: serde_json::Value =
+            serde_json::from_str(&sonic_rs::to_string(&cached_hashes.result()).unwrap()).unwrap();
+
+        assert_eq!(cached_full, full_block);
+        assert_eq!(
+            cached_hashes["transactions"],
+            serde_json::json!(transaction_hashes)
+        );
+        assert_eq!(cached_hashes["uncles"], full_block["uncles"]);
+        assert_eq!(cached_hashes["withdrawals"], full_block["withdrawals"]);
+        assert_eq!(
+            cached_hashes["providerBlockField"],
+            full_block["providerBlockField"]
+        );
+
+        let initial_methods = {
             let requests = requests.lock().unwrap();
             assert_eq!(requests[0]["params"], serde_json::json!(["newHeads"]));
+            assert_eq!(requests[1]["params"], serde_json::json!(["latest", false]));
             requests
                 .iter()
                 .map(|request| request["method"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(methods, ["eth_subscribe", "eth_getBlockByNumber"]);
-        assert!(!methods.iter().any(|method| method == "eth_getBlockByHash"));
+        assert_eq!(
+            initial_methods,
+            [
+                "eth_subscribe",
+                "eth_getBlockByNumber",
+                "eth_getBlockByHash"
+            ]
+        );
+
+        rpc.healthy.store(true, atomic::Ordering::SeqCst);
+        for bad_result in [
+            serde_json::Value::Null,
+            serde_json::json!({"hash": expected_hash, "number": "0x2a"}),
+            serde_json::json!("rpc-error"),
+        ] {
+            block_response_cache
+                .invalidate(&BlockResponseCacheKey::new(expected_hash, true))
+                .await;
+            block_response_cache
+                .invalidate(&BlockResponseCacheKey::new(expected_hash, false))
+                .await;
+            *stub_full_block.lock().unwrap() = bad_result;
+            hydration_release.add_permits(1);
+
+            assert!(rpc.hydrate_block(expected_hash).await.is_err());
+            assert!(block_response_cache
+                .get(&BlockResponseCacheKey::new(expected_hash, true))
+                .await
+                .is_none());
+            assert!(block_response_cache
+                .get(&BlockResponseCacheKey::new(expected_hash, false))
+                .await
+                .is_none());
+            assert!(rpc.healthy.load(atomic::Ordering::SeqCst));
+        }
+
+        let hydration_requests = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "eth_getBlockByHash")
+            .count();
+        assert_eq!(hydration_requests, 4);
 
         subscription.abort();
         server.abort();
         let _ = subscription.await;
+        let _ = server.await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn latest_hash_only_block_seeds_the_response_cache() {
+        let expected_hash = B256::with_last_byte(0x42);
+        let mut expected_header = header(42, 1_234);
+        expected_header.hash = expected_hash;
+        expected_header.inner.parent_hash = B256::with_last_byte(0x41);
+        let mut latest_block = serde_json::to_value(&expected_header).unwrap();
+        let latest_block_object = latest_block.as_object_mut().unwrap();
+        latest_block_object.insert("transactions".into(), serde_json::json!([]));
+        latest_block_object.insert("uncles".into(), serde_json::json!([]));
+        latest_block_object.insert("withdrawals".into(), serde_json::json!([]));
+        latest_block_object.insert("providerBlockField".into(), serde_json::json!("kept"));
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = WebSocketStubState {
+            full_block: Arc::new(Mutex::new(serde_json::Value::Null)),
+            header: expected_header,
+            hydration_release: Arc::new(Semaphore::new(0)),
+            hydration_started: Arc::new(Notify::new()),
+            latest_block: latest_block.clone(),
+            requests: requests.clone(),
+        };
+        let router = Router::new()
+            .route("/", get(websocket_stub_upgrade))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let provider = connect_ws(format!("ws://{address}").parse().unwrap())
+            .await
+            .unwrap();
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let (disconnect_watch, _) = watch::channel(false);
+        let block_response_cache = moka::future::Cache::new(16);
+        let rpc = Arc::new(Web3Rpc {
+            name: "latest-block-stub".into(),
+            block_map: Some(moka::future::Cache::new(16)),
+            block_number_map: Some(moka::future::Cache::new(16)),
+            block_response_cache: Some(block_response_cache.clone()),
+            created_at: Some(Instant::now()),
+            hard_limit_until: Some(hard_limit_until),
+            peak_latency: Some(PeakEwmaLatency::spawn(
+                Duration::from_secs(1),
+                4,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(RollingQuantileLatency::spawn_median(4).await),
+            disconnect_watch: Some(disconnect_watch),
+            ..Default::default()
+        });
+        rpc.ws_provider.store(Some(Arc::new(provider)));
+
+        let latest_header = rpc.latest_block_header(None).await.unwrap().unwrap();
+
+        assert_eq!(latest_header.hash, expected_hash);
+        let cached = block_response_cache
+            .get(&BlockResponseCacheKey::new(expected_hash, false))
+            .await
+            .expect("latest hash-only block must be cached");
+        let cached: serde_json::Value =
+            serde_json::from_str(&sonic_rs::to_string(&cached.result()).unwrap()).unwrap();
+        assert_eq!(cached, latest_block);
+        assert!(block_response_cache
+            .get(&BlockResponseCacheKey::new(expected_hash, true))
+            .await
+            .is_none());
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+            assert_eq!(requests[0]["params"], serde_json::json!(["latest", false]));
+        }
+
+        server.abort();
         let _ = server.await;
     }
 

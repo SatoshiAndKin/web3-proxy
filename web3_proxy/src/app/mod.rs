@@ -10,7 +10,7 @@ use crate::jsonrpc::{
 };
 use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::consensus::RankedRpcs;
-use crate::rpcs::many::Web3Rpcs;
+use crate::rpcs::many::{Web3Rpcs, Web3RpcsSpawnConfig};
 use crate::rpcs::one::Web3Rpc;
 use alloy::consensus::{Transaction as _, TxEnvelope};
 use alloy::eips::Decodable2718;
@@ -135,10 +135,13 @@ impl App {
 
         // TODO: remove this. it should only be done by apply_top_config
         let (balanced_rpcs, balanced_handle, consensus_connections_watcher) = Web3Rpcs::spawn(
-            chain_id,
-            top_config.app.max_head_block_lag,
-            top_config.app.min_synced_rpcs,
-            top_config.app.min_sum_soft_limit,
+            Web3RpcsSpawnConfig::new(
+                chain_id,
+                top_config.app.max_head_block_lag,
+                top_config.app.min_synced_rpcs,
+                top_config.app.min_sum_soft_limit,
+                top_config.app.block_cache_max_bytes,
+            ),
             "balanced rpcs".into(),
             Some(watch_consensus_head_sender),
             Some(deduped_txid_firehose.clone()),
@@ -150,11 +153,14 @@ impl App {
         // only some chains have this, so this might be empty
         // TODO: set min_sum_soft_limit > 0 if any private rpcs are configured. this way we don't accidently leak to the public mempool if they are all offline
         let (private_rpcs, private_handle, _) = Web3Rpcs::spawn(
-            chain_id,
-            // private rpcs don't get subscriptions, so no need for max_head_block_lag
-            None,
-            0,
-            0,
+            Web3RpcsSpawnConfig::new(
+                chain_id,
+                // private rpcs don't get subscriptions, so no need for max_head_block_lag
+                None,
+                0,
+                0,
+                top_config.app.block_cache_max_bytes,
+            ),
             "protected rpcs".into(),
             // subscribing to new heads here won't work well. if they are fast, they might be ahead of balanced_rpcs
             // they also often have low rate limits
@@ -168,11 +174,14 @@ impl App {
 
         // prepare a Web3Rpcs to hold all our 4337 Abstraction Bundler connections (if any)
         let (bundler_4337_rpcs, bundler_4337_rpcs_handle, _) = Web3Rpcs::spawn(
-            chain_id,
-            // bundler_4337_rpcs don't get subscriptions, so no need for max_head_block_lag
-            None,
-            0,
-            0,
+            Web3RpcsSpawnConfig::new(
+                chain_id,
+                // bundler_4337_rpcs don't get subscriptions, so no need for max_head_block_lag
+                None,
+                0,
+                0,
+                top_config.app.block_cache_max_bytes,
+            ),
             "eip4337 rpcs".into(),
             None,
             None,
@@ -637,6 +646,12 @@ impl App {
         self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse> {
+        if let Some(request) = web3_request.inner.jsonrpc_request() {
+            if let Some(response) = self.balanced_rpcs.cached_block_response(request).await {
+                return Ok(response);
+            }
+        }
+
         // TODO: serve net_version without querying the backend
         // TODO: don't force OwnedLazyValue
         let response: jsonrpc::SingleResponse = match web3_request.inner.method() {
@@ -971,5 +986,116 @@ impl fmt::Debug for App {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // TODO: the default formatter takes forever to write. this is too quiet though
         f.debug_struct("Web3ProxyApp").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jsonrpc::SingleRequest;
+    use crate::rpcs::blockchain::{BlockResponseCacheKey, CachedBlockResponse};
+    use alloy::rpc::types::Header;
+    use sonic_rs::OwnedLazyValue;
+
+    async fn app_with_no_backend() -> Arc<App> {
+        let (balanced_rpcs, _handle, _) = Web3Rpcs::spawn(
+            Web3RpcsSpawnConfig::new(1, None, 0, 0, 1_000_000),
+            "cache-only-test".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (_, watch_consensus_head_receiver) = watch::channel(None);
+
+        Arc::new(App {
+            balanced_rpcs: balanced_rpcs.clone(),
+            bundler_4337_rpcs: balanced_rpcs.clone(),
+            config: AppConfig::default(),
+            http_client: None,
+            watch_consensus_head_receiver,
+            pending_txid_firehose: DedupedBroadcaster::new(4, 16),
+            hostname: None,
+            frontend_port: Arc::new(AtomicU16::new(0)),
+            protected_rpcs: balanced_rpcs,
+            start: Instant::now(),
+            tx_subscriptions: Semaphore::new(1),
+        })
+    }
+
+    fn head(number: u64, hash: B256) -> BlockHeader {
+        let mut header: Header = Header {
+            hash,
+            ..Default::default()
+        };
+        header.inner.number = number;
+        BlockHeader::new(Arc::new(header))
+    }
+
+    #[tokio::test]
+    async fn proxy_serves_all_cached_block_forms_without_a_backend() {
+        let app = app_with_no_backend().await;
+        let block_hash = B256::with_last_byte(0x42);
+        let transaction_hash = B256::with_last_byte(0x11);
+        let full_value = serde_json::json!({
+            "hash": block_hash,
+            "number": "0x2a",
+            "transactions": [{"hash": transaction_hash, "providerTx": true}],
+            "uncles": [],
+            "withdrawals": [],
+            "providerBlock": true,
+        });
+        let raw = Arc::new(sonic_rs::from_str::<OwnedLazyValue>(&full_value.to_string()).unwrap());
+        let (full, hashes) = CachedBlockResponse::from_full(raw, block_hash).unwrap();
+        app.balanced_rpcs
+            .block_responses
+            .insert(BlockResponseCacheKey::new(block_hash, true), full)
+            .await;
+        app.balanced_rpcs
+            .block_responses
+            .insert(BlockResponseCacheKey::new(block_hash, false), hashes)
+            .await;
+        app.balanced_rpcs
+            .blocks_by_number
+            .insert(U64::from(42), block_hash)
+            .await;
+        let head = head(42, block_hash);
+
+        let requests = [
+            format!(
+                r#"{{"jsonrpc":"2.0","id":"hash-full","method":"eth_getBlockByHash","params":["{block_hash}",true]}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":"hash-hashes","method":"eth_getBlockByHash","params":["{block_hash}",false]}}"#
+            ),
+            r#"{"jsonrpc":"2.0","id":"number-full","method":"eth_getBlockByNumber","params":["0x2a",true]}"#.into(),
+            r#"{"jsonrpc":"2.0","id":"latest-hashes","method":"eth_getBlockByNumber","params":["latest",false]}"#.into(),
+        ];
+
+        for request in requests {
+            let request: SingleRequest = sonic_rs::from_str(&request).unwrap();
+            let expected_id: serde_json::Value =
+                serde_json::from_str(&sonic_rs::to_string(&request.id).unwrap()).unwrap();
+            let full_transactions = request.params[1].as_bool().unwrap();
+            let (status, response, backend_rpcs) = app
+                .proxy_request(request, ProxyMode::Best, Some(head.clone()), None)
+                .await;
+            let response = response.parsed().await.unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&sonic_rs::to_string(&response).unwrap()).unwrap();
+
+            assert_eq!(status, StatusCode::OK);
+            assert!(backend_rpcs.is_empty());
+            assert_eq!(response["id"], expected_id);
+            if full_transactions {
+                assert_eq!(response["result"], full_value);
+            } else {
+                assert_eq!(
+                    response["result"]["transactions"],
+                    serde_json::json!([transaction_hash])
+                );
+                assert_eq!(response["result"]["providerBlock"], true);
+            }
+        }
     }
 }

@@ -1172,6 +1172,7 @@ mod tests {
             watch_head_block: None,
             blocks_by_hash,
             blocks_by_number: Cache::new(16),
+            block_responses: Cache::new(16),
             min_synced_rpcs,
             min_sum_soft_limit: u32::try_from(min_synced_rpcs)
                 .expect("test RPC count should fit in a u32"),
