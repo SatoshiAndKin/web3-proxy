@@ -7,7 +7,6 @@ pub use hashbrown;
 pub use http;
 pub use jiff;
 pub use moka;
-pub use num;
 pub use ordered_float;
 pub use parking_lot;
 pub use reqwest;

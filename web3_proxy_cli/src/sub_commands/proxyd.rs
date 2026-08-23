@@ -10,7 +10,6 @@ use web3_proxy::frontend;
 use web3_proxy::prelude::anyhow;
 use web3_proxy::prelude::argh::{self, FromArgs};
 use web3_proxy::prelude::futures::StreamExt;
-use web3_proxy::prelude::num::Zero;
 use web3_proxy::prelude::tokio;
 use web3_proxy::prelude::tokio::process::Command;
 use web3_proxy::prelude::tokio::signal::unix::SignalKind;
@@ -301,7 +300,7 @@ impl ProxydSubCommand {
             }
         }
 
-        if background_errors.is_zero() && !exited_with_err {
+        if background_errors == 0 && !exited_with_err {
             info!("finished");
             Ok(())
         } else {
