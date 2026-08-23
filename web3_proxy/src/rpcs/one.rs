@@ -718,12 +718,15 @@ impl Web3Rpc {
             // TODO: how often? different depending on the chain?
             // TODO: reset this timeout when a new block is seen? we need to keep median_request_latency updated though
             let health_sleep_seconds = 10;
+            let block_data_limit_refresh_interval = Duration::from_secs(60);
 
             // health check loop
             let f = async move {
                 // // TODO: benchmark this and lock contention
                 // let mut old_total_requests = 0;
                 // let mut new_total_requests;
+                let mut block_data_limit_refresh_at =
+                    Instant::now() + block_data_limit_refresh_interval;
 
                 // errors here should not cause the loop to exit! only mark unhealthy
                 loop {
@@ -751,6 +754,18 @@ impl Web3Rpc {
                         }
                     } else {
                         rpc.healthy.store(true, atomic::Ordering::SeqCst);
+                    }
+
+                    if rpc.automatic_block_limit
+                        && rpc.block_data_limit.load(atomic::Ordering::SeqCst) == 0
+                        && Instant::now() >= block_data_limit_refresh_at
+                    {
+                        if let Err(err) = rpc.check_block_data_limit().await {
+                            warn!(?err, "unable to refresh block data limit on {}", rpc);
+                        }
+
+                        block_data_limit_refresh_at =
+                            Instant::now() + block_data_limit_refresh_interval;
                     }
 
                     // TODO: should we count the requests done inside this health check
