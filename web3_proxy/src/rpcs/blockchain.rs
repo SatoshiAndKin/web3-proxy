@@ -127,10 +127,10 @@ impl Display for BlockHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} ({}, {}s old)",
+            "{} ({}, {}ms old)",
             self.number(),
             self.hash(),
-            self.age().as_secs()
+            self.age().as_millis()
         )
     }
 }
