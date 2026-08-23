@@ -13,7 +13,7 @@ use web3_proxy::prelude::futures::StreamExt;
 use web3_proxy::prelude::tokio;
 use web3_proxy::prelude::tokio::process::Command;
 use web3_proxy::prelude::tokio::signal::unix::SignalKind;
-use web3_proxy::prelude::tokio::sync::broadcast;
+use web3_proxy::prelude::tokio::sync::{broadcast, watch};
 use web3_proxy::prelude::tokio::time::{sleep_until, Instant};
 use web3_proxy::prelude::tokio::{select, signal};
 
@@ -30,6 +30,7 @@ pub struct ProxydSubCommand {
 impl ProxydSubCommand {
     pub async fn main(self, top_config: TopConfig, top_config_path: PathBuf) -> anyhow::Result<()> {
         let (frontend_shutdown_sender, _) = broadcast::channel(1);
+        let (watch_consensus_head_sender, _) = watch::channel(None);
         // TODO: i think there is a small race. if config_path changes
 
         let frontend_port = Arc::new(self.port.into());
@@ -38,6 +39,7 @@ impl ProxydSubCommand {
             Some(top_config_path),
             frontend_port,
             frontend_shutdown_sender,
+            watch_consensus_head_sender,
         )
         .await
     }
@@ -48,6 +50,9 @@ impl ProxydSubCommand {
         top_config_path: Option<PathBuf>,
         frontend_port: Arc<AtomicU16>,
         frontend_shutdown_sender: broadcast::Sender<()>,
+        watch_consensus_head_sender: watch::Sender<
+            Option<web3_proxy::rpcs::blockchain::BlockHeader>,
+        >,
     ) -> anyhow::Result<()> {
         let mut terminate_stream = signal::unix::signal(SignalKind::terminate())?;
 
@@ -67,6 +72,7 @@ impl ProxydSubCommand {
             frontend_port,
             top_config.clone(),
             app_shutdown_sender.clone(),
+            watch_consensus_head_sender,
         )
         .await?;
 

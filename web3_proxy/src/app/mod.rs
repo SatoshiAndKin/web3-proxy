@@ -95,6 +95,7 @@ impl App {
         frontend_port: Arc<AtomicU16>,
         mut top_config: TopConfig,
         shutdown_sender: broadcast::Sender<()>,
+        watch_consensus_head_sender: watch::Sender<Option<BlockHeader>>,
     ) -> anyhow::Result<Web3ProxyAppSpawn> {
         let mut config_watcher_shutdown_receiver = shutdown_sender.subscribe();
         let mut background_shutdown_receiver = shutdown_sender.subscribe();
@@ -125,7 +126,7 @@ impl App {
                 .build()?,
         );
 
-        let (watch_consensus_head_sender, watch_consensus_head_receiver) = watch::channel(None);
+        let watch_consensus_head_receiver = watch_consensus_head_sender.subscribe();
 
         let chain_id = top_config.app.chain_id;
 

@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
-use std::{fmt::Debug, time::Duration};
-use tracing::{info, warn};
+use std::fmt::Debug;
+use tracing::info;
 use web3_proxy::prelude::alloy::consensus::{SignableTransaction, TxEip1559};
 use web3_proxy::prelude::alloy::eips::Encodable2718;
 use web3_proxy::prelude::alloy::network::TxSignerSync;
@@ -9,7 +9,7 @@ use web3_proxy::prelude::alloy::providers::{Provider, RootProvider};
 use web3_proxy::prelude::alloy::rpc::types::{Block, Log, Transaction};
 use web3_proxy::prelude::reqwest::{self, header, StatusCode};
 use web3_proxy::prelude::serde::{de::DeserializeOwned, Serialize};
-use web3_proxy::prelude::tokio::{self, task::yield_now, time::sleep};
+use web3_proxy::prelude::tokio;
 use web3_proxy::rpcs::blockchain::ArcBlock;
 use web3_proxy_cli::test_utils::{TestAnvil, TestApp};
 
@@ -123,32 +123,12 @@ async fn it_starts_and_stops() {
 
     assert_eq!(first_block_num, second_block_num - 1);
 
-    let mut proxy_result = None;
+    x.wait_for_block(second_block_num).await;
 
-    for _ in 0..10 {
-        // TODO: we currently give a 502 here when we should give a `None`
-        match proxy_provider
-            .raw_request::<_, Option<ArcBlock>>("eth_getBlockByNumber".into(), ("latest", false))
-            .await
-        {
-            Ok(x) => {
-                proxy_result = x;
-
-                if let Some(ref proxy_result) = proxy_result {
-                    if proxy_result.number() == second_block_num {
-                        break;
-                    }
-                }
-
-                warn!(?proxy_result, ?second_block_num);
-
-                sleep(Duration::from_millis(100)).await;
-            }
-            Err(err) => {
-                panic!("{:?}", err);
-            }
-        }
-    }
+    let proxy_result = proxy_provider
+        .raw_request::<_, Option<ArcBlock>>("eth_getBlockByNumber".into(), ("latest", false))
+        .await
+        .unwrap();
 
     assert_eq!(Some(anvil_result), proxy_result);
 
@@ -258,8 +238,6 @@ async fn it_matches_anvil() {
         .unwrap();
     info!(%fund_tx_hash);
 
-    yield_now().await;
-
     // deploy singleton deployer
     // Send through the proxy so it can fan the transaction out to its configured providers.
     let deploy_tx: B256 = proxy_provider.raw_request("eth_sendRawTransaction".into(), ["0xf9016c8085174876e8008303c4d88080b90154608060405234801561001057600080fd5b50610134806100206000396000f3fe6080604052348015600f57600080fd5b506004361060285760003560e01c80634af63f0214602d575b600080fd5b60cf60048036036040811015604157600080fd5b810190602081018135640100000000811115605b57600080fd5b820183602082011115606c57600080fd5b80359060200191846001830284011164010000000083111715608d57600080fd5b91908080601f016020809104026020016040519081016040528093929190818152602001838380828437600092019190915250929550509135925060eb915050565b604080516001600160a01b039092168252519081900360200190f35b6000818351602085016000f5939250505056fea26469706673582212206b44f8a82cb6b156bfcc3dc6aadd6df4eefd204bc928a4397fd15dacf6d5320564736f6c634300060200331b83247000822470"]).await.unwrap();
@@ -270,7 +248,11 @@ async fn it_matches_anvil() {
             .unwrap()
     );
 
-    yield_now().await;
+    let deployed_block_number: U64 = anvil_provider
+        .raw_request("eth_blockNumber".into(), ())
+        .await
+        .unwrap();
+    x.wait_for_block(deployed_block_number.to::<u64>()).await;
 
     let code: Bytes = request_both(
         anvil_provider,
@@ -290,8 +272,6 @@ async fn it_matches_anvil() {
     .await
     .unwrap();
     info!(?deploy_tx);
-
-    sleep(Duration::from_secs(1)).await;
 
     let head_block_num: U64 =
         request_both(anvil_provider, proxy_provider, "eth_blockNumber", json!([])).await;

@@ -11,9 +11,11 @@ use web3_proxy::prelude::sonic_rs::{self, json};
 use web3_proxy::prelude::tokio::{
     runtime::Builder,
     sync::broadcast::{self, error::SendError},
-    time::{sleep, Instant},
+    sync::watch,
+    time::{sleep, timeout_at, Instant},
 };
 use web3_proxy::prelude::url::Url;
+use web3_proxy::rpcs::blockchain::BlockHeader;
 use web3_proxy::rpcs::provider::AlloyHttpProvider;
 use web3_proxy::test_utils::TestAnvil;
 
@@ -21,6 +23,7 @@ pub struct TestApp {
     pub proxy_handle: Option<thread::JoinHandle<anyhow::Result<()>>>,
     pub proxy_provider: AlloyHttpProvider,
     pub proxy_url: Url,
+    head_block_receiver: watch::Receiver<Option<BlockHeader>>,
     shutdown_sender: broadcast::Sender<()>,
 }
 
@@ -56,6 +59,7 @@ impl TestApp {
         };
 
         let (shutdown_sender, _) = broadcast::channel(1);
+        let (watch_consensus_head_sender, head_block_receiver) = watch::channel(None);
         let frontend_port = Arc::new(AtomicU16::new(0));
 
         let proxy_handle = {
@@ -72,6 +76,7 @@ impl TestApp {
                         None,
                         frontend_port,
                         shutdown_sender,
+                        watch_consensus_head_sender,
                     ))
             })
         };
@@ -95,7 +100,34 @@ impl TestApp {
             proxy_handle: Some(proxy_handle),
             proxy_provider,
             proxy_url,
+            head_block_receiver,
             shutdown_sender,
+        }
+    }
+
+    pub async fn wait_for_block(&self, target: u64) {
+        let mut head_block_receiver = self.head_block_receiver.clone();
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        loop {
+            let last_observed = head_block_receiver
+                .borrow_and_update()
+                .as_ref()
+                .map(|block| block.number().to::<u64>());
+
+            if last_observed.is_some_and(|block| block >= target) {
+                return;
+            }
+
+            match timeout_at(deadline, head_block_receiver.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => panic!(
+                    "consensus head channel closed while waiting for block {target}; last observed block: {last_observed:?}"
+                ),
+                Err(_) => panic!(
+                    "timed out while waiting for consensus head block {target}; last observed block: {last_observed:?}"
+                ),
+            }
         }
     }
 
