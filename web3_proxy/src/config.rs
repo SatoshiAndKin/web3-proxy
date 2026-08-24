@@ -1,7 +1,7 @@
 use crate::app::Web3ProxyJoinHandle;
 use crate::rpcs::blockchain::{
     BlockHydrationCoordinator, BlockResponseCache, BlocksByHashCache, BlocksByNumberCache,
-    HeadObservation,
+    HeadObservationPublisher,
 };
 use crate::rpcs::one::Web3Rpc;
 use alloy::primitives::{TxHash, U256, U64};
@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tracing::warn;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -296,7 +295,7 @@ impl Web3RpcConfig {
         blocks_by_hash_cache: BlocksByHashCache,
         blocks_by_number_cache: BlocksByNumberCache,
         block_response_cache: BlockResponseCache,
-        head_observation_sender: Option<mpsc::UnboundedSender<HeadObservation>>,
+        head_observation_publisher: Option<HeadObservationPublisher>,
         block_hydration: Option<Arc<BlockHydrationCoordinator>>,
         pending_txid_firehouse: Option<Arc<DedupedBroadcaster<TxHash>>>,
         max_head_block_age: Duration,
@@ -315,7 +314,7 @@ impl Web3RpcConfig {
             blocks_by_hash_cache,
             blocks_by_number_cache,
             block_response_cache,
-            head_observation_sender,
+            head_observation_publisher,
             block_hydration,
             pending_txid_firehouse,
             max_head_block_age,

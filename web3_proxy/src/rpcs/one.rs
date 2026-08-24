@@ -1,7 +1,7 @@
 //! Rate-limited communication with a web3 provider.
 use super::blockchain::{
     ArcHeader, BlockHeader, BlockHydrationCoordinator, BlockResponseCache, BlockResponseCacheKey,
-    BlocksByHashCache, BlocksByNumberCache, CachedBlockResponse, HeadObservation,
+    BlocksByHashCache, BlocksByNumberCache, CachedBlockResponse, HeadObservationPublisher,
 };
 use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::{cmp::Ordering, sync::Arc};
 use tokio::select;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
@@ -80,7 +80,7 @@ pub struct Web3Rpc {
     /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
     pub backup: bool,
     /// if subscribed to new heads, blocks are sent through this channel to update a parent Web3Rpcs
-    pub(super) head_observation_sender: Option<mpsc::UnboundedSender<HeadObservation>>,
+    pub(super) head_observation_publisher: Option<HeadObservationPublisher>,
     pub(super) block_hydration: Option<Arc<BlockHydrationCoordinator>>,
     /// TODO: have an enum for this so that "no limit" prints pretty?
     pub(super) block_data_limit: AtomicU64,
@@ -124,7 +124,7 @@ impl Web3Rpc {
         block_map: BlocksByHashCache,
         block_number_map: BlocksByNumberCache,
         block_response_cache: BlockResponseCache,
-        head_observation_sender: Option<mpsc::UnboundedSender<HeadObservation>>,
+        head_observation_publisher: Option<HeadObservationPublisher>,
         block_hydration: Option<Arc<BlockHydrationCoordinator>>,
         pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
         max_head_block_age: Duration,
@@ -135,7 +135,7 @@ impl Web3Rpc {
 
         let block_data_limit: AtomicU64 = config.block_data_limit.into();
         let automatic_block_limit = (block_data_limit.load(atomic::Ordering::SeqCst) == 0)
-            && head_observation_sender.is_some();
+            && head_observation_publisher.is_some();
 
         // have a sender for tracking hard limit anywhere. we use this in case we
         // and track on servers that have a configured hard limit
@@ -214,7 +214,7 @@ impl Web3Rpc {
             median_latency: Some(median_request_latency),
             soft_limit: config.soft_limit,
             pending_txid_firehose,
-            head_observation_sender,
+            head_observation_publisher,
             block_hydration,
             ws_url,
             disconnect_watch: Some(disconnect_watch),
@@ -553,7 +553,6 @@ impl Web3Rpc {
         self: &Arc<Self>,
         new_head_block: Web3ProxyResult<Option<ArcHeader>>,
     ) -> Web3ProxyResult<()> {
-        let observed_at = Instant::now();
         let head_block_sender = self
             .head_block_sender
             .as_ref()
@@ -583,14 +582,10 @@ impl Web3Rpc {
                     Some(new_head_block) => {
                         let new_hash = *new_head_block.hash();
 
-                        if let Some(head_observation_sender) = &self.head_observation_sender {
-                            head_observation_sender
-                                .send(HeadObservation {
-                                    block: Some(new_head_block.clone()),
-                                    rpc: self.clone(),
-                                    observed_at,
-                                })
-                                .context("head_observation_sender failed sending")?;
+                        if let Some(head_observation_publisher) = &self.head_observation_publisher {
+                            head_observation_publisher
+                                .publish(Some(new_head_block.clone()), self.clone())
+                                .context("head observation publisher failed sending")?;
                             observation_sent = true;
                         }
 
@@ -628,16 +623,12 @@ impl Web3Rpc {
             return Ok(());
         }
 
-        if let Some(head_observation_sender) = &self.head_observation_sender {
+        if let Some(head_observation_publisher) = &self.head_observation_publisher {
             // tell web3rpcs about this rpc having this block
             // web3rpcs will do `self.head_block_sender.send_replace(new_head_block)`
-            head_observation_sender
-                .send(HeadObservation {
-                    block: new_head_block.clone(),
-                    rpc: self.clone(),
-                    observed_at,
-                })
-                .context("head_observation_sender failed sending")?;
+            head_observation_publisher
+                .publish(new_head_block.clone(), self.clone())
+                .context("head observation publisher failed sending")?;
         } else {
             head_block_sender.send_replace(new_head_block.clone());
         }
@@ -830,7 +821,7 @@ impl Web3Rpc {
         let mut abort_handles = vec![];
 
         // health check that runs if there haven't been any recent requests
-        let health_handle = if self.head_observation_sender.is_some() {
+        let health_handle = if self.head_observation_publisher.is_some() {
             // TODO: move this into a proper function
             let rpc = self.clone();
 
@@ -958,7 +949,7 @@ impl Web3Rpc {
         futures.push(health_handle);
 
         // subscribe to new heads
-        if self.head_observation_sender.is_some() {
+        if self.head_observation_publisher.is_some() {
             let clone = self.clone();
 
             let f = async move { clone.subscribe_new_heads().await };
@@ -1182,7 +1173,7 @@ impl Web3Rpc {
                 return Ok(OpenRequestResult::Failed);
             }
 
-            if self.head_observation_sender.is_some() {
+            if self.head_observation_publisher.is_some() {
                 // make sure this rpc has the oldest block that this request needs
                 if let Some(block_needed) = web3_request.min_block_needed() {
                     if !self.has_block_data(block_needed) {
@@ -1499,7 +1490,7 @@ mod tests {
     use futures::SinkExt;
     use std::sync::Mutex;
     use tokio::net::TcpListener;
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::{mpsc, Notify, Semaphore};
 
     #[derive(Clone)]
     struct WebSocketStubState {
@@ -1893,6 +1884,7 @@ mod tests {
         let (head_block_sender, _) = watch::channel(None);
         let (disconnect_watch, _) = watch::channel(false);
         let (head_observation_sender, mut head_observation_receiver) = mpsc::unbounded_channel();
+        let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
         let block_response_cache = moka::future::Cache::new(16);
         let block_hydration = BlockHydrationCoordinator::new(block_response_cache.clone());
         let rpc = Arc::new(Web3Rpc {
@@ -1902,7 +1894,7 @@ mod tests {
             block_response_cache: Some(block_response_cache.clone()),
             created_at: Some(Instant::now()),
             hard_limit_until: Some(hard_limit_until),
-            head_observation_sender: Some(head_observation_sender),
+            head_observation_publisher: Some(head_observation_publisher),
             block_hydration: Some(block_hydration),
             head_block_sender: Some(head_block_sender),
             peak_latency: Some(PeakEwmaLatency::spawn(

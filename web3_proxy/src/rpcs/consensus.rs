@@ -663,13 +663,10 @@ impl ConsensusFinder {
         observed_at: Instant,
     ) -> Option<BlockHeader> {
         let block_hash = *block.hash();
-        let first_seen = match self.first_seen.get(&block_hash).await {
-            Some(first_seen) if first_seen <= observed_at => first_seen,
-            Some(_) | None => {
-                self.first_seen.insert(block_hash, observed_at).await;
-                observed_at
-            }
-        };
+        let first_seen = self
+            .first_seen
+            .get_with(block_hash, async { observed_at })
+            .await;
 
         let sample_key = (block_hash, rpc.name.clone());
         if self.sampled_heads.get(&sample_key).await.is_none() {
@@ -1153,7 +1150,9 @@ impl std::fmt::Display for MaybeBlockNum<'_> {
 #[cfg(test)]
 mod tests {
     use super::{ConsensusFinder, ConsensusUpdateSource, RankedRpcs};
-    use crate::rpcs::blockchain::{BlockHeader, BlockHydrationCoordinator, BlocksByHashCache};
+    use crate::rpcs::blockchain::{
+        BlockHeader, BlockHydrationCoordinator, BlocksByHashCache, HeadObservationPublisher,
+    };
     use crate::rpcs::many::Web3Rpcs;
     use crate::rpcs::one::Web3Rpc;
     use alloy::primitives::{B256, U64};
@@ -1244,6 +1243,7 @@ mod tests {
 
     fn web3_rpcs(blocks_by_hash: BlocksByHashCache, min_synced_rpcs: usize) -> Web3Rpcs {
         let (head_observation_sender, _) = mpsc::unbounded_channel();
+        let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
         let (watch_ranked_rpcs, _) = watch::channel(None);
         let block_responses = Cache::new(16);
         let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
@@ -1251,7 +1251,7 @@ mod tests {
         Web3Rpcs {
             name: "test".into(),
             chain_id: 1,
-            head_observation_sender,
+            head_observation_publisher,
             by_name: RwLock::new(HashMap::new()),
             watch_ranked_rpcs,
             watch_head_block: None,

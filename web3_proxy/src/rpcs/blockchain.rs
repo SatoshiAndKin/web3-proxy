@@ -9,6 +9,7 @@ use alloy::primitives::{B256, U64};
 use alloy::rpc::types::{Block, Header};
 use hashbrown::HashMap;
 use moka::future::{Cache, CacheBuilder};
+use parking_lot::Mutex as SyncMutex;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
 use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, OwnedLazyValue};
@@ -35,6 +36,40 @@ pub struct HeadObservation {
     pub block: Option<BlockHeader>,
     pub rpc: Arc<Web3Rpc>,
     pub observed_at: Instant,
+}
+
+#[derive(Clone)]
+pub struct HeadObservationPublisher {
+    inner: Arc<HeadObservationPublisherInner>,
+}
+
+struct HeadObservationPublisherInner {
+    sender: mpsc::UnboundedSender<HeadObservation>,
+    publish_lock: SyncMutex<()>,
+}
+
+impl HeadObservationPublisher {
+    pub fn new(sender: mpsc::UnboundedSender<HeadObservation>) -> Self {
+        Self {
+            inner: Arc::new(HeadObservationPublisherInner {
+                sender,
+                publish_lock: SyncMutex::new(()),
+            }),
+        }
+    }
+
+    pub fn publish(
+        &self,
+        block: Option<BlockHeader>,
+        rpc: Arc<Web3Rpc>,
+    ) -> Result<(), mpsc::error::SendError<HeadObservation>> {
+        let _publish_guard = self.inner.publish_lock.lock();
+        self.inner.sender.send(HeadObservation {
+            block,
+            rpc,
+            observed_at: Instant::now(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -66,9 +101,26 @@ impl BlockHydrationCoordinator {
             return;
         }
 
+        self.register_attempt(rpc, block_hash).await;
+    }
+
+    async fn register_attempt(self: &Arc<Self>, rpc: Arc<Web3Rpc>, block_hash: B256) {
         let rpc_name = rpc.name.clone();
         let mut races = self.races.lock().await;
-        let race = races.entry(block_hash).or_default();
+        let race = match races.entry(block_hash) {
+            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                if self
+                    .block_responses
+                    .get(&BlockResponseCacheKey::new(block_hash, true))
+                    .await
+                    .is_some()
+                {
+                    return;
+                }
+                entry.insert(HydrationRace::default())
+            }
+        };
         if race.winner.is_some() || race.attempts.contains_key(&rpc_name) {
             return;
         }
@@ -616,7 +668,7 @@ mod tests {
     use hashbrown::HashMap;
     use parking_lot::RwLock;
     use sonic_rs::JsonValueTrait;
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{mpsc, watch, Barrier};
     use tokio::time::Duration;
 
     fn block_header(timestamp: u64) -> BlockHeader {
@@ -637,6 +689,7 @@ mod tests {
 
     fn web3_rpcs(block_cache_max_bytes: u64) -> Web3Rpcs {
         let (head_observation_sender, _) = mpsc::unbounded_channel();
+        let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
         let (watch_ranked_rpcs, _) = watch::channel(None);
         let block_responses = new_block_response_cache(block_cache_max_bytes);
         let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
@@ -644,7 +697,7 @@ mod tests {
         Web3Rpcs {
             name: "block-cache-test".into(),
             chain_id: 1,
-            head_observation_sender,
+            head_observation_publisher,
             by_name: RwLock::new(HashMap::new()),
             watch_ranked_rpcs,
             watch_head_block: None,
@@ -658,6 +711,90 @@ mod tests {
             max_head_block_age: Duration::from_secs(60),
             pending_txid_firehose: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_head_publications_preserve_observation_order() {
+        const PUBLICATION_COUNT: usize = 128;
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let publisher = HeadObservationPublisher::new(sender);
+        let rpc = Arc::new(Web3Rpc::default());
+        let start = Arc::new(Barrier::new(PUBLICATION_COUNT + 1));
+        let mut publications = Vec::with_capacity(PUBLICATION_COUNT);
+
+        for _ in 0..PUBLICATION_COUNT {
+            let publisher = publisher.clone();
+            let rpc = rpc.clone();
+            let start = start.clone();
+            publications.push(tokio::spawn(async move {
+                start.wait().await;
+                publisher.publish(None, rpc).unwrap();
+            }));
+        }
+
+        start.wait().await;
+        let mut previous = None;
+        for _ in 0..PUBLICATION_COUNT {
+            let observation = receiver.recv().await.unwrap();
+            if let Some(previous) = previous {
+                assert!(observation.observed_at >= previous);
+            }
+            previous = Some(observation.observed_at);
+        }
+
+        for publication in publications {
+            publication.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_fill_during_announcement_gap_prevents_hydration_request() {
+        let block_hash = B256::with_last_byte(0x42);
+        let block_responses = Cache::new(16);
+        let coordinator = BlockHydrationCoordinator::new(block_responses.clone());
+        let rpc = Arc::new(Web3Rpc {
+            name: "cached".into(),
+            ..Default::default()
+        });
+
+        assert!(block_responses
+            .get(&BlockResponseCacheKey::new(block_hash, true))
+            .await
+            .is_none());
+
+        let registration_guard = coordinator.races.lock().await;
+        let registration = {
+            let coordinator = coordinator.clone();
+            let rpc = rpc.clone();
+            tokio::spawn(async move {
+                coordinator.register_attempt(rpc, block_hash).await;
+            })
+        };
+
+        let block = serde_json::json!({
+            "hash": block_hash,
+            "number": "0x2a",
+            "transactions": [{"hash": B256::with_last_byte(0x11)}],
+            "uncles": [],
+        });
+        let (full, hashes) = CachedBlockResponse::from_full(raw_block(block), block_hash).unwrap();
+        block_responses
+            .insert(BlockResponseCacheKey::new(block_hash, true), full)
+            .await;
+        block_responses
+            .insert(BlockResponseCacheKey::new(block_hash, false), hashes)
+            .await;
+
+        drop(registration_guard);
+        registration.await.unwrap();
+
+        assert!(coordinator.races.lock().await.is_empty());
+        assert_eq!(
+            rpc.total_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     fn raw_block(value: serde_json::Value) -> Arc<OwnedLazyValue> {

@@ -1,7 +1,7 @@
 //! Load balanced communication with a group of web3 rpc providers
 use super::blockchain::{
     new_block_response_cache, BlockHeader, BlockHydrationCoordinator, BlockResponseCache,
-    BlocksByHashCache, BlocksByNumberCache, HeadObservation,
+    BlocksByHashCache, BlocksByNumberCache, HeadObservation, HeadObservationPublisher,
 };
 use super::consensus::{RankedRpcs, RpcsForRequest};
 use super::one::Web3Rpc;
@@ -37,7 +37,7 @@ pub struct Web3Rpcs {
     pub(crate) name: Cow<'static, str>,
     pub(crate) chain_id: u64,
     /// if watch_head_block is some, Web3Rpc inside self will send blocks here when they get them
-    pub(crate) head_observation_sender: mpsc::UnboundedSender<HeadObservation>,
+    pub(crate) head_observation_publisher: HeadObservationPublisher,
     /// any requests will be forwarded to one (or more) of these connections
     /// TODO: hopefully this not being an async lock will be okay. if you need it across awaits, clone the arc
     pub(crate) by_name: RwLock<HashMap<String, Arc<Web3Rpc>>>,
@@ -138,6 +138,7 @@ impl Web3Rpcs {
     )> {
         let (head_observation_sender, head_observation_receiver) =
             mpsc::unbounded_channel::<HeadObservation>();
+        let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
 
         // TODO: use an actual weighter for block headers
         // TODO: time_to_idle instead?
@@ -175,7 +176,7 @@ impl Web3Rpcs {
             block_interval.mul_f32((max_head_block_lag.to::<u64>() * 10) as f32);
 
         let connections = Arc::new(Self {
-            head_observation_sender,
+            head_observation_publisher,
             block_hydration,
             blocks_by_hash,
             blocks_by_number,
@@ -253,8 +254,8 @@ impl Web3Rpcs {
                 }
 
                 let http_client = app.http_client.clone();
-                let head_observation_sender = if self.watch_head_block.is_some() {
-                    Some(self.head_observation_sender.clone())
+                let head_observation_publisher = if self.watch_head_block.is_some() {
+                    Some(self.head_observation_publisher.clone())
                 } else {
                     None
                 };
@@ -275,7 +276,7 @@ impl Web3Rpcs {
                     blocks_by_hash_cache,
                     blocks_by_number_cache,
                     block_response_cache,
-                    head_observation_sender,
+                    head_observation_publisher,
                     Some(self.block_hydration.clone()),
                     self.pending_txid_firehose.clone(),
                     self.max_head_block_age,
