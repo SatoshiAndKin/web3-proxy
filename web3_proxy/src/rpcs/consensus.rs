@@ -446,30 +446,23 @@ impl ConsensusFinder {
 
         let backups_voted_str = if backups_needed { "B " } else { "" };
 
-        let rpc_head_str = if let Some(rpc) = rpc.as_ref() {
-            format!(
-                "{}@{}",
-                rpc,
-                new_block
-                    .map(|x| x.to_string())
-                    .unwrap_or_else(|| "None".to_string()),
-            )
-        } else {
-            "None".to_string()
+        let update_source = ConsensusUpdateSource {
+            consensus_block: &consensus_head_block,
+            rpc: rpc.map(Arc::as_ref),
+            rpc_block: &new_block,
         };
 
         match old_ranked_rpcs.as_ref() {
             None => {
                 info!(
-                    "first {}/{} {}{}/{}/{} block={}, rpc={}",
+                    "first {}/{} {}{}/{}/{} {}",
                     best_tier,
                     worst_tier,
                     backups_voted_str,
                     num_consensus_rpcs,
                     num_active_rpcs,
                     total_rpcs,
-                    MaybeBlock(&consensus_head_block),
-                    rpc_head_str,
+                    update_source,
                 );
 
                 if backups_needed {
@@ -512,30 +505,28 @@ impl ConsensusFinder {
                             // no change in hash. no need to use watch_consensus_head_sender
                             // TODO: trace level if rpc is backup
                             debug!(
-                                "con {}/{} {}{}/{}/{} con={} rpc={}",
+                                "con {}/{} {}{}/{}/{} {}",
                                 best_tier,
                                 worst_tier,
                                 backups_voted_str,
                                 num_consensus_rpcs,
                                 num_active_rpcs,
                                 total_rpcs,
-                                MaybeBlock(&consensus_head_block),
-                                rpc_head_str,
+                                update_source,
                             )
                         } else {
                             // hash changed
 
                             debug!(
-                                "unc {}/{} {}{}/{}/{} con={} old={} rpc={}",
+                                "unc {}/{} {}{}/{}/{} old={} {}",
                                 best_tier,
                                 worst_tier,
                                 backups_voted_str,
                                 num_consensus_rpcs,
                                 num_active_rpcs,
                                 total_rpcs,
-                                MaybeBlock(&consensus_head_block),
                                 MaybeBlock(old_head_block),
-                                rpc_head_str,
+                                update_source,
                             );
 
                             let consensus_head_block = if let Some(consensus_head_block) =
@@ -561,16 +552,15 @@ impl ConsensusFinder {
                         // this is unlikely but possible
                         // TODO: better log that includes all the votes
                         warn!(
-                            "chain rolled back {}/{} {}{}/{}/{} con={} old={} rpc={}",
+                            "chain rolled back {}/{} {}{}/{}/{} old={} {}",
                             best_tier,
                             worst_tier,
                             backups_voted_str,
                             num_consensus_rpcs,
                             num_active_rpcs,
                             total_rpcs,
-                            MaybeBlock(&consensus_head_block),
                             MaybeBlock(old_head_block),
-                            rpc_head_str,
+                            update_source,
                         );
 
                         if backups_needed {
@@ -600,15 +590,14 @@ impl ConsensusFinder {
                     }
                     Ordering::Greater => {
                         info!(
-                            "new {}/{} {}{}/{}/{} con={} rpc={}",
+                            "new {}/{} {}{}/{}/{} {}",
                             best_tier,
                             worst_tier,
                             backups_voted_str,
                             num_consensus_rpcs,
                             num_active_rpcs,
                             total_rpcs,
-                            MaybeBlock(&consensus_head_block),
-                            rpc_head_str,
+                            update_source,
                         );
 
                         if backups_needed {
@@ -1126,6 +1115,30 @@ impl std::fmt::Display for MaybeBlock<'_> {
     }
 }
 
+struct ConsensusUpdateSource<'a> {
+    consensus_block: &'a Option<BlockHeader>,
+    rpc: Option<&'a Web3Rpc>,
+    rpc_block: &'a Option<BlockHeader>,
+}
+
+impl std::fmt::Display for ConsensusUpdateSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.rpc {
+            Some(rpc) if self.consensus_block == self.rpc_block => {
+                write!(f, "rpc={}@{}", rpc, MaybeBlock(self.rpc_block))
+            }
+            Some(rpc) => write!(
+                f,
+                "heads_differ con={} rpc={}@{}",
+                MaybeBlock(self.consensus_block),
+                rpc,
+                MaybeBlock(self.rpc_block),
+            ),
+            None => write!(f, "con={} rpc=None", MaybeBlock(self.consensus_block),),
+        }
+    }
+}
+
 struct MaybeBlockNum<'a>(pub &'a Option<U64>);
 
 impl std::fmt::Display for MaybeBlockNum<'_> {
@@ -1139,7 +1152,7 @@ impl std::fmt::Display for MaybeBlockNum<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusFinder, RankedRpcs};
+    use super::{ConsensusFinder, ConsensusUpdateSource, RankedRpcs};
     use crate::rpcs::blockchain::{BlockHeader, BlockHydrationCoordinator, BlocksByHashCache};
     use crate::rpcs::many::Web3Rpcs;
     use crate::rpcs::one::Web3Rpc;
@@ -1183,6 +1196,50 @@ mod tests {
         header.inner.number = number;
         header.inner.parent_hash = parent_hash;
         BlockHeader::new(Arc::new(header))
+    }
+
+    #[test]
+    fn consensus_update_source_prints_matching_block_once_with_rpc() {
+        let hash = B256::repeat_byte(0x11);
+        let consensus_block = Some(block(10, hash, B256::ZERO));
+        let rpc_block = consensus_block.clone();
+        let rpc = Web3Rpc {
+            name: "test-rpc".into(),
+            ..Default::default()
+        };
+
+        let output = ConsensusUpdateSource {
+            consensus_block: &consensus_block,
+            rpc: Some(&rpc),
+            rpc_block: &rpc_block,
+        }
+        .to_string();
+
+        assert!(output.starts_with(&format!("rpc=test-rpc@10 ({hash}, ")));
+        assert!(!output.contains("con="));
+        assert_eq!(output.matches(&hash.to_string()).count(), 1);
+    }
+
+    #[test]
+    fn consensus_update_source_marks_different_blocks_and_prints_both_hashes() {
+        let consensus_hash = B256::repeat_byte(0x11);
+        let rpc_hash = B256::repeat_byte(0x22);
+        let consensus_block = Some(block(10, consensus_hash, B256::ZERO));
+        let rpc_block = Some(block(11, rpc_hash, consensus_hash));
+        let rpc = Web3Rpc {
+            name: "test-rpc".into(),
+            ..Default::default()
+        };
+
+        let output = ConsensusUpdateSource {
+            consensus_block: &consensus_block,
+            rpc: Some(&rpc),
+            rpc_block: &rpc_block,
+        }
+        .to_string();
+
+        assert!(output.starts_with(&format!("heads_differ con=10 ({consensus_hash}, ")));
+        assert!(output.contains(&format!("rpc=test-rpc@11 ({rpc_hash}, ")));
     }
 
     fn web3_rpcs(blocks_by_hash: BlocksByHashCache, min_synced_rpcs: usize) -> Web3Rpcs {
