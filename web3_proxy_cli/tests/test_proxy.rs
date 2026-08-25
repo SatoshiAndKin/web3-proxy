@@ -5,11 +5,13 @@ use web3_proxy::prelude::alloy::consensus::{SignableTransaction, TxEip1559};
 use web3_proxy::prelude::alloy::eips::Encodable2718;
 use web3_proxy::prelude::alloy::network::TxSignerSync;
 use web3_proxy::prelude::alloy::primitives::{Address, Bytes, TxKind, B256, U256, U64};
-use web3_proxy::prelude::alloy::providers::{Provider, RootProvider};
+use web3_proxy::prelude::alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use web3_proxy::prelude::alloy::rpc::types::{Block, Log, Transaction};
+use web3_proxy::prelude::futures::StreamExt;
 use web3_proxy::prelude::reqwest::{self, header, StatusCode};
 use web3_proxy::prelude::serde::{de::DeserializeOwned, Serialize};
 use web3_proxy::prelude::tokio;
+use web3_proxy::prelude::tokio::time::{timeout, Duration};
 use web3_proxy::rpcs::blockchain::ArcBlock;
 use web3_proxy_cli::test_utils::{TestAnvil, TestApp};
 
@@ -136,6 +138,52 @@ async fn it_starts_and_stops() {
 
     // most tests won't need to wait, but we should wait here to be sure all the shutdown logic works properly
     x.wait_for_stop();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn websocket_new_heads_returns_subscription_and_delivers_block() {
+    let anvil = TestAnvil::spawn_chain(31337).await;
+    let _: Value = anvil
+        .provider
+        .raw_request("evm_mine".into(), ())
+        .await
+        .unwrap();
+    let proxy = TestApp::spawn(&anvil).await;
+
+    let mut websocket_url = proxy.proxy_url.clone();
+    websocket_url.set_scheme("ws").unwrap();
+    let provider: RootProvider = ProviderBuilder::default()
+        .connect_ws(WsConnect::new(websocket_url.as_str()))
+        .await
+        .unwrap();
+    let subscription = timeout(Duration::from_secs(5), provider.subscribe_blocks())
+        .await
+        .expect("proxy did not acknowledge the newHeads subscription")
+        .unwrap();
+    let mut blocks = subscription.into_stream();
+
+    let _: Value = anvil
+        .provider
+        .raw_request("evm_mine".into(), ())
+        .await
+        .unwrap();
+    let expected_block: U64 = anvil
+        .provider
+        .raw_request("eth_blockNumber".into(), ())
+        .await
+        .unwrap();
+    let header = timeout(Duration::from_secs(5), async {
+        loop {
+            let header = blocks.next().await.expect("subscription stream closed");
+            if header.number == expected_block.to::<u64>() {
+                return header;
+            }
+        }
+    })
+    .await
+    .expect("proxy did not deliver the mined block");
+
+    assert_eq!(header.number, expected_block.to::<u64>());
 }
 
 /// TODO: have another test that queries mainnet so the state is more interesting
