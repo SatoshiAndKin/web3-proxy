@@ -1061,6 +1061,7 @@ mod tests {
             .await;
         let head = head(42, block_hash);
 
+        // TODO: use actual typeds here instead of formatting raw strings
         let requests = [
             format!(
                 r#"{{"jsonrpc":"2.0","id":"hash-full","method":"eth_getBlockByHash","params":["{block_hash}",true]}}"#
