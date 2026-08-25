@@ -43,7 +43,8 @@ pub struct CliConfig {
 async fn main() -> anyhow::Result<()> {
     // if RUST_LOG isn't set, configure a default
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "wait_for_sync=debug");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RUST_LOG", "wait_for_sync=debug") };
     }
 
     // this probably won't matter for us in docker, but better safe than sorry

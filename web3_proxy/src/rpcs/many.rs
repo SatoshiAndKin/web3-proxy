@@ -392,9 +392,9 @@ impl Web3Rpcs {
     ) -> Web3ProxyResult<RpcsForRequest> {
         // TODO: by_name might include things that are on a forked
         let ranked_rpcs: Arc<RankedRpcs> =
-            if let Some(ranked_rpcs) = self.watch_ranked_rpcs.borrow().clone() {
+            match self.watch_ranked_rpcs.borrow().clone() { Some(ranked_rpcs) => {
                 ranked_rpcs
-            } else if self.watch_head_block.is_some() {
+            } _ => if self.watch_head_block.is_some() {
                 // if we are here, this set of rpcs is subscribed to newHeads. But we didn't get a RankedRpcs. that means something is wrong
                 return Err(Web3ProxyError::NoServersSynced);
             } else {
@@ -411,7 +411,7 @@ impl Web3Rpcs {
                 );
 
                 Arc::new(x)
-            };
+            }};
 
         match ranked_rpcs.for_request(web3_request) {
             None => Err(Web3ProxyError::NoServersSynced),

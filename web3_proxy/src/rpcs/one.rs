@@ -755,15 +755,15 @@ impl Web3Rpc {
     /// TODO: this needs to be a subscribe_with_reconnect that does a retry with jitter and exponential backoff
     async fn subscribe_with_reconnect(self: Arc<Self>) -> Web3ProxyResult<()> {
         loop {
-            if let Err(err) = self.clone().subscribe().await {
+            match self.clone().subscribe().await { Err(err) => {
                 if self.should_disconnect() {
                     break;
                 }
 
                 warn!(?err, "subscribe err on {}", self);
-            } else if self.should_disconnect() {
+            } _ => if self.should_disconnect() {
                 break;
-            }
+            }}
 
             // TODO: exponential backoff with jitter
             if self.backup {
@@ -895,7 +895,7 @@ impl Web3Rpc {
             };
 
             // TODO: log quick_check lik
-            let initial_check = if let Err(err) = self.check_health(false, error_handler).await {
+            let initial_check = match self.check_health(false, error_handler).await { Err(err) => {
                 if self.backup {
                     warn!(?err, "initial health check on {} failed", self);
                 } else {
@@ -903,9 +903,9 @@ impl Web3Rpc {
                 }
 
                 false
-            } else {
+            } _ => {
                 true
-            };
+            }};
 
             self.healthy
                 .store(self.health_status(initial_check), atomic::Ordering::SeqCst);
@@ -923,7 +923,7 @@ impl Web3Rpc {
                     }
 
                     // TODO: if this fails too many times, reset the connection
-                    if let Err(err) = rpc.check_provider().await {
+                    match rpc.check_provider().await { Err(err) => {
                         rpc.healthy.store(false, atomic::Ordering::SeqCst);
 
                         // TODO: if rate limit error, set "retry_at"
@@ -932,9 +932,9 @@ impl Web3Rpc {
                         } else {
                             error!(?err, "provider check on {} failed", rpc);
                         }
-                    } else {
+                    } _ => {
                         rpc.healthy.store(true, atomic::Ordering::SeqCst);
-                    }
+                    }}
 
                     sleep(Duration::from_secs(health_sleep_seconds)).await;
                 }

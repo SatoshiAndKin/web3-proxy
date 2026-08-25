@@ -225,7 +225,7 @@ impl App {
 
                     // TODO: compare new and old here? the sender should be doing that already but maybe its better here
 
-                    if let Err(err) = app.apply_top_config_rpcs(&new_top_config).await {
+                    match app.apply_top_config_rpcs(&new_top_config).await { Err(err) => {
                         error!(?err, "unable to apply config! Retrying in 10 seconds (or if the config changes)");
 
                         select! {
@@ -235,7 +235,7 @@ impl App {
                             _ = sleep(Duration::from_secs(10)) => {}
                             _ = new_top_config_receiver.changed() => {}
                         }
-                    } else {
+                    } _ => {
                         // configs applied successfully. wait for configs to change or for the app to exit
                         select! {
                             _ = config_watcher_shutdown_receiver.recv() => {
@@ -243,7 +243,7 @@ impl App {
                             }
                             _ = new_top_config_receiver.changed() => {}
                         }
-                    }
+                    }}
 
                     // TODO: add a min time between config changes
                     // TODO: is this yield actually helpful? i'm not so sure

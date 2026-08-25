@@ -518,13 +518,13 @@ impl Web3Rpcs {
 
     async fn reconcile_cached_uncles(&self, block_hash: B256) {
         let hashes_key = BlockResponseCacheKey::new(block_hash, false);
-        let block = if let Some(block) = self.block_responses.get(&hashes_key).await {
+        let block = match self.block_responses.get(&hashes_key).await { Some(block) => {
             Some(block)
-        } else {
+        } _ => {
             self.block_responses
                 .get(&BlockResponseCacheKey::new(block_hash, true))
                 .await
-        };
+        }};
 
         if let Some(block) = block {
             self.invalidate_uncle_headers_if_canonical(&block).await;

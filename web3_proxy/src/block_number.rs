@@ -96,7 +96,7 @@ pub async fn clean_block_number<'a>(
 
                 let (block, change) = if let Some(obj) = x.as_object_mut() {
                     // it might be a Map like `{"blockHash": String("0xa5626dc20d3a0a209b1de85521717a3e859698de8ce98bca1b16822b7501f74b")}`
-                    if let Some(block_hash) = obj.get(&"blockHash").cloned() {
+                    match obj.get(&"blockHash").cloned() { Some(block_hash) => {
                         let block_hash: B256 =
                             sonic_rs::from_value(&block_hash).context("decoding blockHash")?;
 
@@ -118,9 +118,9 @@ pub async fn clean_block_number<'a>(
                             )
                             .into());
                         }
-                    } else {
+                    } _ => {
                         return Err(anyhow::anyhow!("blockHash missing").into());
-                    }
+                    }}
                 } else {
                     // it might be a string like "latest" or a block number or a block hash
                     // TODO: "BlockNumber" needs a better name
