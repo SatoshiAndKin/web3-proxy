@@ -12,19 +12,26 @@ use futures::stream::StreamExt;
 use sonic_rs::{json, JsonValueTrait};
 use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::WatchStream;
 use tracing::{error, trace};
 
+pub(crate) struct PreparedSubscription {
+    pub(crate) id: U64,
+    pub(crate) abort_handle: AbortHandle,
+    pub(crate) response: jsonrpc::ParsedResponse,
+    pub(crate) start_sender: oneshot::Sender<()>,
+}
+
 impl App {
-    pub async fn eth_subscribe<'a>(
+    pub(crate) async fn eth_subscribe<'a>(
         self: &'a Arc<Self>,
         web3_request: Arc<ValidatedRequest>,
         subscription_count: &'a AtomicU64,
         // TODO: taking a sender for Message instead of the exact json we are planning to send feels wrong, but its easier for now
         response_sender: mpsc::Sender<Message>,
-    ) -> Web3ProxyResult<(AbortHandle, jsonrpc::ParsedResponse)> {
+    ) -> Web3ProxyResult<PreparedSubscription> {
         let subscribe_to = web3_request
             .inner
             .params()
@@ -35,6 +42,8 @@ impl App {
             })?;
 
         let (subscription_abort_handle, subscription_registration) = AbortHandle::new_pair();
+        // Keep notifications behind the JSON-RPC acknowledgement in the socket queue.
+        let (start_sender, start_receiver) = oneshot::channel();
 
         // TODO: this only needs to be unique per connection. we don't need it globably unique
         // TODO: have a max number of subscriptions per key/ip. have a global max number of subscriptions? how should this be calculated?
@@ -53,6 +62,10 @@ impl App {
                 let proxy_mode = web3_request.proxy_mode();
 
                 tokio::spawn(async move {
+                    if start_receiver.await.is_err() {
+                        return;
+                    }
+
                     trace!("newHeads subscription {:?}", subscription_id);
 
                     let mut head_block_receiver = Abortable::new(
@@ -127,6 +140,10 @@ impl App {
                 let proxy_mode = web3_request.proxy_mode();
 
                 tokio::spawn(async move {
+                    if start_receiver.await.is_err() {
+                        return;
+                    }
+
                     let mut pending_txid_firehose = Abortable::new(
                         BroadcastStream::new(pending_txid_firehose),
                         subscription_registration,
@@ -223,7 +240,11 @@ impl App {
         web3_request.set_response(&response);
         let response = response.parsed().await.expect("Response already parsed");
 
-        // TODO: make a `SubscriptonHandle(AbortHandle, JoinHandle)` struct?
-        Ok((subscription_abort_handle, response))
+        Ok(PreparedSubscription {
+            id: subscription_id,
+            abort_handle: subscription_abort_handle,
+            response,
+            start_sender,
+        })
     }
 }

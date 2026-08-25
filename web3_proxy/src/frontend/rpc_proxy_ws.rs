@@ -23,7 +23,7 @@ use std::str::from_utf8;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::select;
-use tokio::sync::{broadcast, mpsc, RwLock as AsyncRwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock as AsyncRwLock};
 use tracing::trace;
 
 /// How to select backend servers for a request
@@ -36,6 +36,25 @@ pub enum ProxyMode {
     Fastest(usize),
     /// send to all servers for benchmarking. return the fastest non-error response
     Versus,
+}
+
+struct WebsocketRpcResponse {
+    response: jsonrpc::Response,
+    subscription_start: Option<oneshot::Sender<()>>,
+}
+
+struct SocketResponse {
+    message: Message,
+    subscription_start: Option<oneshot::Sender<()>>,
+}
+
+impl From<Message> for SocketResponse {
+    fn from(message: Message) -> Self {
+        Self {
+            message,
+            subscription_start: None,
+        }
+    }
 }
 
 /// Public entrypoint for WebSocket JSON-RPC requests.
@@ -112,7 +131,7 @@ async fn websocket_proxy_web3_rpc(
     response_sender: &mpsc::Sender<Message>,
     subscription_count: &AtomicU64,
     subscriptions: &AsyncRwLock<HashMap<U64, AbortHandle>>,
-) -> Web3ProxyResult<jsonrpc::Response> {
+) -> Web3ProxyResult<WebsocketRpcResponse> {
     match &json_request.method[..] {
         "eth_subscribe" => {
             let web3_request = ValidatedRequest::new_with_app(
@@ -130,20 +149,16 @@ async fn websocket_proxy_web3_rpc(
                 .eth_subscribe(web3_request, subscription_count, response_sender.clone())
                 .await
             {
-                Ok((handle, response)) => {
-                    if let jsonrpc::ResponsePayload::Success {
-                        result: ref subscription_id,
-                    } = response.payload
-                    {
-                        let mut x = subscriptions.write().await;
+                Ok(subscription) => {
+                    subscriptions
+                        .write()
+                        .await
+                        .insert(subscription.id, subscription.abort_handle);
 
-                        let subscription_id = sonic_rs::to_value(subscription_id.as_ref()).unwrap();
-                        let key: U64 = sonic_rs::from_value(&subscription_id).unwrap();
-
-                        x.insert(key, handle);
-                    }
-
-                    Ok(response.into())
+                    Ok(WebsocketRpcResponse {
+                        response: subscription.response.into(),
+                        subscription_start: Some(subscription.start_sender),
+                    })
                 }
                 Err(err) => Err(err),
             }
@@ -197,12 +212,18 @@ async fn websocket_proxy_web3_rpc(
             web3_request.set_response(&response);
             let response = response.parsed().await.expect("Response already parsed");
 
-            Ok(response.into())
+            Ok(WebsocketRpcResponse {
+                response: response.into(),
+                subscription_start: None,
+            })
         }
         _ => app
             .proxy_web3_rpc(proxy_mode, json_request.into(), None)
             .await
-            .map(|(_, response, _)| response),
+            .map(|(_, response, _)| WebsocketRpcResponse {
+                response,
+                subscription_start: None,
+            }),
     }
 }
 
@@ -214,7 +235,7 @@ async fn handle_socket_payload(
     response_sender: &mpsc::Sender<Message>,
     subscription_count: &AtomicU64,
     subscriptions: Arc<AsyncRwLock<HashMap<U64, AbortHandle>>>,
-) -> Web3ProxyResult<Message> {
+) -> Web3ProxyResult<SocketResponse> {
     // TODO: handle batched requests
     let (response_id, response) = match sonic_rs::from_str::<SingleRequest>(payload) {
         Ok(json_request) => {
@@ -236,18 +257,24 @@ async fn handle_socket_payload(
         Err(err) => (Default::default(), Err(err.into())),
     };
 
-    let response_str = match response {
-        Ok(x) => x.to_json_string().await?,
+    let (response_str, subscription_start) = match response {
+        Ok(x) => (x.response.to_json_string().await?, x.subscription_start),
         Err(err) => {
             let (_, response_data) = err.as_response_parts(None::<RequestForError>);
 
             let response = ParsedResponse::from_response_data(response_data, response_id);
 
-            sonic_rs::to_string(&response).expect("to_string should always work here")
+            (
+                sonic_rs::to_string(&response).expect("to_string should always work here"),
+                None,
+            )
         }
     };
 
-    Ok(Message::Text(response_str.into()))
+    Ok(SocketResponse {
+        message: Message::Text(response_str.into()),
+        subscription_start,
+    })
 }
 
 async fn read_web3_socket(
@@ -285,16 +312,16 @@ async fn read_web3_socket(
                                     subscriptions,
                                 )
                                 .await {
-                                    Ok(message) => message,
+                                    Ok(response) => response,
                                     Err(err) => {
                                         // TODO: how can we get the id out of the payload?
-                                        err.into_message(None, None::<RequestForError>)
+                                        err.into_message(None, None::<RequestForError>).into()
                                     }
                                 }
                             }
                             Message::Ping(x) => {
                                 trace!("ping: {:?}", x);
-                                Message::Pong(x)
+                                Message::Pong(x).into()
                             }
                             Message::Pong(x) => {
                                 trace!("pong: {:?}", x);
@@ -309,7 +336,7 @@ async fn read_web3_socket(
                             Message::Binary(payload) => {
                                 let payload = from_utf8(&payload).unwrap();
 
-                                let m = match handle_socket_payload(
+                                let mut response = match handle_socket_payload(
                                     &app,
                                     proxy_mode,
                                     payload,
@@ -318,26 +345,33 @@ async fn read_web3_socket(
                                     subscriptions,
                                 )
                                 .await {
-                                    Ok(message) => message,
+                                    Ok(response) => response,
                                     Err(err) => {
                                         // TODO: how can we get the id out of the payload?
-                                        err.into_message(None, None::<RequestForError>)
+                                        err.into_message(None, None::<RequestForError>).into()
                                     }
                                 };
 
                                 // TODO: is this an okay way to convert from text to binary?
-                                let m = if let Message::Text(m) = m {
+                                response.message = if let Message::Text(m) = response.message {
                                     Message::Binary(m.as_bytes().to_vec().into())
                                 } else {
                                     unimplemented!();
                                 };
 
-                                m
+                                response
                             }
                         };
 
-                        if response_sender.send(response_msg).await.is_err() {
+                        let SocketResponse {
+                            message,
+                            subscription_start,
+                        } = response_msg;
+
+                        if response_sender.send(message).await.is_err() {
                             let _ = close_sender.send(true);
+                        } else if let Some(subscription_start) = subscription_start {
+                            let _ = subscription_start.send(());
                         };
                     };
 
