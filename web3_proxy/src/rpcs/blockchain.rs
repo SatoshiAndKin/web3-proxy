@@ -506,6 +506,36 @@ impl From<ArcHeader> for BlockHeader {
 }
 
 impl Web3Rpcs {
+    /// Return a block header by hash, fetching and caching it when necessary.
+    pub(crate) async fn block_header_by_hash(
+        &self,
+        block_hash: B256,
+    ) -> Web3ProxyResult<BlockHeader> {
+        if let Some(block) = self.blocks_by_hash.get(&block_hash).await {
+            return Ok(block);
+        }
+
+        let result: Option<Arc<OwnedLazyValue>> = Box::pin(self.internal_request(
+            "eth_getBlockByHash".into(),
+            &(block_hash, false),
+            Some(Duration::from_secs(5)),
+        ))
+        .await?;
+        let result = result.ok_or(Web3ProxyError::UnknownBlockHash(block_hash))?;
+        let block: Block = sonic_rs::from_str(
+            &sonic_rs::to_string(&result).expect("block result must serialize"),
+        )?;
+
+        if block.header.hash != block_hash {
+            return Err(Web3ProxyError::BadResponse(
+                "fetched block hash does not match the requested hash".into(),
+            ));
+        }
+
+        let block = BlockHeader::new(Arc::new(block.header));
+        self.try_cache_block_header(block, false).await
+    }
+
     async fn invalidate_uncle_headers_if_canonical(&self, block: &CachedBlockResponse) {
         if self.blocks_by_number.get(&block.block_number).await != Some(block.block_hash) {
             return;
@@ -518,13 +548,14 @@ impl Web3Rpcs {
 
     async fn reconcile_cached_uncles(&self, block_hash: B256) {
         let hashes_key = BlockResponseCacheKey::new(block_hash, false);
-        let block = match self.block_responses.get(&hashes_key).await { Some(block) => {
-            Some(block)
-        } _ => {
-            self.block_responses
-                .get(&BlockResponseCacheKey::new(block_hash, true))
-                .await
-        }};
+        let block = match self.block_responses.get(&hashes_key).await {
+            Some(block) => Some(block),
+            _ => {
+                self.block_responses
+                    .get(&BlockResponseCacheKey::new(block_hash, true))
+                    .await
+            }
+        };
 
         if let Some(block) = block {
             self.invalidate_uncle_headers_if_canonical(&block).await;

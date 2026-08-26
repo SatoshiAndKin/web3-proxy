@@ -96,31 +96,32 @@ pub async fn clean_block_number<'a>(
 
                 let (block, change) = if let Some(obj) = x.as_object_mut() {
                     // it might be a Map like `{"blockHash": String("0xa5626dc20d3a0a209b1de85521717a3e859698de8ce98bca1b16822b7501f74b")}`
-                    match obj.get(&"blockHash").cloned() { Some(block_hash) => {
-                        let block_hash: B256 =
-                            sonic_rs::from_value(&block_hash).context("decoding blockHash")?;
+                    match obj.get(&"blockHash").cloned() {
+                        Some(block_hash) => {
+                            let block_hash: B256 =
+                                sonic_rs::from_value(&block_hash).context("decoding blockHash")?;
 
-                        if block_hash == *head_block.hash() {
-                            (head_block.into(), false)
-                        } else if let Some(app) = app {
-                            // TODO: make a jsonrpc query here? cache rates will be better but it adds a network request
-                            let block = app
-                                .balanced_rpcs
-                                .blocks_by_hash
-                                .get(&block_hash)
-                                .await
-                                .context("fetching block number from hash")?;
+                            if block_hash == *head_block.hash() {
+                                (head_block.into(), false)
+                            } else if let Some(app) = app {
+                                let block = app
+                                    .balanced_rpcs
+                                    .block_header_by_hash(block_hash)
+                                    .await
+                                    .context("fetching block number from hash")?;
 
-                            (BlockNumOrHash::from(&block), false)
-                        } else {
-                            return Err(anyhow::anyhow!(
-                                "app missing. cannot find block number from hash"
-                            )
-                            .into());
+                                (BlockNumOrHash::from(&block), false)
+                            } else {
+                                return Err(anyhow::anyhow!(
+                                    "app missing. cannot find block number from hash"
+                                )
+                                .into());
+                            }
                         }
-                    } _ => {
-                        return Err(anyhow::anyhow!("blockHash missing").into());
-                    }}
+                        _ => {
+                            return Err(anyhow::anyhow!("blockHash missing").into());
+                        }
+                    }
                 } else {
                     // it might be a string like "latest" or a block number or a block hash
                     // TODO: "BlockNumber" needs a better name
@@ -135,11 +136,9 @@ pub async fn clean_block_number<'a>(
                         if block_hash == *head_block.hash() {
                             (head_block.number(), false)
                         } else if let Some(app) = app {
-                            // TODO: make a jsonrpc query here? cache rates will be better but it adds a network request
                             let block = app
                                 .balanced_rpcs
-                                .blocks_by_hash
-                                .get(&block_hash)
+                                .block_header_by_hash(block_hash)
                                 .await
                                 .context("fetching block number from hash")?;
 

@@ -699,15 +699,17 @@ impl ConsensusFinder {
                     .await
                     .web3_context("failed caching block")?;
 
-                match self.insert(rpc, rpc_head_block.clone(), observed_at).await
-                { Some(prev_block) => {
-                    // false if this block was already sent by this rpc
-                    // true if new block for this rpc
-                    prev_block.hash() != rpc_head_block.hash()
-                } _ => {
-                    // first block for this rpc
-                    true
-                }}
+                match self.insert(rpc, rpc_head_block.clone(), observed_at).await {
+                    Some(prev_block) => {
+                        // false if this block was already sent by this rpc
+                        // true if new block for this rpc
+                        prev_block.hash() != rpc_head_block.hash()
+                    }
+                    _ => {
+                        // first block for this rpc
+                        true
+                    }
+                }
             }
             None => {
                 // false if this rpc was already removed

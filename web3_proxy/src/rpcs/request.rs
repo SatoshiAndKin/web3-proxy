@@ -158,8 +158,7 @@ impl OpenRequestHandle {
             let x: ParsedResponse<R> = sonic_rs::from_slice(&buf[..n])?;
 
             Ok(x.into())
-        } else if let (Some(url), Some(client)) =
-            (self.rpc.http_url.clone(), &self.rpc.http_client)
+        } else if let (Some(url), Some(client)) = (self.rpc.http_url.clone(), &self.rpc.http_client)
         {
             // second, prefer the http provider
             let request = self

@@ -391,27 +391,29 @@ impl Web3Rpcs {
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<RpcsForRequest> {
         // TODO: by_name might include things that are on a forked
-        let ranked_rpcs: Arc<RankedRpcs> =
-            match self.watch_ranked_rpcs.borrow().clone() { Some(ranked_rpcs) => {
-                ranked_rpcs
-            } _ => if self.watch_head_block.is_some() {
-                // if we are here, this set of rpcs is subscribed to newHeads. But we didn't get a RankedRpcs. that means something is wrong
-                return Err(Web3ProxyError::NoServersSynced);
-            } else {
-                trace!("watch_head_block is none");
+        let ranked_rpcs: Arc<RankedRpcs> = match self.watch_ranked_rpcs.borrow().clone() {
+            Some(ranked_rpcs) => ranked_rpcs,
+            _ => {
+                if self.watch_head_block.is_some() {
+                    // if we are here, this set of rpcs is subscribed to newHeads. But we didn't get a RankedRpcs. that means something is wrong
+                    return Err(Web3ProxyError::NoServersSynced);
+                } else {
+                    trace!("watch_head_block is none");
 
-                // no RankedRpcs, but also no newHeads subscription. This is probably a set of "protected" rpcs or similar
-                let rpcs = self.by_name.read().values().cloned().collect();
+                    // no RankedRpcs, but also no newHeads subscription. This is probably a set of "protected" rpcs or similar
+                    let rpcs = self.by_name.read().values().cloned().collect();
 
-                // TODO: does this need the head_block? i don't think so
-                let x = RankedRpcs::from_rpcs(
-                    rpcs,
-                    web3_request.head_block.clone(),
-                    self.watch_head_block.is_some(),
-                );
+                    // TODO: does this need the head_block? i don't think so
+                    let x = RankedRpcs::from_rpcs(
+                        rpcs,
+                        web3_request.head_block.clone(),
+                        self.watch_head_block.is_some(),
+                    );
 
-                Arc::new(x)
-            }};
+                    Arc::new(x)
+                }
+            }
+        };
 
         match ranked_rpcs.for_request(web3_request) {
             None => Err(Web3ProxyError::NoServersSynced),

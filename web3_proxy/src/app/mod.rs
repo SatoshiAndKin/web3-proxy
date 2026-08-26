@@ -225,25 +225,28 @@ impl App {
 
                     // TODO: compare new and old here? the sender should be doing that already but maybe its better here
 
-                    match app.apply_top_config_rpcs(&new_top_config).await { Err(err) => {
-                        error!(?err, "unable to apply config! Retrying in 10 seconds (or if the config changes)");
+                    match app.apply_top_config_rpcs(&new_top_config).await {
+                        Err(err) => {
+                            error!(?err, "unable to apply config! Retrying in 10 seconds (or if the config changes)");
 
-                        select! {
-                            _ = config_watcher_shutdown_receiver.recv() => {
-                                break;
+                            select! {
+                                _ = config_watcher_shutdown_receiver.recv() => {
+                                    break;
+                                }
+                                _ = sleep(Duration::from_secs(10)) => {}
+                                _ = new_top_config_receiver.changed() => {}
                             }
-                            _ = sleep(Duration::from_secs(10)) => {}
-                            _ = new_top_config_receiver.changed() => {}
                         }
-                    } _ => {
-                        // configs applied successfully. wait for configs to change or for the app to exit
-                        select! {
-                            _ = config_watcher_shutdown_receiver.recv() => {
-                                break;
+                        _ => {
+                            // configs applied successfully. wait for configs to change or for the app to exit
+                            select! {
+                                _ = config_watcher_shutdown_receiver.recv() => {
+                                    break;
+                                }
+                                _ = new_top_config_receiver.changed() => {}
                             }
-                            _ = new_top_config_receiver.changed() => {}
                         }
-                    }}
+                    }
 
                     // TODO: add a min time between config changes
                     // TODO: is this yield actually helpful? i'm not so sure

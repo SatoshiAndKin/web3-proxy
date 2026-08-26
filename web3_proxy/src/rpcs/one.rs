@@ -755,15 +755,20 @@ impl Web3Rpc {
     /// TODO: this needs to be a subscribe_with_reconnect that does a retry with jitter and exponential backoff
     async fn subscribe_with_reconnect(self: Arc<Self>) -> Web3ProxyResult<()> {
         loop {
-            match self.clone().subscribe().await { Err(err) => {
-                if self.should_disconnect() {
-                    break;
-                }
+            match self.clone().subscribe().await {
+                Err(err) => {
+                    if self.should_disconnect() {
+                        break;
+                    }
 
-                warn!(?err, "subscribe err on {}", self);
-            } _ => if self.should_disconnect() {
-                break;
-            }}
+                    warn!(?err, "subscribe err on {}", self);
+                }
+                _ => {
+                    if self.should_disconnect() {
+                        break;
+                    }
+                }
+            }
 
             // TODO: exponential backoff with jitter
             if self.backup {
@@ -895,17 +900,18 @@ impl Web3Rpc {
             };
 
             // TODO: log quick_check lik
-            let initial_check = match self.check_health(false, error_handler).await { Err(err) => {
-                if self.backup {
-                    warn!(?err, "initial health check on {} failed", self);
-                } else {
-                    error!(?err, "initial health check on {} failed", self);
-                }
+            let initial_check = match self.check_health(false, error_handler).await {
+                Err(err) => {
+                    if self.backup {
+                        warn!(?err, "initial health check on {} failed", self);
+                    } else {
+                        error!(?err, "initial health check on {} failed", self);
+                    }
 
-                false
-            } _ => {
-                true
-            }};
+                    false
+                }
+                _ => true,
+            };
 
             self.healthy
                 .store(self.health_status(initial_check), atomic::Ordering::SeqCst);
@@ -923,18 +929,21 @@ impl Web3Rpc {
                     }
 
                     // TODO: if this fails too many times, reset the connection
-                    match rpc.check_provider().await { Err(err) => {
-                        rpc.healthy.store(false, atomic::Ordering::SeqCst);
+                    match rpc.check_provider().await {
+                        Err(err) => {
+                            rpc.healthy.store(false, atomic::Ordering::SeqCst);
 
-                        // TODO: if rate limit error, set "retry_at"
-                        if rpc.backup {
-                            warn!(?err, "provider check on {} failed", rpc);
-                        } else {
-                            error!(?err, "provider check on {} failed", rpc);
+                            // TODO: if rate limit error, set "retry_at"
+                            if rpc.backup {
+                                warn!(?err, "provider check on {} failed", rpc);
+                            } else {
+                                error!(?err, "provider check on {} failed", rpc);
+                            }
                         }
-                    } _ => {
-                        rpc.healthy.store(true, atomic::Ordering::SeqCst);
-                    }}
+                        _ => {
+                            rpc.healthy.store(true, atomic::Ordering::SeqCst);
+                        }
+                    }
 
                     sleep(Duration::from_secs(health_sleep_seconds)).await;
                 }
@@ -1481,8 +1490,9 @@ impl fmt::Display for Web3Rpc {
 mod tests {
     #![allow(unused_imports)]
     use super::*;
+    use crate::rpcs::many::{Web3Rpcs, Web3RpcsSpawnConfig};
     use alloy::primitives::{B256, U256};
-    use alloy::rpc::types::Header;
+    use alloy::rpc::types::{Block, Header};
     use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
     use axum::extract::State;
     use axum::response::IntoResponse;
@@ -1705,6 +1715,59 @@ mod tests {
         })
         .await
         .expect("the hydration race must cache a block")
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn block_header_hash_miss_fetches_and_populates_cache() {
+        let requested_header = header(42, 1_700_000_000);
+        let block_hash = requested_header.hash;
+        let block: Block = Block::empty(requested_header);
+        let stub = hydration_stub(
+            "block-header-cache-through",
+            serde_json::to_value(block).unwrap(),
+        )
+        .await;
+        stub.rpc.healthy.store(true, atomic::Ordering::SeqCst);
+
+        let (rpcs, _handle, _) = Web3Rpcs::spawn(
+            Web3RpcsSpawnConfig::new(1, None, 0, 0, 1_000_000),
+            "block-header-cache-through".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        rpcs.by_name
+            .write()
+            .insert(stub.rpc.name.clone(), stub.rpc.clone());
+
+        assert_eq!(rpcs.blocks_by_hash.get(&block_hash).await, None);
+
+        stub.hydration_release.add_permits(1);
+        let fetched = rpcs.block_header_by_hash(block_hash).await.unwrap();
+
+        assert_eq!(*fetched.hash(), block_hash);
+        assert_eq!(fetched.number(), U64::from(42));
+        let cached = rpcs.blocks_by_hash.get(&block_hash).await.unwrap();
+        assert_eq!(*cached.hash(), block_hash);
+        assert_eq!(cached.number(), U64::from(42));
+
+        let fetched_again = tokio::time::timeout(
+            Duration::from_secs(1),
+            rpcs.block_header_by_hash(block_hash),
+        )
+        .await
+        .expect("the cached lookup must not wait for another RPC response")
+        .unwrap();
+        assert_eq!(*fetched_again.hash(), block_hash);
+
+        let requests = stub.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "eth_getBlockByHash");
+        assert_eq!(
+            requests[0]["params"],
+            serde_json::json!([block_hash, false])
+        );
     }
 
     #[test_log::test(tokio::test)]
