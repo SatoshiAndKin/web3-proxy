@@ -253,6 +253,7 @@ fn get_block_param_id(method: &str) -> Option<usize> {
         "eth_getTransactionCount" => Some(1),
         "eth_getUncleByBlockNumberAndIndex" => Some(0),
         "eth_getUncleCountByBlockNumber" => Some(0),
+        "eth_simulateV1" => Some(1),
         "trace_block" => Some(0),
         "trace_call" => Some(2),
         "trace_callMany" => Some(1),
@@ -605,6 +606,61 @@ mod test {
             .unwrap();
 
         assert!(matches!(x, RequestBlocks::Point { .. }));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_eth_simulate_v1_block_hash() {
+        let head_block = BlockHeader::new(Arc::new(block(18_173_997)));
+        let params = json!([
+            {
+                "blockStateCalls": [{ "calls": [] }],
+                "traceTransfers": false,
+                "validation": false,
+                "returnFullTransactions": false
+            },
+            {
+                "blockHash": head_block.hash(),
+                "requireCanonical": true
+            }
+        ]);
+        let original_params = params.clone();
+        let mut request = SingleRequest::new(99.into(), "eth_simulateV1".into(), params).unwrap();
+
+        let request_blocks = RequestBlocks::try_new(&mut request, Some(&head_block), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            request_blocks,
+            RequestBlocks::Point {
+                block_needed: (&head_block).into(),
+            }
+        );
+        assert_eq!(request.params, original_params);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_eth_simulate_v1_defaults_to_latest_block() {
+        let head_block = BlockHeader::new(Arc::new(block(18_173_997)));
+        let params = json!([{
+            "blockStateCalls": [{ "calls": [] }],
+            "traceTransfers": false,
+            "validation": false,
+            "returnFullTransactions": false
+        }]);
+        let mut request = SingleRequest::new(99.into(), "eth_simulateV1".into(), params).unwrap();
+
+        let request_blocks = RequestBlocks::try_new(&mut request, Some(&head_block), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            request_blocks,
+            RequestBlocks::Point {
+                block_needed: (&head_block).into(),
+            }
+        );
+        assert_eq!(request.params.get(1), Some(&json!(head_block.number())));
     }
 
     #[test]
