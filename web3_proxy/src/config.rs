@@ -32,7 +32,14 @@ pub struct TopConfig {
 
 impl TopConfig {
     pub fn from_toml_str(input: &str) -> anyhow::Result<Self> {
-        let expanded = shellexpand::env(input)?;
+        Self::from_toml_str_with_env(input, |name| std::env::var(name).map(Some))
+    }
+
+    fn from_toml_str_with_env<F>(input: &str, env: F) -> anyhow::Result<Self>
+    where
+        F: FnMut(&str) -> Result<Option<String>, std::env::VarError>,
+    {
+        let expanded = shellexpand::env_with_context(input, env)?;
         Ok(toml::from_str(&expanded)?)
     }
 
@@ -327,7 +334,6 @@ impl Web3RpcConfig {
 mod tests {
     use super::{AppConfig, TopConfig, Web3RpcConfig};
     use sonic_rs::json;
-    use std::env;
 
     #[test]
     fn expected_app_defaults() {
@@ -379,11 +385,8 @@ mod tests {
     #[test]
     fn top_config_expands_environment_variables() {
         const VARIABLE: &str = "WEB3_PROXY_TEST_RPC_URL";
-        let previous_value = env::var_os(VARIABLE);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { env::set_var(VARIABLE, "http://127.0.0.1:8545") };
 
-        let config = TopConfig::from_toml_str(
+        let config = TopConfig::from_toml_str_with_env(
             r#"
                 [app]
                 chain_id = 1
@@ -391,15 +394,12 @@ mod tests {
                 [balanced_rpcs.local]
                 http_url = "${WEB3_PROXY_TEST_RPC_URL}"
             "#,
+            |name| match name {
+                VARIABLE => Ok(Some("http://127.0.0.1:8545".to_string())),
+                _ => Err(std::env::VarError::NotPresent),
+            },
         )
         .unwrap();
-
-        match previous_value {
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            Some(value) => unsafe { env::set_var(VARIABLE, value) },
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            None => unsafe { env::remove_var(VARIABLE) },
-        }
 
         assert_eq!(
             config.balanced_rpcs["local"].http_url.as_deref(),
@@ -409,12 +409,7 @@ mod tests {
 
     #[test]
     fn top_config_rejects_missing_environment_variables() {
-        const VARIABLE: &str = "WEB3_PROXY_TEST_MISSING_RPC_URL";
-        let previous_value = env::var_os(VARIABLE);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { env::remove_var(VARIABLE) };
-
-        let error = TopConfig::from_toml_str(
+        let error = TopConfig::from_toml_str_with_env(
             r#"
                 [app]
                 chain_id = 1
@@ -422,13 +417,9 @@ mod tests {
                 [balanced_rpcs.local]
                 http_url = "${WEB3_PROXY_TEST_MISSING_RPC_URL}"
             "#,
+            |_| Err(std::env::VarError::NotPresent),
         )
         .unwrap_err();
-
-        if let Some(value) = previous_value {
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            unsafe { env::set_var(VARIABLE, value) };
-        }
 
         assert_eq!(
             error.to_string(),
