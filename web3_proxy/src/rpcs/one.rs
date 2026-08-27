@@ -2374,6 +2374,38 @@ mod tests {
         assert!(!x.has_block_data(head_block.number() + U64::from(1000)));
     }
 
+    #[test_log::test(tokio::test)]
+    async fn pruned_node_does_not_wait_for_an_old_max_block() {
+        let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
+        let head_block = BlockHeader::new(Arc::new(header(1_000, now)));
+        let (head_block_sender, _) = watch::channel(Some(head_block.clone()));
+        let (head_observation_sender, head_observation_receiver) = mpsc::unbounded_channel();
+        let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
+        drop(head_observation_receiver);
+        let rpc = Arc::new(Web3Rpc {
+            name: "pruned".to_owned(),
+            healthy: AtomicBool::new(true),
+            block_data_limit: 128.into(),
+            head_observation_publisher: Some(head_observation_publisher),
+            head_block_sender: Some(head_block_sender),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal(
+            "eth_getBlockByNumber".into(),
+            &("0x320", false),
+            Some(head_block),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.max_block_needed(), Some(U64::from(800)));
+        assert!(matches!(
+            rpc.try_request_handle(&request, None, false).await.unwrap(),
+            OpenRequestResult::Failed
+        ));
+    }
+
     /*
     // TODO: think about how to bring the concept of a "lagged" node back
     #[test]
