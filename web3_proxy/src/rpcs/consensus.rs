@@ -1003,9 +1003,14 @@ impl RpcsForRequest {
         stream! {
             trace!("entered stream");
             let error_handler = None;
+            let mut opened_any = false;
 
             // todo!("be sure to set server_error if we exit without any rpcs!");
-            while !self.request.connect_timeout() {
+            while if opened_any {
+                !self.request.expired()
+            } else {
+                !self.request.connect_timeout()
+            } {
                 let mut earliest_retry_at: Option<Instant> = None;
                 let mut opened = 0;
                 let mut tried = 0;
@@ -1023,6 +1028,7 @@ impl RpcsForRequest {
                             Ok(OpenRequestResult::Handle(handle)) => {
                                 trace!("opened handle: {}", best_rpc);
                                 opened += 1;
+                                opened_any = true;
                                 yield handle;
                             }
                             Ok(OpenRequestResult::RetryAt(retry_at)) => {
@@ -1057,17 +1063,22 @@ impl RpcsForRequest {
                 warn!(?earliest_retry_at, num_waits=%wait_for_sync.len(), %tried, %opened, "no rpcs ready");
 
                 let min_wait_until = Instant::now() + Duration::from_millis(10);
+                let retry_deadline = if opened_any {
+                    self.request.expire_at()
+                } else {
+                    self.request.connect_timeout_at()
+                };
 
                 // clear earliest_retry_at if it is too far in the future to help us
                 if let Some(retry_at) = earliest_retry_at {
-                    let corrected = retry_at.max(min_wait_until).min(self.request.connect_timeout_at());
+                    let corrected = retry_at.max(min_wait_until).min(retry_deadline);
 
                     // set a minimum of 100ms. this is probably actually a bug we should figure out.
                     earliest_retry_at = Some(corrected);
                 } else if wait_for_sync.is_empty() {
                     break;
                 } else {
-                    earliest_retry_at = Some(self.request.connect_timeout_at());
+                    earliest_retry_at = Some(retry_deadline);
                 }
 
                 let retry_until = sleep_until(earliest_retry_at.expect("retry_at should always be set by now"));
@@ -1318,6 +1329,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn request_stream_retries_after_a_backend_outlives_the_connect_deadline() {
         let (first_limit, _) = watch::channel(Instant::now());
+        let first_limit_control = first_limit.clone();
         let first = Arc::new(Web3Rpc {
             name: "slow-failure".to_owned(),
             healthy: AtomicBool::new(true),
@@ -1351,6 +1363,7 @@ mod tests {
         assert_eq!(first_handle.connection_name(), "slow-failure");
 
         tokio::time::advance(Duration::from_millis(20)).await;
+        first_limit_control.send_replace(Instant::now() + Duration::from_millis(40));
         drop(first_handle);
 
         let retry_handle = timeout(Duration::from_millis(50), stream.next())

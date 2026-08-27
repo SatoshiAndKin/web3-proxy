@@ -100,6 +100,22 @@ impl Drop for OpenRequestHandle {
 }
 
 impl OpenRequestHandle {
+    fn delay_reuse_for(&self, duration: Duration) {
+        let retry_at = Instant::now() + duration;
+        self.rpc
+            .hard_limit_until
+            .as_ref()
+            .unwrap()
+            .send_if_modified(|current| {
+                if *current >= retry_at {
+                    false
+                } else {
+                    *current = retry_at;
+                    true
+                }
+            });
+    }
+
     pub async fn new(
         web3_request: Arc<ValidatedRequest>,
         rpc: Arc<Web3Rpc>,
@@ -136,12 +152,7 @@ impl OpenRequestHandle {
             warn!(?duration, "rate limited on {}!", self.rpc);
         }
 
-        // TODO: use send_if_modified to be sure we only send if our value is greater
-        self.rpc
-            .hard_limit_until
-            .as_ref()
-            .unwrap()
-            .send_replace(Instant::now() + duration);
+        self.delay_reuse_for(duration);
     }
 
     /// Just get the response from the provider without any extra handling.
@@ -269,6 +280,16 @@ impl OpenRequestHandle {
         let start = Instant::now();
 
         let mut response = self._request().await;
+
+        if matches!(
+            &response,
+            Err(Web3ProxyError::Reqwest(_)
+                | Web3ProxyError::Io(_)
+                | Web3ProxyError::AlloyTransport(_))
+        ) {
+            warn!(rpc = %self.rpc, "backend transport failed; delaying reuse");
+            self.delay_reuse_for(Duration::from_secs(1));
+        }
 
         // measure successes and errors
         // originally i thought we wouldn't want errors, but I think it's a more accurate number including all requests
