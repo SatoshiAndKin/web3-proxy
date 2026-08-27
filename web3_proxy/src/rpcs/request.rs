@@ -474,10 +474,17 @@ impl OpenRequestHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::history_error_for_request;
+    use super::{history_error_for_request, OpenRequestHandle};
     use crate::errors::Web3ProxyError;
-    use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, ValidatedRequest};
+    use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, SingleRequest, ValidatedRequest};
+    use crate::rpcs::one::Web3Rpc;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::{routing::post, Router};
+    use sonic_rs::{json, OwnedLazyValue};
     use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::watch;
+    use tokio::time::Instant;
 
     fn request(method: &'static str) -> Arc<ValidatedRequest> {
         Arc::new(ValidatedRequest {
@@ -506,5 +513,47 @@ mod tests {
             data: None,
         };
         assert!(history_error_for_request(&request("eth_getLogs"), &different_error).is_none());
+    }
+
+    #[tokio::test]
+    async fn backend_rate_limit_is_returned_as_a_retryable_request_error() {
+        let router = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"rate limit exceeded"}}"#,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "rate-limited".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some(format!("http://{address}").parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            ..Default::default()
+        });
+        let request = Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Request(
+                SingleRequest::new(1.into(), "eth_getLogs".into(), json!([])).unwrap(),
+            ),
+            ..Default::default()
+        });
+
+        let response = OpenRequestHandle::new(request, rpc, None)
+            .await
+            .request::<Arc<OwnedLazyValue>>()
+            .await;
+
+        assert!(matches!(
+            response,
+            Err(Web3ProxyError::JsonRpcErrorData(error))
+                if error.code == -32005 && error.message == "rate limit exceeded"
+        ));
+        server.abort();
     }
 }
