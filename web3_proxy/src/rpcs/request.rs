@@ -449,3 +449,40 @@ impl OpenRequestHandle {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::history_error_for_request;
+    use crate::errors::Web3ProxyError;
+    use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, ValidatedRequest};
+    use std::sync::Arc;
+
+    fn request(method: &'static str) -> Arc<ValidatedRequest> {
+        Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Method(method.into(), 0),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn geth_pruned_log_history_error_retries_only_log_requests() {
+        let error = JsonRpcErrorData {
+            code: 4444,
+            message: "pruned history unavailable".into(),
+            data: None,
+        };
+
+        assert!(matches!(
+            history_error_for_request(&request("eth_getLogs"), &error),
+            Some(Web3ProxyError::LogHistoryRequired { .. })
+        ));
+        assert!(history_error_for_request(&request("eth_getCode"), &error).is_none());
+
+        let different_error = JsonRpcErrorData {
+            code: 4444,
+            message: "different backend error".into(),
+            data: None,
+        };
+        assert!(history_error_for_request(&request("eth_getLogs"), &different_error).is_none());
+    }
+}
