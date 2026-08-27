@@ -328,6 +328,7 @@ impl OpenRequestHandle {
                         } else if error.message.starts_with("execution reverted") {
                             ResponseType::Revert
                         } else if error.code == StatusCode::TOO_MANY_REQUESTS.as_u16() as i64 {
+                            response = Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
                             ResponseType::RateLimited
                         } else {
                             // TODO! THIS HAS TOO MANY FALSE POSITIVES! Theres another spot in the code that checks for things.
@@ -365,6 +366,8 @@ impl OpenRequestHandle {
                                 }
                                 -32001 => {
                                     if error.message == "Exceeded the quota usage" {
+                                        response =
+                                            Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
                                         ResponseType::RateLimited
                                     } else {
                                         ResponseType::Error
@@ -372,6 +375,8 @@ impl OpenRequestHandle {
                                 }
                                 -32005 => {
                                     if error.message == "rate limit exceeded" {
+                                        response =
+                                            Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
                                         ResponseType::RateLimited
                                     } else {
                                         ResponseType::Error
