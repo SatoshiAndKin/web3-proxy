@@ -1288,7 +1288,9 @@ impl Web3Rpc {
 
         if !allow_unhealthy {
             if !(self.healthy.load(atomic::Ordering::SeqCst)) {
-                return Ok(OpenRequestResult::Failed);
+                return Ok(OpenRequestResult::RetryAt(
+                    self.next_available(Instant::now() + Duration::from_secs(1)),
+                ));
             }
 
             if self.head_observation_publisher.is_some() {
