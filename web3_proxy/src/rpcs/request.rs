@@ -561,4 +561,33 @@ mod tests {
         ));
         server.abort();
     }
+
+    #[tokio::test]
+    async fn backend_transport_failure_temporarily_limits_the_backend() {
+        let (hard_limit_until, hard_limit_receiver) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "unreachable".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some("http://127.0.0.1:1".parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            ..Default::default()
+        });
+        let request = Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Request(
+                SingleRequest::new(1.into(), "eth_call".into(), json!([])).unwrap(),
+            ),
+            ..Default::default()
+        });
+
+        let response = OpenRequestHandle::new(request, rpc, None)
+            .await
+            .request::<Arc<OwnedLazyValue>>()
+            .await;
+
+        assert!(response.is_err());
+        assert!(
+            *hard_limit_receiver.borrow() > Instant::now(),
+            "a transport failure should delay reuse of the failing backend"
+        );
+    }
 }
