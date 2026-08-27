@@ -1315,6 +1315,51 @@ mod tests {
             .is_some());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn request_stream_retries_after_a_backend_outlives_the_connect_deadline() {
+        let (first_limit, _) = watch::channel(Instant::now());
+        let first = Arc::new(Web3Rpc {
+            name: "slow-failure".to_owned(),
+            healthy: AtomicBool::new(true),
+            hard_limit_until: Some(first_limit),
+            ..Default::default()
+        });
+        let (retry_limit, _) = watch::channel(Instant::now() + Duration::from_millis(30));
+        let retry = Arc::new(Web3Rpc {
+            name: "recovering".to_owned(),
+            healthy: AtomicBool::new(true),
+            hard_limit_until: Some(retry_limit),
+            ..Default::default()
+        });
+        let request = Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Method("eth_call".into(), 0),
+            connect_timeout: Duration::from_millis(10),
+            expire_timeout: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let rpcs = RpcsForRequest {
+            inner: vec![first, retry],
+            outer: Vec::new(),
+            request,
+        };
+        let mut stream = Box::pin(rpcs.to_stream());
+
+        let first_handle = stream
+            .next()
+            .await
+            .expect("the first backend should open immediately");
+        assert_eq!(first_handle.connection_name(), "slow-failure");
+
+        tokio::time::advance(Duration::from_millis(20)).await;
+        drop(first_handle);
+
+        let retry_handle = timeout(Duration::from_millis(50), stream.next())
+            .await
+            .expect("the stream should wait within the request expiry")
+            .expect("the stream should retry after the connect deadline");
+        assert_eq!(retry_handle.connection_name(), "recovering");
+    }
+
     #[test]
     fn consensus_update_source_prints_matching_block_once_with_rpc() {
         let hash = B256::repeat_byte(0x11);
