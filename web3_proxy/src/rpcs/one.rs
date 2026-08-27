@@ -2410,6 +2410,27 @@ mod tests {
         ));
     }
 
+    #[test_log::test(tokio::test)]
+    async fn temporarily_unhealthy_node_requests_a_retry() {
+        let rpc = Arc::new(Web3Rpc {
+            name: "temporarily-unhealthy".to_owned(),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal(
+            "eth_blockNumber".into(),
+            &[(); 0],
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            rpc.try_request_handle(&request, None, false).await.unwrap(),
+            OpenRequestResult::RetryAt(_)
+        ));
+    }
+
     /*
     // TODO: think about how to bring the concept of a "lagged" node back
     #[test]
