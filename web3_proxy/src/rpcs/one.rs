@@ -6,7 +6,7 @@ use super::blockchain::{
 use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
-use crate::config::Web3RpcConfig;
+use crate::config::{Web3RpcConfig, DEFAULT_MAX_CONCURRENT_REQUESTS};
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
@@ -35,10 +35,28 @@ use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::{cmp::Ordering, sync::Arc};
 use tokio::select;
-use tokio::sync::watch;
+use tokio::sync::{watch, AcquireError, Semaphore, SemaphorePermit};
 use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
+
+pub(super) struct RequestPermits(Semaphore);
+
+impl RequestPermits {
+    pub(super) fn new(max_concurrent_requests: usize) -> Self {
+        Self(Semaphore::new(max_concurrent_requests))
+    }
+
+    pub(super) async fn acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
+        self.0.acquire().await
+    }
+}
+
+impl Default for RequestPermits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_CONCURRENT_REQUESTS)
+    }
+}
 
 /// An active connection to a Web3 RPC server like geth or erigon.
 /// TODO: smarter Default derive or move the channels around so they aren't part of this at all
@@ -52,6 +70,8 @@ pub struct Web3Rpc {
 
     /// Track in-flight requests
     pub(super) active_requests: AtomicUsize,
+    /// Bound concurrent work sent to this backend.
+    pub(super) request_permits: RequestPermits,
     /// mapping of block numbers and hashes
     pub(super) block_map: Option<BlocksByHashCache>,
     /// canonical mapping of block numbers to hashes
@@ -154,6 +174,10 @@ impl Web3Rpc {
             ));
         }
 
+        if config.max_concurrent_requests == 0 {
+            return Err(anyhow!("max_concurrent_requests must be greater than zero"));
+        }
+
         let (head_block, _) = watch::channel(None);
 
         // Spawn the task for calculting average peak latency
@@ -220,6 +244,7 @@ impl Web3Rpc {
             max_head_block_age,
             name,
             peak_latency: Some(peak_latency),
+            request_permits: RequestPermits::new(config.max_concurrent_requests),
             median_latency: Some(median_request_latency),
             soft_limit: config.soft_limit,
             pending_txid_firehose,

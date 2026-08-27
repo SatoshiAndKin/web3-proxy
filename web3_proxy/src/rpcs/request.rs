@@ -160,7 +160,8 @@ impl OpenRequestHandle {
     async fn _request<R: JsonRpcResultData + serde::Serialize>(
         &self,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
-        if let Some(ipc_path) = self.rpc.ipc_path.as_ref() {
+        let request_permit = self.rpc.request_permits.acquire().await?;
+        let response = if let Some(ipc_path) = self.rpc.ipc_path.as_ref() {
             // first, prefer the unix stream
             let request = self
                 .web3_request
@@ -250,7 +251,9 @@ impl OpenRequestHandle {
         } else {
             // this must be a test
             Err(anyhow::anyhow!("no provider configured!").into())
-        }
+        };
+        drop(request_permit);
+        response
     }
 
     pub fn error_handler(&self) -> RequestErrorHandler {
@@ -503,7 +506,7 @@ mod tests {
     use super::{history_error_for_request, OpenRequestHandle};
     use crate::errors::Web3ProxyError;
     use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, SingleRequest, ValidatedRequest};
-    use crate::rpcs::one::Web3Rpc;
+    use crate::rpcs::one::{RequestPermits, Web3Rpc};
     use axum::extract::State;
     use axum::http::header::CONTENT_TYPE;
     use axum::{routing::post, Router};
@@ -650,7 +653,7 @@ mod tests {
             http_client: Some(reqwest::Client::new()),
             http_url: Some(format!("http://{address}").parse().unwrap()),
             hard_limit_until: Some(hard_limit_until),
-            request_permits: Semaphore::new(2),
+            request_permits: RequestPermits::new(2),
             ..Default::default()
         });
 
