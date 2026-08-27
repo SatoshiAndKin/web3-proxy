@@ -1316,6 +1316,10 @@ impl Web3Rpc {
                         if let Some(head_block) = head_block_receiver.borrow_and_update().as_ref() {
                             let head_block_number = head_block.number();
 
+                            if head_block_number >= block_needed {
+                                return Ok(OpenRequestResult::Failed);
+                            }
+
                             if head_block_number + U64::from(5) < block_needed {
                                 return Err(Web3ProxyError::FarFutureBlock {
                                     head: Some(head_block_number),
