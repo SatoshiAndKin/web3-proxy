@@ -1150,7 +1150,7 @@ impl std::fmt::Display for MaybeBlockNum<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusFinder, ConsensusUpdateSource, RankedRpcs};
+    use super::{ConsensusFinder, ConsensusUpdateSource, RankedRpcs, RpcsForRequest};
     use crate::block_number::{BlockNumOrHash, RequestBlocks};
     use crate::jsonrpc::{RequestOrMethod, ValidatedRequest};
     use crate::rpcs::blockchain::{
@@ -1160,6 +1160,7 @@ mod tests {
     use crate::rpcs::one::Web3Rpc;
     use alloy::primitives::{B256, U64};
     use alloy::rpc::types::Header;
+    use futures::StreamExt;
     use hashbrown::HashMap;
     use latency::EwmaLatency;
     use moka::future::Cache;
@@ -1168,7 +1169,7 @@ mod tests {
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
-    use tokio::time::Instant;
+    use tokio::time::{timeout, Instant};
     use tracing::Level;
 
     #[derive(Clone)]
@@ -1278,6 +1279,37 @@ mod tests {
             .expect("a state-history backend should serve historical state");
         assert_eq!(state_rpcs.inner.len(), 1);
         assert_eq!(state_rpcs.inner[0].name, "state-archive");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn request_stream_waits_for_the_earliest_backend_retry() {
+        let retry_at = Instant::now() + Duration::from_millis(20);
+        let (hard_limit_until, _) = watch::channel(retry_at);
+        let rpc = Arc::new(Web3Rpc {
+            name: "rate-limited".to_owned(),
+            healthy: AtomicBool::new(true),
+            hard_limit_until: Some(hard_limit_until),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal(
+            "eth_blockNumber".into(),
+            &[(); 0],
+            None,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let rpcs = RpcsForRequest {
+            inner: vec![rpc],
+            outer: Vec::new(),
+            request,
+        };
+        let mut stream = Box::pin(rpcs.to_stream());
+
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect("request stream should honor the backend retry time")
+            .is_some());
     }
 
     #[test]
