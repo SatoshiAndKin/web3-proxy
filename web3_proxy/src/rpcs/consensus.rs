@@ -1151,6 +1151,8 @@ impl std::fmt::Display for MaybeBlockNum<'_> {
 #[cfg(test)]
 mod tests {
     use super::{ConsensusFinder, ConsensusUpdateSource, RankedRpcs};
+    use crate::block_number::{BlockNumOrHash, RequestBlocks};
+    use crate::jsonrpc::{RequestOrMethod, ValidatedRequest};
     use crate::rpcs::blockchain::{
         BlockHeader, BlockHydrationCoordinator, BlocksByHashCache, HeadObservationPublisher,
     };
@@ -1196,6 +1198,68 @@ mod tests {
         header.inner.number = number;
         header.inner.parent_hash = parent_hash;
         BlockHeader::new(Arc::new(header))
+    }
+
+    fn rpc_with_history_limits(
+        name: &str,
+        head: &BlockHeader,
+        block_data_limit: u64,
+        log_data_limit: u64,
+    ) -> Arc<Web3Rpc> {
+        let (head_block_sender, _) = watch::channel(Some(head.clone()));
+
+        Arc::new(Web3Rpc {
+            name: name.into(),
+            block_data_limit: block_data_limit.into(),
+            log_data_limit: log_data_limit.into(),
+            head_block_sender: Some(head_block_sender),
+            healthy: AtomicBool::new(true),
+            ..Default::default()
+        })
+    }
+
+    fn request(method: &'static str, request_blocks: RequestBlocks) -> Arc<ValidatedRequest> {
+        Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Method(method.into(), 0),
+            request_blocks,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn historical_logs_use_log_history_without_changing_archive_state_routing() {
+        let head = block(1_000, B256::repeat_byte(0x11), B256::ZERO);
+        let state_archive = rpc_with_history_limits("state-archive", &head, u64::MAX, 128);
+        let log_archive = rpc_with_history_limits("log-archive", &head, 128, u64::MAX);
+        let ranked = RankedRpcs::from_rpcs(
+            vec![state_archive.clone(), log_archive.clone()],
+            Some(head),
+            true,
+        );
+        let log_request = request(
+            "eth_getLogs",
+            RequestBlocks::Range {
+                from_block: BlockNumOrHash::Num(U64::from(100)),
+                to_block: BlockNumOrHash::Num(U64::from(100)),
+            },
+        );
+        let log_rpcs = ranked
+            .for_request(&log_request)
+            .expect("a log-history backend should serve historical logs");
+        assert_eq!(log_rpcs.inner.len(), 1);
+        assert_eq!(log_rpcs.inner[0].name, "log-archive");
+
+        let state_request = request(
+            "eth_getCode",
+            RequestBlocks::Point {
+                block_needed: BlockNumOrHash::Num(U64::from(100)),
+            },
+        );
+        let state_rpcs = ranked
+            .for_request(&state_request)
+            .expect("a state-history backend should serve historical state");
+        assert_eq!(state_rpcs.inner.len(), 1);
+        assert_eq!(state_rpcs.inner[0].name, "state-archive");
     }
 
     #[test]
