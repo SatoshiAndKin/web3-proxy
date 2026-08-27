@@ -504,13 +504,32 @@ mod tests {
     use crate::errors::Web3ProxyError;
     use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, SingleRequest, ValidatedRequest};
     use crate::rpcs::one::Web3Rpc;
+    use axum::extract::State;
     use axum::http::header::CONTENT_TYPE;
     use axum::{routing::post, Router};
     use sonic_rs::{json, OwnedLazyValue};
     use std::sync::Arc;
     use tokio::net::TcpListener;
-    use tokio::sync::watch;
-    use tokio::time::Instant;
+    use tokio::sync::{mpsc, watch, Semaphore};
+    use tokio::time::{timeout, Duration, Instant};
+
+    #[derive(Clone)]
+    struct HeldRequestState {
+        started: mpsc::UnboundedSender<()>,
+        release: Arc<Semaphore>,
+    }
+
+    async fn held_json_rpc_request(
+        State(state): State<HeldRequestState>,
+    ) -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+        state.started.send(()).unwrap();
+        state.release.acquire().await.unwrap().forget();
+
+        (
+            [(CONTENT_TYPE, "application/json")],
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#,
+        )
+    }
 
     fn request(method: &'static str) -> Arc<ValidatedRequest> {
         Arc::new(ValidatedRequest {
@@ -610,5 +629,70 @@ mod tests {
             *hard_limit_receiver.borrow() > Instant::now(),
             "a transport failure should delay reuse of the failing backend"
         );
+    }
+
+    #[tokio::test]
+    async fn backend_request_concurrency_never_exceeds_its_permit_limit() {
+        let (started_sender, mut started_receiver) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let router = Router::new()
+            .route("/", post(held_json_rpc_request))
+            .with_state(HeldRequestState {
+                started: started_sender,
+                release: release.clone(),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "concurrency-limited".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some(format!("http://{address}").parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            request_permits: Semaphore::new(2),
+            ..Default::default()
+        });
+
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let rpc = rpc.clone();
+            let request = Arc::new(ValidatedRequest {
+                inner: RequestOrMethod::Request(
+                    SingleRequest::new(1.into(), "eth_call".into(), json!([])).unwrap(),
+                ),
+                ..Default::default()
+            });
+            requests.push(tokio::spawn(async move {
+                OpenRequestHandle::new(request, rpc, None)
+                    .await
+                    .request::<Arc<OwnedLazyValue>>()
+                    .await
+            }));
+        }
+
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("first backend request should start");
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("second backend request should start");
+        assert!(
+            timeout(Duration::from_millis(100), started_receiver.recv())
+                .await
+                .is_err(),
+            "a third backend request started without a permit"
+        );
+
+        release.add_permits(2);
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("third backend request should start after a permit is released");
+        release.add_permits(1);
+
+        for request in requests {
+            request.await.unwrap().unwrap();
+        }
+        server.abort();
     }
 }
