@@ -1006,7 +1006,7 @@ impl RpcsForRequest {
 
             // todo!("be sure to set server_error if we exit without any rpcs!");
             while !self.request.connect_timeout() {
-                let mut earliest_retry_at = None;
+                let mut earliest_retry_at: Option<Instant> = None;
                 let mut opened = 0;
                 let mut tried = 0;
                 let mut wait_for_sync = Vec::new();
@@ -1031,7 +1031,10 @@ impl RpcsForRequest {
                                     best_rpc,
                                     retry_at.duration_since(Instant::now()).as_secs_f32()
                                 );
-                                earliest_retry_at = earliest_retry_at.min(Some(retry_at, ));
+                                earliest_retry_at = Some(
+                                    earliest_retry_at
+                                        .map_or(retry_at, |earliest| earliest.min(retry_at)),
+                                );
                             }
                             Ok(OpenRequestResult::Lagged(x)) => {
                                 // this will probably always be the same block, right?
