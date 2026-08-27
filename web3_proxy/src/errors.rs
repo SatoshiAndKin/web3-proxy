@@ -56,6 +56,12 @@ pub enum Web3ProxyError {
         min: Option<U64>,
         max: Option<U64>,
     },
+    #[from(ignore)]
+    #[display("{:?} to {:?}", min, max)]
+    LogHistoryRequired {
+        min: Option<U64>,
+        max: Option<U64>,
+    },
     #[error(ignore)]
     #[from(ignore)]
     BadRequest(Cow<'static, str>),
@@ -234,6 +240,21 @@ impl Web3ProxyError {
                     StatusCode::OK,
                     JsonRpcErrorData {
                         message: "Archive data required".into(),
+                        code: StatusCode::OK.as_u16().into(),
+                        data: Some(json!({
+                            "request": request_for_error,
+                            "min": min,
+                            "max": max,
+                        })),
+                    },
+                )
+            }
+            Self::LogHistoryRequired { min, max } => {
+                trace!(?min, ?max, "log history required");
+                (
+                    StatusCode::OK,
+                    JsonRpcErrorData {
+                        message: "Log history required".into(),
                         code: StatusCode::OK.as_u16().into(),
                         data: Some(json!({
                             "request": request_for_error,

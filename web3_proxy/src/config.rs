@@ -239,9 +239,12 @@ pub struct Web3RpcConfig {
     /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
     #[serde(default = "Default::default")]
     pub backup: bool,
-    /// block data limit. If None, will be queried
+    /// State-history limit. If unknown, the proxy queries it.
     #[serde(default = "Default::default")]
     pub block_data_limit: BlockDataLimit,
+    /// log history limit. If unknown, the proxy queries it independently.
+    #[serde(default = "Default::default")]
+    pub log_data_limit: BlockDataLimit,
     /// simple way to disable a connection without deleting the row
     #[serde(default = "Default::default")]
     pub disabled: bool,
@@ -277,6 +280,7 @@ impl fmt::Debug for Web3RpcConfig {
             .debug_struct("Web3RpcConfig")
             .field("backup", &self.backup)
             .field("block_data_limit", &self.block_data_limit)
+            .field("log_data_limit", &self.log_data_limit)
             .field("disabled", &self.disabled)
             .field("display_name", &self.display_name)
             .field("http_url", &self.http_url.as_ref().map(|_| "[REDACTED]"))
@@ -378,7 +382,7 @@ mod tests {
 
         assert_eq!(
             format!("{config:?}"),
-            "Web3RpcConfig { backup: false, block_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
+            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
         );
     }
 

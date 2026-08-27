@@ -240,13 +240,13 @@ impl RankedRpcs {
 
             if self.check_block_data {
                 if let Some(block_needed) = min_block_needed {
-                    if !rpc.has_block_data(block_needed) {
+                    if !rpc.has_data_for_request(web3_request, block_needed) {
                         outer_for_request.push(rpc);
                         continue;
                     }
                 }
                 if let Some(block_needed) = max_block_needed {
-                    if !rpc.has_block_data(block_needed) {
+                    if !rpc.has_data_for_request(web3_request, block_needed) {
                         outer_for_request.push(rpc);
                         continue;
                     }
@@ -1248,6 +1248,24 @@ mod tests {
             .expect("a log-history backend should serve historical logs");
         assert_eq!(log_rpcs.inner.len(), 1);
         assert_eq!(log_rpcs.inner[0].name, "log-archive");
+
+        let recent_log_request = request(
+            "eth_getLogs",
+            RequestBlocks::Range {
+                from_block: BlockNumOrHash::Num(U64::from(900)),
+                to_block: BlockNumOrHash::Num(U64::from(900)),
+            },
+        );
+        let recent_log_rpcs = ranked
+            .for_request(&recent_log_request)
+            .expect("recent logs should use all backends that retain them");
+        let mut recent_log_rpc_names = recent_log_rpcs
+            .inner
+            .iter()
+            .map(|rpc| rpc.name.as_str())
+            .collect::<Vec<_>>();
+        recent_log_rpc_names.sort_unstable();
+        assert_eq!(recent_log_rpc_names, ["log-archive", "state-archive"]);
 
         let state_request = request(
             "eth_getCode",

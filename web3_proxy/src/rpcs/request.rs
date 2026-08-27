@@ -16,6 +16,23 @@ use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn, Level};
 
+fn history_error_for_request(
+    request: &ValidatedRequest,
+    error: &JsonRpcErrorData,
+) -> Option<Web3ProxyError> {
+    if request.requires_log_history()
+        && error.code == 4444
+        && error.message == "pruned history unavailable"
+    {
+        Some(Web3ProxyError::LogHistoryRequired {
+            min: request.min_block_needed(),
+            max: request.max_block_needed(),
+        })
+    } else {
+        None
+    }
+}
+
 #[derive(From)]
 pub enum OpenRequestResult {
     Handle(OpenRequestHandle),
@@ -303,7 +320,12 @@ impl OpenRequestHandle {
                     ResponsePayload::Error { error } => {
                         trace!(?error, "jsonrpc error data");
 
-                        if error.message.starts_with("execution reverted") {
+                        if let Some(history_error) =
+                            history_error_for_request(&self.web3_request, error)
+                        {
+                            response = Err(history_error);
+                            ResponseType::Error
+                        } else if error.message.starts_with("execution reverted") {
                             ResponseType::Revert
                         } else if error.code == StatusCode::TOO_MANY_REQUESTS.as_u16() as i64 {
                             ResponseType::RateLimited

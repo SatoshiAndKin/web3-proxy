@@ -210,6 +210,11 @@ impl Serialize for ValidatedRequest {
 }
 
 impl ValidatedRequest {
+    #[inline]
+    pub fn requires_log_history(&self) -> bool {
+        self.inner.method() == "eth_getLogs"
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn new_with_options(
         app: Option<&App>,
