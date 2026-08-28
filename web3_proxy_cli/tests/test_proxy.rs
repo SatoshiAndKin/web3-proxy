@@ -293,6 +293,102 @@ async fn eth_call_batch_uses_each_synced_backend() {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn eth_call_batch_distribution_tracks_backend_concurrency_capacity() {
+    let anvil = TestAnvil::spawn_chain(31337).await;
+    let _: Value = anvil
+        .provider
+        .raw_request("evm_mine".into(), ())
+        .await
+        .unwrap();
+    let proxy = TestApp::spawn_with_balanced_rpc_limits(&anvil, vec![256, 64]).await;
+    let client = reqwest::Client::new();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status_before = loop {
+        let status: Value = client
+            .get(format!("{}status", proxy.proxy_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["balanced_rpcs"]["synced_connections"]
+            .as_array()
+            .is_some_and(|connections| connections.len() == 2)
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both backends did not synchronize"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    let before = status_before["balanced_rpcs"]["conns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|backend| {
+            (
+                backend["name"].as_str().unwrap().to_owned(),
+                backend["backend_batch_requests"]
+                    .as_u64()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let requests = (0..384)
+        .map(|id| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{"to": Address::ZERO}, "latest"],
+                "id": id
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = client
+        .post(proxy.proxy_url.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&requests)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(response.as_array().unwrap().len(), requests.len());
+
+    let status_after: Value = client
+        .get(format!("{}status", proxy.proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let deltas = status_after["balanced_rpcs"]["conns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|backend| {
+            let name = backend["name"].as_str().unwrap();
+            (
+                name.to_owned(),
+                backend["backend_batch_requests"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    - before[name],
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(deltas["anvil_0"], 5);
+    assert_eq!(deltas["anvil_1"], 2);
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn websocket_new_heads_returns_subscription_and_delivers_block() {
     let anvil = TestAnvil::spawn_chain(31337).await;
     let _: Value = anvil
