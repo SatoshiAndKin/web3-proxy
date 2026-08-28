@@ -29,6 +29,14 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn spawn(anvil: &TestAnvil) -> Self {
+        Self::spawn_with_balanced_rpc_count(anvil, 1).await
+    }
+
+    pub async fn spawn_with_balanced_rpc_count(
+        anvil: &TestAnvil,
+        balanced_rpc_count: usize,
+    ) -> Self {
+        assert!(balanced_rpc_count > 0);
         let app_config: AppConfig = sonic_rs::from_value(&json!({
             "chain_id": anvil.instance.chain_id(),
             "min_sum_soft_limit": 1,
@@ -36,16 +44,22 @@ impl TestApp {
         }))
         .unwrap();
 
+        let balanced_rpcs = (0..balanced_rpc_count)
+            .map(|index| {
+                (
+                    format!("anvil_{index}"),
+                    Web3RpcConfig {
+                        http_url: Some(anvil.instance.endpoint()),
+                        ws_url: Some(anvil.instance.ws_endpoint()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+
         let top_config = TopConfig {
             app: app_config,
-            balanced_rpcs: HashMap::from([(
-                "anvil".to_string(),
-                Web3RpcConfig {
-                    http_url: Some(anvil.instance.endpoint()),
-                    ws_url: Some(anvil.instance.ws_endpoint()),
-                    ..Default::default()
-                },
-            )]),
+            balanced_rpcs,
             private_rpcs: HashMap::from([(
                 "anvil_private".to_string(),
                 Web3RpcConfig {
