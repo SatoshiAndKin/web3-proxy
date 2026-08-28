@@ -12,6 +12,7 @@ use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::consensus::RankedRpcs;
 use crate::rpcs::many::{Web3Rpcs, Web3RpcsSpawnConfig};
 use crate::rpcs::one::Web3Rpc;
+use crate::rpcs::request::OpenRequestHandle;
 use alloy::consensus::{Transaction as _, TxEnvelope};
 use alloy::eips::Decodable2718;
 use alloy::primitives::{keccak256, Address, Bytes, TxHash, B256, U256, U64};
@@ -88,6 +89,41 @@ pub struct Web3ProxyAppSpawn {
     pub new_top_config: Arc<watch::Sender<TopConfig>>,
     /// watch this to know when the app is ready to serve requests
     pub ranked_rpcs: watch::Receiver<Option<Arc<RankedRpcs>>>,
+}
+
+fn weighted_batch_lengths(
+    request_count: usize,
+    capacities: impl IntoIterator<Item = usize>,
+) -> Vec<usize> {
+    let capacities = capacities
+        .into_iter()
+        .map(|capacity| capacity.max(1))
+        .collect::<Vec<_>>();
+    let total_capacity = capacities
+        .iter()
+        .map(|capacity| *capacity as u128)
+        .sum::<u128>();
+    let request_count = request_count as u128;
+    let mut remainders = Vec::with_capacity(capacities.len());
+    let mut lengths = capacities
+        .into_iter()
+        .enumerate()
+        .map(|(index, capacity)| {
+            let weighted = request_count * capacity as u128;
+            remainders.push((index, weighted % total_capacity));
+            usize::try_from(weighted / total_capacity)
+                .expect("weighted backend batch length fits usize")
+        })
+        .collect::<Vec<_>>();
+    let assigned = lengths.iter().sum::<usize>();
+    remainders.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (index, _) in remainders
+        .into_iter()
+        .take(request_count as usize - assigned)
+    {
+        lengths[index] += 1;
+    }
+    lengths
 }
 
 impl App {
@@ -483,17 +519,27 @@ impl App {
             handles.push(handle);
         }
 
-        let requests_per_backend = normalized_requests.len().div_ceil(handles.len());
-        let batches = normalized_requests
-            .chunks(requests_per_backend)
-            .zip(handles)
-            .map(|(requests, handle)| async move {
-                let rpc = handle.clone_connection();
-                handle
-                    .request_batch(requests)
-                    .await
-                    .map(|responses| (rpc, responses))
-            });
+        let batch_lengths = weighted_batch_lengths(
+            normalized_requests.len(),
+            handles.iter().map(OpenRequestHandle::batch_capacity),
+        );
+        let mut offset = 0;
+        let batches =
+            handles
+                .into_iter()
+                .zip(batch_lengths)
+                .filter_map(|(handle, request_count)| {
+                    let start = offset;
+                    offset += request_count;
+                    let requests = normalized_requests.get(start..offset)?;
+                    (!requests.is_empty()).then_some(async move {
+                        let rpc = handle.clone_connection();
+                        handle
+                            .request_batch(requests)
+                            .await
+                            .map(|responses| (rpc, responses))
+                    })
+                });
         let mut responses = Vec::with_capacity(normalized_requests.len());
         let mut response_rpcs = Vec::with_capacity(normalized_requests.len());
         let mut used_rpcs = Vec::new();

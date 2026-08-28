@@ -241,6 +241,10 @@ impl OpenRequestHandle {
         self.rpc.clone()
     }
 
+    pub fn batch_capacity(&self) -> usize {
+        self.rpc.request_permits.max_concurrent_requests()
+    }
+
     pub fn rate_limit_for(&self, duration: Duration) {
         if self.rpc.backup {
             debug!(?duration, "rate limited on {}!", self.rpc);

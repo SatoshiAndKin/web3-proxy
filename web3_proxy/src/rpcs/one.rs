@@ -44,6 +44,7 @@ use url::Url;
 
 pub(super) struct RequestPermits {
     semaphore: Semaphore,
+    max_concurrent_requests: usize,
     max_backend_batch_items: usize,
 }
 
@@ -51,6 +52,7 @@ impl RequestPermits {
     pub(super) fn new(max_concurrent_requests: usize, max_backend_batch_items: usize) -> Self {
         Self {
             semaphore: Semaphore::new(max_concurrent_requests),
+            max_concurrent_requests,
             max_backend_batch_items,
         }
     }
@@ -69,6 +71,10 @@ impl RequestPermits {
 
     pub(super) fn max_backend_batch_items(&self) -> usize {
         self.max_backend_batch_items
+    }
+
+    pub(super) fn max_concurrent_requests(&self) -> usize {
+        self.max_concurrent_requests
     }
 }
 

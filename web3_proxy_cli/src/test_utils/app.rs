@@ -39,10 +39,7 @@ impl TestApp {
         assert!(balanced_rpc_count > 0);
         Self::spawn_with_balanced_rpc_limits(
             anvil,
-            vec![
-                Web3RpcConfig::default().max_concurrent_requests;
-                balanced_rpc_count
-            ],
+            vec![Web3RpcConfig::default().max_concurrent_requests; balanced_rpc_count],
         )
         .await
     }
