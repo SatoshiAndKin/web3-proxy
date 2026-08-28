@@ -18,6 +18,7 @@ use std::time::Duration;
 use tracing::warn;
 
 pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 448;
+pub(crate) const DEFAULT_MAX_BACKEND_BATCH_ITEMS: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TopConfig {
@@ -259,6 +260,9 @@ pub struct Web3RpcConfig {
     /// maximum number of requests that can concurrently use this backend
     #[serde_inline_default(448usize)]
     pub max_concurrent_requests: usize,
+    /// maximum number of calls grouped into one backend JSON-RPC batch packet
+    #[serde_inline_default(64usize)]
+    pub max_backend_batch_items: usize,
     /// the requests per second at which the server starts slowing down
     #[serde_inline_default(1u32)]
     pub soft_limit: u32,
@@ -291,6 +295,7 @@ impl fmt::Debug for Web3RpcConfig {
             .field("http_url", &self.http_url.as_ref().map(|_| "[REDACTED]"))
             .field("ipc_path", &self.ipc_path)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("max_backend_batch_items", &self.max_backend_batch_items)
             .field("soft_limit", &self.soft_limit)
             .field("subscribe_txs", &self.subscribe_txs)
             .field("ws_url", &self.ws_url.as_ref().map(|_| "[REDACTED]"))
@@ -342,7 +347,10 @@ impl Web3RpcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, TopConfig, Web3RpcConfig, DEFAULT_MAX_CONCURRENT_REQUESTS};
+    use super::{
+        AppConfig, TopConfig, Web3RpcConfig, DEFAULT_MAX_BACKEND_BATCH_ITEMS,
+        DEFAULT_MAX_CONCURRENT_REQUESTS,
+    };
     use sonic_rs::json;
 
     #[test]
@@ -371,11 +379,13 @@ mod tests {
 
         assert_eq!(a.soft_limit, 1);
         assert_eq!(a.max_concurrent_requests, DEFAULT_MAX_CONCURRENT_REQUESTS);
+        assert_eq!(a.max_backend_batch_items, DEFAULT_MAX_BACKEND_BATCH_ITEMS);
 
         let b: Web3RpcConfig = Default::default();
 
         assert_eq!(b.soft_limit, 1);
         assert_eq!(b.max_concurrent_requests, DEFAULT_MAX_CONCURRENT_REQUESTS);
+        assert_eq!(b.max_backend_batch_items, DEFAULT_MAX_BACKEND_BATCH_ITEMS);
 
         assert_eq!(a, b);
     }
@@ -390,7 +400,7 @@ mod tests {
 
         assert_eq!(
             format!("{config:?}"),
-            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, max_concurrent_requests: 448, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
+            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
         );
     }
 

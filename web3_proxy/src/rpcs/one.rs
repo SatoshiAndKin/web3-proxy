@@ -6,7 +6,9 @@ use super::blockchain::{
 use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
-use crate::config::{Web3RpcConfig, DEFAULT_MAX_CONCURRENT_REQUESTS};
+use crate::config::{
+    Web3RpcConfig, DEFAULT_MAX_BACKEND_BATCH_ITEMS, DEFAULT_MAX_CONCURRENT_REQUESTS,
+};
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
@@ -42,14 +44,14 @@ use url::Url;
 
 pub(super) struct RequestPermits {
     semaphore: Semaphore,
-    max: usize,
+    max_backend_batch_items: usize,
 }
 
 impl RequestPermits {
-    pub(super) fn new(max_concurrent_requests: usize) -> Self {
+    pub(super) fn new(max_concurrent_requests: usize, max_backend_batch_items: usize) -> Self {
         Self {
             semaphore: Semaphore::new(max_concurrent_requests),
-            max: max_concurrent_requests,
+            max_backend_batch_items,
         }
     }
 
@@ -65,14 +67,17 @@ impl RequestPermits {
         self.semaphore.acquire_many(permits).await
     }
 
-    pub(super) fn max(&self) -> usize {
-        self.max
+    pub(super) fn max_backend_batch_items(&self) -> usize {
+        self.max_backend_batch_items
     }
 }
 
 impl Default for RequestPermits {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_CONCURRENT_REQUESTS)
+        Self::new(
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
+            DEFAULT_MAX_BACKEND_BATCH_ITEMS,
+        )
     }
 }
 
@@ -197,6 +202,14 @@ impl Web3Rpc {
         if config.max_concurrent_requests == 0 {
             return Err(anyhow!("max_concurrent_requests must be greater than zero"));
         }
+        if config.max_backend_batch_items == 0 {
+            return Err(anyhow!("max_backend_batch_items must be greater than zero"));
+        }
+        if config.max_backend_batch_items > config.max_concurrent_requests {
+            return Err(anyhow!(
+                "max_backend_batch_items must not exceed max_concurrent_requests"
+            ));
+        }
 
         let (head_block, _) = watch::channel(None);
 
@@ -264,7 +277,10 @@ impl Web3Rpc {
             max_head_block_age,
             name,
             peak_latency: Some(peak_latency),
-            request_permits: RequestPermits::new(config.max_concurrent_requests),
+            request_permits: RequestPermits::new(
+                config.max_concurrent_requests,
+                config.max_backend_batch_items,
+            ),
             median_latency: Some(median_request_latency),
             soft_limit: config.soft_limit,
             pending_txid_firehose,

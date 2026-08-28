@@ -265,7 +265,7 @@ impl OpenRequestHandle {
             .http_url
             .clone()
             .context("backend batch forwarding requires an HTTP URL")?;
-        let chunk_size = self.rpc.request_permits.max().max(1);
+        let chunk_size = self.rpc.request_permits.max_backend_batch_items();
         let mut responses = Vec::with_capacity(requests.len());
         let _active_request_guard = BatchActiveRequestGuard::new(self.rpc.clone(), requests.len());
 
@@ -855,7 +855,7 @@ mod tests {
             http_client: Some(reqwest::Client::new()),
             http_url: Some(format!("http://{address}").parse().unwrap()),
             hard_limit_until: Some(hard_limit_until),
-            request_permits: RequestPermits::new(2),
+            request_permits: RequestPermits::new(2, 2),
             ..Default::default()
         });
 
