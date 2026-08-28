@@ -163,29 +163,26 @@ async fn eth_call_batch_stays_batched_at_backend() {
         .as_u64()
         .unwrap_or_default();
 
+    let requests = (0..129)
+        .map(|id| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{"to": Address::ZERO}, "latest"],
+                "id": id
+            })
+        })
+        .collect::<Vec<_>>();
     let response = client
         .post(proxy.proxy_url.clone())
         .header(header::CONTENT_TYPE, "application/json")
-        .json(&json!([
-            {
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{"to": Address::ZERO}, "latest"],
-                "id": 1
-            },
-            {
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{"to": Address::ZERO}, "latest"],
-                "id": 2
-            }
-        ]))
+        .json(&requests)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response: Value = response.json().await.unwrap();
-    assert_eq!(response.as_array().unwrap().len(), 2);
+    assert_eq!(response.as_array().unwrap().len(), requests.len());
 
     let status: Value = client
         .get(format!("{}status", proxy.proxy_url))
@@ -199,7 +196,7 @@ async fn eth_call_batch_stays_batched_at_backend() {
         .as_u64()
         .unwrap_or_default();
 
-    assert_eq!(batch_requests_after, batch_requests_before + 1);
+    assert_eq!(batch_requests_after, batch_requests_before + 3);
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
