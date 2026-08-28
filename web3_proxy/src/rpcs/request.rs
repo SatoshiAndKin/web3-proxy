@@ -503,7 +503,7 @@ impl OpenRequestHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_error_for_request, OpenRequestHandle};
+    use super::{backend_transport_failure, history_error_for_request, OpenRequestHandle};
     use crate::errors::Web3ProxyError;
     use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, SingleRequest, ValidatedRequest};
     use crate::rpcs::one::{RequestPermits, Web3Rpc};
@@ -632,6 +632,23 @@ mod tests {
             *hard_limit_receiver.borrow() > Instant::now(),
             "a transport failure should delay reuse of the failing backend"
         );
+    }
+
+    #[tokio::test]
+    async fn backend_transport_diagnostic_classifies_connect_without_exposing_the_url() {
+        let secret_url = "http://127.0.0.1:1/private-backend-token";
+        let error = reqwest::Client::new()
+            .get(secret_url)
+            .send()
+            .await
+            .expect_err("the closed local port must refuse the connection");
+
+        let diagnostic = backend_transport_failure(&Web3ProxyError::Reqwest(error))
+            .expect("reqwest failures must have transport diagnostics")
+            .to_string();
+
+        assert_eq!(diagnostic, "http_connect");
+        assert!(!diagnostic.contains("private-backend-token"));
     }
 
     #[tokio::test]
