@@ -11,7 +11,7 @@ use web3_proxy::prelude::futures::StreamExt;
 use web3_proxy::prelude::reqwest::{self, header, StatusCode};
 use web3_proxy::prelude::serde::{de::DeserializeOwned, Serialize};
 use web3_proxy::prelude::tokio;
-use web3_proxy::prelude::tokio::time::{timeout, Duration};
+use web3_proxy::prelude::tokio::time::{sleep, timeout, Duration, Instant};
 use web3_proxy::rpcs::blockchain::ArcBlock;
 use web3_proxy_cli::test_utils::{TestAnvil, TestApp};
 
@@ -210,14 +210,28 @@ async fn eth_call_batch_uses_each_synced_backend() {
     let proxy = TestApp::spawn_with_balanced_rpc_count(&anvil, 2).await;
     let client = reqwest::Client::new();
 
-    let status_before: Value = client
-        .get(format!("{}status", proxy.proxy_url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status_before = loop {
+        let status: Value = client
+            .get(format!("{}status", proxy.proxy_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["balanced_rpcs"]["synced_connections"]
+            .as_array()
+            .is_some_and(|connections| connections.len() == 2)
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both backends did not synchronize"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
     let before = status_before["balanced_rpcs"]["conns"]
         .as_array()
         .unwrap()
