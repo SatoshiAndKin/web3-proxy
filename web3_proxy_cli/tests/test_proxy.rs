@@ -141,6 +141,70 @@ async fn it_starts_and_stops() {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn eth_call_batch_stays_batched_at_backend() {
+    let anvil = TestAnvil::spawn_chain(31337).await;
+    let _: Value = anvil
+        .provider
+        .raw_request("evm_mine".into(), ())
+        .await
+        .unwrap();
+    let proxy = TestApp::spawn(&anvil).await;
+    let client = reqwest::Client::new();
+
+    let status: Value = client
+        .get(format!("{}status", proxy.proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let batch_requests_before = status["balanced_rpcs"]["conns"][0]
+        ["backend_batch_requests"]
+        .as_u64()
+        .unwrap_or_default();
+
+    let response = client
+        .post(proxy.proxy_url.clone())
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&json!([
+            {
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{"to": Address::ZERO}, "latest"],
+                "id": 1
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{"to": Address::ZERO}, "latest"],
+                "id": 2
+            }
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(response.as_array().unwrap().len(), 2);
+
+    let status: Value = client
+        .get(format!("{}status", proxy.proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let batch_requests_after = status["balanced_rpcs"]["conns"][0]
+        ["backend_batch_requests"]
+        .as_u64()
+        .unwrap_or_default();
+
+    assert_eq!(batch_requests_after, batch_requests_before + 1);
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn websocket_new_heads_returns_subscription_and_delivers_block() {
     let anvil = TestAnvil::spawn_chain(31337).await;
     let _: Value = anvil
