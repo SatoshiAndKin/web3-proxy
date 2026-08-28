@@ -7,6 +7,7 @@ use crate::jsonrpc::{
 use alloy::providers::Provider;
 use anyhow::Context;
 use derive_more::From;
+use futures::future::join_all;
 use futures::Future;
 use reqwest::StatusCode;
 use std::fmt;
@@ -269,46 +270,50 @@ impl OpenRequestHandle {
         let mut responses = Vec::with_capacity(requests.len());
         let _active_request_guard = BatchActiveRequestGuard::new(self.rpc.clone(), requests.len());
 
-        for chunk in requests.chunks(chunk_size) {
-            let request_permits = self.rpc.request_permits.acquire_many(chunk.len()).await?;
-            self.rpc
-                .total_requests
-                .fetch_add(chunk.len(), atomic::Ordering::Relaxed);
-            self.rpc
-                .backend_batch_requests
-                .fetch_add(1, atomic::Ordering::Relaxed);
+        let chunks = requests.chunks(chunk_size).map(|chunk| {
+            let rpc = self.rpc.clone();
+            let client = client.clone();
+            let url = url.clone();
+            let handle = &self;
+            async move {
+                let started_at = Instant::now();
+                let result = async {
+                    let _request_permits = rpc.request_permits.acquire_many(chunk.len()).await?;
+                    rpc.total_requests
+                        .fetch_add(chunk.len(), atomic::Ordering::Relaxed);
+                    rpc.backend_batch_requests
+                        .fetch_add(1, atomic::Ordering::Relaxed);
+                    let body = sonic_rs::to_vec(chunk)?;
+                    let response = client
+                        .post(url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .send()
+                        .await?;
 
-            let body = sonic_rs::to_vec(chunk)?;
-            let started_at = Instant::now();
-            let result = async {
-                let response = client
-                    .post(url.clone())
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body)
-                    .send()
-                    .await?;
+                    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                        handle.rate_limit_for(Duration::from_secs(1));
+                    }
 
-                if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                    self.rate_limit_for(Duration::from_secs(1));
+                    let response = response.error_for_status()?;
+                    let bytes = response.bytes().await?;
+                    let chunk_responses: Vec<ParsedResponse> = sonic_rs::from_slice(&bytes)?;
+                    if chunk_responses.len() != chunk.len() {
+                        return Err(anyhow::anyhow!(
+                            "backend batch returned {} responses for {} requests",
+                            chunk_responses.len(),
+                            chunk.len()
+                        )
+                        .into());
+                    }
+                    Ok(chunk_responses)
                 }
-
-                let response = response.error_for_status()?;
-                let bytes = response.bytes().await?;
-                let chunk_responses: Vec<ParsedResponse> = sonic_rs::from_slice(&bytes)?;
-                if chunk_responses.len() != chunk.len() {
-                    return Err(anyhow::anyhow!(
-                        "backend batch returned {} responses for {} requests",
-                        chunk_responses.len(),
-                        chunk.len()
-                    )
-                    .into());
-                }
-                Ok(chunk_responses)
+                .await;
+                (result, started_at.elapsed())
             }
-            .await;
-            drop(request_permits);
+        });
 
-            let latency = started_at.elapsed();
+        for (result, latency) in join_all(chunks).await {
             match result {
                 Ok(chunk_responses) => {
                     let rpc = self.rpc.clone();
