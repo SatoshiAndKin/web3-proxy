@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use deduped_broadcast::DedupedBroadcaster;
 use futures::future::join_all;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use hashbrown::HashSet;
 use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, OwnedLazyValue};
 use std::fmt;
@@ -371,6 +372,18 @@ impl App {
             .head_block()
             .ok_or(Web3ProxyError::NoServersSynced)?;
 
+        if matches!(proxy_mode, ProxyMode::Best)
+            && requests.len() > 1
+            && requests.iter().all(|request| request.method == "eth_call")
+        {
+            if let Some(result) = self
+                .proxy_eth_call_batch(&requests, &head_block, request_id.clone())
+                .await
+            {
+                return result;
+            }
+        }
+
         // TODO: use streams and buffers so we don't overwhelm our server
         let responses = join_all(
             requests
@@ -409,6 +422,77 @@ impl App {
         }
 
         Ok((collected, collected_rpcs))
+    }
+
+    async fn proxy_eth_call_batch(
+        self: &Arc<Self>,
+        requests: &[SingleRequest],
+        head_block: &BlockHeader,
+        request_id: Option<String>,
+    ) -> Option<Web3ProxyResult<(Vec<jsonrpc::ParsedResponse>, Vec<Arc<Web3Rpc>>)>> {
+        let mut validated_requests = Vec::with_capacity(requests.len());
+        for request in requests.iter().cloned() {
+            let validated = match ValidatedRequest::new_with_app(
+                self,
+                ProxyMode::Best,
+                None,
+                request.into(),
+                Some(head_block.clone()),
+                request_id.clone(),
+            )
+            .await
+            {
+                Ok(validated) => validated,
+                Err(_) => return None,
+            };
+            validated_requests.push(validated);
+        }
+
+        if validated_requests
+            .windows(2)
+            .any(|pair| pair[0].request_blocks != pair[1].request_blocks)
+        {
+            return None;
+        }
+
+        let normalized_requests = validated_requests
+            .iter()
+            .map(|request| {
+                request
+                    .inner
+                    .jsonrpc_request()
+                    .expect("validated external request contains JSON-RPC data")
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let rpcs = match self
+            .balanced_rpcs
+            .try_rpcs_for_request(&validated_requests[0])
+            .await
+        {
+            Ok(rpcs) => rpcs,
+            Err(error) => return Some(Err(error)),
+        };
+        let stream = rpcs.to_stream();
+        pin!(stream);
+        let Some(handle) = stream.next().await else {
+            return Some(Err(Web3ProxyError::NoServersSynced));
+        };
+        let rpc = handle.clone_connection();
+
+        let responses = match handle.request_batch(&normalized_requests).await {
+            Ok(responses) => responses,
+            Err(error) => return Some(Err(error)),
+        };
+        for (request, response) in validated_requests.iter().zip(&responses) {
+            request.response.lock().backend_rpcs.push(rpc.clone());
+            let response_bytes = sonic_rs::to_string(response)
+                .expect("JSON-RPC response must serialize")
+                .len() as u64;
+            request.set_response(response_bytes);
+        }
+
+        Some(Ok((responses, vec![rpc])))
     }
 
     /// try to send transactions to the best available rpcs with protected/private mempools

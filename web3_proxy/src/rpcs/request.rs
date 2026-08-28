@@ -1,7 +1,8 @@
 use super::one::Web3Rpc;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::jsonrpc::{
-    self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
+    self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, SingleRequest,
+    ValidatedRequest,
 };
 use alloy::providers::Provider;
 use anyhow::Context;
@@ -123,6 +124,31 @@ pub struct OpenRequestHandle {
     rpc: Arc<Web3Rpc>,
 }
 
+struct BatchActiveRequestGuard {
+    rpc: Arc<Web3Rpc>,
+    extra_requests: usize,
+}
+
+impl BatchActiveRequestGuard {
+    fn new(rpc: Arc<Web3Rpc>, request_count: usize) -> Self {
+        let extra_requests = request_count.saturating_sub(1);
+        rpc.active_requests
+            .fetch_add(extra_requests, atomic::Ordering::SeqCst);
+        Self {
+            rpc,
+            extra_requests,
+        }
+    }
+}
+
+impl Drop for BatchActiveRequestGuard {
+    fn drop(&mut self) {
+        self.rpc
+            .active_requests
+            .fetch_sub(self.extra_requests, atomic::Ordering::SeqCst);
+    }
+}
+
 /// Depending on the context, RPC errors require different handling.
 #[derive(Copy, Clone, Debug, Default)]
 pub enum RequestErrorHandler {
@@ -222,6 +248,93 @@ impl OpenRequestHandle {
         }
 
         self.delay_reuse_for(duration);
+    }
+
+    /// Forward read-only JSON-RPC calls as bounded backend batch packets.
+    pub async fn request_batch(
+        self,
+        requests: &[SingleRequest],
+    ) -> Web3ProxyResult<Vec<ParsedResponse>> {
+        let client = self
+            .rpc
+            .http_client
+            .as_ref()
+            .context("backend batch forwarding requires an HTTP client")?;
+        let url = self
+            .rpc
+            .http_url
+            .clone()
+            .context("backend batch forwarding requires an HTTP URL")?;
+        let chunk_size = self.rpc.request_permits.max().max(1);
+        let mut responses = Vec::with_capacity(requests.len());
+        let _active_request_guard = BatchActiveRequestGuard::new(self.rpc.clone(), requests.len());
+
+        for chunk in requests.chunks(chunk_size) {
+            let request_permits = self.rpc.request_permits.acquire_many(chunk.len()).await?;
+            self.rpc
+                .total_requests
+                .fetch_add(chunk.len(), atomic::Ordering::Relaxed);
+            self.rpc
+                .backend_batch_requests
+                .fetch_add(1, atomic::Ordering::Relaxed);
+
+            let body = sonic_rs::to_vec(chunk)?;
+            let started_at = Instant::now();
+            let result = async {
+                let response = client
+                    .post(url.clone())
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .send()
+                    .await?;
+
+                if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                    self.rate_limit_for(Duration::from_secs(1));
+                }
+
+                let response = response.error_for_status()?;
+                let bytes = response.bytes().await?;
+                let chunk_responses: Vec<ParsedResponse> = sonic_rs::from_slice(&bytes)?;
+                if chunk_responses.len() != chunk.len() {
+                    return Err(anyhow::anyhow!(
+                        "backend batch returned {} responses for {} requests",
+                        chunk_responses.len(),
+                        chunk.len()
+                    )
+                    .into());
+                }
+                Ok(chunk_responses)
+            }
+            .await;
+            drop(request_permits);
+
+            let latency = started_at.elapsed();
+            match result {
+                Ok(chunk_responses) => {
+                    let rpc = self.rpc.clone();
+                    tokio::spawn(async move {
+                        rpc.peak_latency.as_ref().unwrap().report(latency);
+                        rpc.median_latency.as_ref().unwrap().record(latency);
+                    });
+                    responses.extend(chunk_responses);
+                }
+                Err(error) => {
+                    if let Some(transport_failure) = backend_transport_failure(&error) {
+                        warn!(
+                            rpc = %self.rpc,
+                            method = "eth_call_batch",
+                            transport_failure = %transport_failure,
+                            elapsed_ms = latency.as_millis(),
+                            "backend transport failed; delaying reuse"
+                        );
+                        self.delay_reuse_for(Duration::from_secs(1));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(responses)
     }
 
     /// Just get the response from the provider without any extra handling.

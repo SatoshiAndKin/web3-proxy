@@ -159,8 +159,7 @@ async fn eth_call_batch_stays_batched_at_backend() {
         .json()
         .await
         .unwrap();
-    let batch_requests_before = status["balanced_rpcs"]["conns"][0]
-        ["backend_batch_requests"]
+    let batch_requests_before = status["balanced_rpcs"]["conns"][0]["backend_batch_requests"]
         .as_u64()
         .unwrap_or_default();
 
@@ -196,8 +195,7 @@ async fn eth_call_batch_stays_batched_at_backend() {
         .json()
         .await
         .unwrap();
-    let batch_requests_after = status["balanced_rpcs"]["conns"][0]
-        ["backend_batch_requests"]
+    let batch_requests_after = status["balanced_rpcs"]["conns"][0]["backend_batch_requests"]
         .as_u64()
         .unwrap_or_default();
 

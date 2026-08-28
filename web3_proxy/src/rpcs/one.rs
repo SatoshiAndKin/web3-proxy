@@ -40,15 +40,33 @@ use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBeh
 use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
 
-pub(super) struct RequestPermits(Semaphore);
+pub(super) struct RequestPermits {
+    semaphore: Semaphore,
+    max: usize,
+}
 
 impl RequestPermits {
     pub(super) fn new(max_concurrent_requests: usize) -> Self {
-        Self(Semaphore::new(max_concurrent_requests))
+        Self {
+            semaphore: Semaphore::new(max_concurrent_requests),
+            max: max_concurrent_requests,
+        }
     }
 
     pub(super) async fn acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
-        self.0.acquire().await
+        self.semaphore.acquire().await
+    }
+
+    pub(super) async fn acquire_many(
+        &self,
+        permits: usize,
+    ) -> Result<SemaphorePermit<'_>, AcquireError> {
+        let permits = u32::try_from(permits).expect("backend batch chunk exceeds u32::MAX");
+        self.semaphore.acquire_many(permits).await
+    }
+
+    pub(super) fn max(&self) -> usize {
+        self.max
     }
 }
 
@@ -122,6 +140,8 @@ pub struct Web3Rpc {
     pub(super) tier: AtomicU32,
     /// Track total requests served.
     pub(super) total_requests: AtomicUsize,
+    /// Track JSON-RPC batch packets forwarded to this backend.
+    pub(super) backend_batch_requests: AtomicUsize,
     /// If the head block is too old, it is ignored.
     pub(super) max_head_block_age: Duration,
     /// Track request latency.
@@ -1511,7 +1531,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 16)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 17)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
@@ -1555,6 +1575,11 @@ impl Serialize for Web3Rpc {
         state.serialize_field(
             "total_requests",
             &self.total_requests.load(atomic::Ordering::Relaxed),
+        )?;
+
+        state.serialize_field(
+            "backend_batch_requests",
+            &self.backend_batch_requests.load(atomic::Ordering::Relaxed),
         )?;
 
         state.serialize_field(
