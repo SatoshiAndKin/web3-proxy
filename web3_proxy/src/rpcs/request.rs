@@ -8,6 +8,7 @@ use anyhow::Context;
 use derive_more::From;
 use futures::Future;
 use reqwest::StatusCode;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::Arc;
@@ -15,6 +16,74 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn, Level};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendTransportFailure {
+    HttpTimeout,
+    HttpConnect,
+    HttpStatus(StatusCode),
+    HttpBody,
+    HttpDecode,
+    HttpRequest,
+    HttpOther,
+    Io {
+        kind: std::io::ErrorKind,
+        os_code: Option<i32>,
+    },
+    Alloy,
+}
+
+impl fmt::Display for BackendTransportFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpTimeout => formatter.write_str("http_timeout"),
+            Self::HttpConnect => formatter.write_str("http_connect"),
+            Self::HttpStatus(status) => write!(formatter, "http_status_{}", status.as_u16()),
+            Self::HttpBody => formatter.write_str("http_body"),
+            Self::HttpDecode => formatter.write_str("http_decode"),
+            Self::HttpRequest => formatter.write_str("http_request"),
+            Self::HttpOther => formatter.write_str("http_other"),
+            Self::Io { kind, os_code } => {
+                write!(formatter, "io_{kind:?}")?;
+                if let Some(os_code) = os_code {
+                    write!(formatter, "_{os_code}")?;
+                }
+                Ok(())
+            }
+            Self::Alloy => formatter.write_str("alloy_transport"),
+        }
+    }
+}
+
+fn backend_transport_failure(error: &Web3ProxyError) -> Option<BackendTransportFailure> {
+    match error {
+        Web3ProxyError::Reqwest(error) if error.is_timeout() => {
+            Some(BackendTransportFailure::HttpTimeout)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_connect() => {
+            Some(BackendTransportFailure::HttpConnect)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_status() => Some(
+            BackendTransportFailure::HttpStatus(error.status().expect("status error has a status")),
+        ),
+        Web3ProxyError::Reqwest(error) if error.is_body() => {
+            Some(BackendTransportFailure::HttpBody)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_decode() => {
+            Some(BackendTransportFailure::HttpDecode)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_request() => {
+            Some(BackendTransportFailure::HttpRequest)
+        }
+        Web3ProxyError::Reqwest(_) => Some(BackendTransportFailure::HttpOther),
+        Web3ProxyError::Io(error) => Some(BackendTransportFailure::Io {
+            kind: error.kind(),
+            os_code: error.raw_os_error(),
+        }),
+        Web3ProxyError::AlloyTransport(_) => Some(BackendTransportFailure::Alloy),
+        _ => None,
+    }
+}
 
 fn history_error_for_request(
     request: &ValidatedRequest,
@@ -284,14 +353,17 @@ impl OpenRequestHandle {
 
         let mut response = self._request().await;
 
-        if matches!(
-            &response,
-            Err(Web3ProxyError::Reqwest(_)
-                | Web3ProxyError::Io(_)
-                | Web3ProxyError::AlloyTransport(_))
-        ) {
-            warn!(rpc = %self.rpc, "backend transport failed; delaying reuse");
-            self.delay_reuse_for(Duration::from_secs(1));
+        if let Err(error) = &response {
+            if let Some(transport_failure) = backend_transport_failure(error) {
+                warn!(
+                    rpc = %self.rpc,
+                    method = %self.web3_request.inner.method(),
+                    transport_failure = %transport_failure,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "backend transport failed; delaying reuse"
+                );
+                self.delay_reuse_for(Duration::from_secs(1));
+            }
         }
 
         // measure successes and errors
