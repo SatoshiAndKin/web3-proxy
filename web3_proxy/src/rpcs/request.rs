@@ -719,6 +719,18 @@ mod tests {
         )
     }
 
+    async fn held_json_rpc_batch(
+        State(state): State<HeldRequestState>,
+    ) -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+        state.started.send(()).unwrap();
+        state.release.acquire().await.unwrap().forget();
+
+        (
+            [(CONTENT_TYPE, "application/json")],
+            r#"[{"jsonrpc":"2.0","id":1,"result":"0x1"},{"jsonrpc":"2.0","id":2,"result":"0x1"}]"#,
+        )
+    }
+
     fn request(method: &'static str) -> Arc<ValidatedRequest> {
         Arc::new(ValidatedRequest {
             inner: RequestOrMethod::Method(method.into(), 0),
@@ -898,6 +910,53 @@ mod tests {
         for request in requests {
             request.await.unwrap().unwrap();
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_batch_packets_fill_available_concurrency() {
+        let (started_sender, mut started_receiver) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let router = Router::new()
+            .route("/", post(held_json_rpc_batch))
+            .with_state(HeldRequestState {
+                started: started_sender,
+                release: release.clone(),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "batch-concurrency-limited".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some(format!("http://{address}").parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            request_permits: RequestPermits::new(4, 2),
+            ..Default::default()
+        });
+        let request = Arc::new(ValidatedRequest::default());
+        let requests = (1..=4)
+            .map(|id| SingleRequest::new(id.into(), "eth_call".into(), json!([])).unwrap())
+            .collect::<Vec<_>>();
+
+        let batch = tokio::spawn(async move {
+            OpenRequestHandle::new(request, rpc, None)
+                .await
+                .request_batch(&requests)
+                .await
+        });
+
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("first backend batch packet should start");
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("second backend batch packet should use the remaining permits");
+        release.add_permits(2);
+
+        let responses = batch.await.unwrap().unwrap();
+        assert_eq!(responses.len(), 4);
         server.abort();
     }
 }
