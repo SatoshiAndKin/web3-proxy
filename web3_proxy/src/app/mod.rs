@@ -473,18 +473,44 @@ impl App {
             Ok(rpcs) => rpcs,
             Err(error) => return Some(Err(error)),
         };
-        let stream = rpcs.to_stream();
-        pin!(stream);
-        let Some(handle) = stream.next().await else {
-            return Some(Err(Web3ProxyError::NoServersSynced));
-        };
-        let rpc = handle.clone_connection();
+        let mut handles = rpcs.open_batch_handles().await;
+        if handles.is_empty() {
+            let stream = rpcs.to_stream();
+            pin!(stream);
+            let Some(handle) = stream.next().await else {
+                return Some(Err(Web3ProxyError::NoServersSynced));
+            };
+            handles.push(handle);
+        }
 
-        let responses = match handle.request_batch(&normalized_requests).await {
-            Ok(responses) => responses,
-            Err(error) => return Some(Err(error)),
-        };
-        for (request, response) in validated_requests.iter().zip(&responses) {
+        let requests_per_backend = normalized_requests.len().div_ceil(handles.len());
+        let batches = normalized_requests
+            .chunks(requests_per_backend)
+            .zip(handles)
+            .map(|(requests, handle)| async move {
+                let rpc = handle.clone_connection();
+                handle
+                    .request_batch(requests)
+                    .await
+                    .map(|responses| (rpc, responses))
+            });
+        let mut responses = Vec::with_capacity(normalized_requests.len());
+        let mut response_rpcs = Vec::with_capacity(normalized_requests.len());
+        let mut used_rpcs = Vec::new();
+        for result in join_all(batches).await {
+            let (rpc, batch_responses) = match result {
+                Ok(result) => result,
+                Err(error) => return Some(Err(error)),
+            };
+            response_rpcs.extend(std::iter::repeat_n(rpc.clone(), batch_responses.len()));
+            used_rpcs.push(rpc);
+            responses.extend(batch_responses);
+        }
+        for ((request, response), rpc) in validated_requests
+            .iter()
+            .zip(&responses)
+            .zip(&response_rpcs)
+        {
             request.response.lock().backend_rpcs.push(rpc.clone());
             let response_bytes = sonic_rs::to_string(response)
                 .expect("JSON-RPC response must serialize")
@@ -492,7 +518,7 @@ impl App {
             request.set_response(response_bytes);
         }
 
-        Some(Ok((responses, vec![rpc])))
+        Some(Ok((responses, used_rpcs)))
     }
 
     /// try to send transactions to the best available rpcs with protected/private mempools

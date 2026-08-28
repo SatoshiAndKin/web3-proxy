@@ -999,6 +999,22 @@ fn best_rpc<'a>(rpc_a: &'a Arc<Web3Rpc>, rpc_b: &'a Arc<Web3Rpc>) -> &'a Arc<Web
 */
 
 impl RpcsForRequest {
+    pub async fn open_batch_handles(&self) -> Vec<OpenRequestHandle> {
+        let mut handles = Vec::with_capacity(self.inner.len());
+        for rpc in &self.inner {
+            match rpc.try_request_handle(&self.request, None, false).await {
+                Ok(OpenRequestResult::Handle(handle)) => handles.push(handle),
+                Ok(
+                    OpenRequestResult::RetryAt(_)
+                    | OpenRequestResult::Lagged(_)
+                    | OpenRequestResult::Failed,
+                )
+                | Err(_) => {}
+            }
+        }
+        handles
+    }
+
     pub fn to_stream(self) -> impl Stream<Item = OpenRequestHandle> {
         stream! {
             trace!("entered stream");
