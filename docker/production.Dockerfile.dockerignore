@@ -1,0 +1,33 @@
+# Deny all files, then allow only build inputs. No .env, Git metadata, private
+# configurations, state directories, or local binaries enter the build context.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!LICENSE
+!deduped_broadcast/
+!deduped_broadcast/Cargo.toml
+!deduped_broadcast/src/
+!deduped_broadcast/src/**/
+!deduped_broadcast/src/**/*.rs
+!latency/
+!latency/Cargo.toml
+!latency/src/
+!latency/src/**/
+!latency/src/**/*.rs
+!web3_proxy/
+!web3_proxy/Cargo.toml
+!web3_proxy/src/
+!web3_proxy/src/**/
+!web3_proxy/src/**/*.rs
+!web3_proxy/src/block_relay/fixtures/electra.json
+!web3_proxy/src/block_relay/fixtures/test-jwt.hex
+!web3_proxy_cli/
+!web3_proxy_cli/Cargo.toml
+!web3_proxy_cli/src/
+!web3_proxy_cli/src/**/
+!web3_proxy_cli/src/**/*.rs
+!web3_proxy_cli/tests/
+!web3_proxy_cli/tests/**/*.rs
+!docs/
+!docs/block-relay.example.toml
