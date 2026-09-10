@@ -21,7 +21,7 @@ use hashbrown::HashMap;
 use sonic_rs::{json, JsonValueTrait};
 use std::str::from_utf8;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::select;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock as AsyncRwLock};
 use tracing::trace;
@@ -95,10 +95,20 @@ async fn _websocket_handler(
     app: Arc<App>,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
+    if *app.frontend_shutdown.borrow() {
+        return Ok(axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
     match ws_upgrade {
-        Ok(ws) => Ok(ws
-            .on_upgrade(move |socket| proxy_web3_socket(app, proxy_mode, socket))
-            .into_response()),
+        Ok(ws) => {
+            // Register before the upgrade, so shutdown also waits for pending handshakes.
+            let token = app.frontend_tasks.token();
+            Ok(ws
+                .on_upgrade(move |socket| async move {
+                    let _token = token;
+                    proxy_web3_socket(app, proxy_mode, socket).await;
+                })
+                .into_response())
+        }
         Err(_) => {
             if let Some(redirect) = &app.config.redirect_public_url {
                 // this is not a websocket. redirect to a friendly page
@@ -120,8 +130,29 @@ async fn proxy_web3_socket(app: Arc<App>, proxy_mode: ProxyMode, socket: WebSock
     // TODO: this should be bounded. async blocking on too many messages would be fine
     let (response_sender, response_receiver) = mpsc::channel::<Message>(buffer);
 
-    tokio::spawn(write_web3_socket(response_receiver, ws_tx));
-    tokio::spawn(read_web3_socket(app, proxy_mode, ws_rx, response_sender));
+    let mut shutdown = app.frontend_shutdown.subscribe();
+    let (close_sender, close_receiver) = broadcast::channel(1);
+    let connection = async {
+        tokio::join!(
+            write_web3_socket(response_receiver, ws_tx, close_sender.clone()),
+            read_web3_socket(
+                app,
+                proxy_mode,
+                ws_rx,
+                response_sender,
+                close_sender,
+                close_receiver
+            ),
+        );
+    };
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = &mut connection => {},
+        _ = async { let _ = shutdown.wait_for(|stopping| *stopping).await; } => {
+            // Leave room for the process's 25-second drain and runtime cleanup.
+            let _ = tokio::time::timeout(Duration::from_secs(23), &mut connection).await;
+        }
+    }
 }
 
 async fn websocket_proxy_web3_rpc(
@@ -282,14 +313,19 @@ async fn read_web3_socket(
     proxy_mode: ProxyMode,
     mut ws_rx: SplitStream<WebSocket>,
     response_sender: mpsc::Sender<Message>,
+    close_sender: broadcast::Sender<bool>,
+    mut close_receiver: broadcast::Receiver<bool>,
 ) {
     let subscriptions = Arc::new(AsyncRwLock::new(HashMap::new()));
     let subscription_count = Arc::new(AtomicU64::new(1));
 
-    let (close_sender, mut close_receiver) = broadcast::channel(1);
+    let mut shutdown = app.frontend_shutdown.subscribe();
+    let mut requests = tokio::task::JoinSet::new();
 
     loop {
         select! {
+            _ = shutdown.wait_for(|stopping| *stopping) => break,
+            _ = requests.join_next(), if !requests.is_empty() => {},
             msg = ws_rx.next() => {
                 if let Some(Ok(msg)) = msg {
                     // clone things so we can handle multiple messages in parallel
@@ -375,7 +411,7 @@ async fn read_web3_socket(
                         };
                     };
 
-                    tokio::spawn(f);
+                    requests.spawn(f);
                 } else {
                     break;
                 }
@@ -385,11 +421,31 @@ async fn read_web3_socket(
             }
         }
     }
+    if *shutdown.borrow() {
+        let _ = tokio::time::timeout(Duration::from_secs(20), async {
+            while requests.join_next().await.is_some() {}
+        })
+        .await;
+    }
+    requests.abort_all();
+    while requests.join_next().await.is_some() {}
+    for (_, subscription) in subscriptions.write().await.drain() {
+        subscription.abort();
+    }
+    if *shutdown.borrow() {
+        use axum::extract::ws::{close_code, CloseFrame};
+        let close = Message::Close(Some(CloseFrame {
+            code: close_code::AWAY,
+            reason: "server shutdown".into(),
+        }));
+        let _ = tokio::time::timeout(Duration::from_secs(1), response_sender.send(close)).await;
+    }
 }
 
 async fn write_web3_socket(
     mut response_rx: mpsc::Receiver<Message>,
     mut ws_tx: SplitSink<WebSocket, Message>,
+    close_sender: broadcast::Sender<bool>,
 ) {
     // TODO: increment counter for open websockets
 
@@ -403,6 +459,7 @@ async fn write_web3_socket(
             break;
         };
     }
+    let _ = close_sender.send(true);
 
     // TODO: decrement counter for open websockets
 }

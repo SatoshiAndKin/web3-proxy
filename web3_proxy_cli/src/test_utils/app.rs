@@ -10,7 +10,6 @@ use web3_proxy::prelude::reqwest;
 use web3_proxy::prelude::sonic_rs::{self, json};
 use web3_proxy::prelude::tokio::{
     runtime::Builder,
-    sync::broadcast::{self, error::SendError},
     sync::watch,
     time::{sleep, timeout_at, Instant},
 };
@@ -24,7 +23,7 @@ pub struct TestApp {
     pub proxy_provider: AlloyHttpProvider,
     pub proxy_url: Url,
     head_block_receiver: watch::Receiver<Option<BlockHeader>>,
-    shutdown_sender: broadcast::Sender<()>,
+    shutdown_sender: watch::Sender<bool>,
 }
 
 impl TestApp {
@@ -88,7 +87,7 @@ impl TestApp {
             extra: Default::default(),
         };
 
-        let (shutdown_sender, _) = broadcast::channel(1);
+        let (shutdown_sender, _) = watch::channel(false);
         let (watch_consensus_head_sender, head_block_receiver) = watch::channel(None);
         let frontend_port = Arc::new(AtomicU16::new(0));
 
@@ -161,12 +160,12 @@ impl TestApp {
         }
     }
 
-    pub fn stop(&self) -> Result<usize, SendError<()>> {
-        self.shutdown_sender.send(())
+    pub fn stop(&self) {
+        self.shutdown_sender.send_replace(true);
     }
 
     pub fn wait_for_stop(mut self) {
-        let _ = self.stop();
+        self.stop();
         if let Some(handle) = self.proxy_handle.take() {
             handle.join().unwrap().unwrap();
         }
@@ -175,6 +174,6 @@ impl TestApp {
 
 impl Drop for TestApp {
     fn drop(&mut self) {
-        let _ = self.stop();
+        self.stop();
     }
 }

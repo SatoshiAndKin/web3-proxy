@@ -81,7 +81,7 @@ pub async fn health(State(app): State<Arc<App>>) -> Result<impl IntoResponse, We
 
 #[inline]
 async fn _health(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
-    if app.balanced_rpcs.synced() {
+    if !*app.frontend_shutdown.borrow() && app.balanced_rpcs.synced() {
         (StatusCode::OK, CONTENT_TYPE_PLAIN, HEALTH_OK.clone())
     } else {
         (

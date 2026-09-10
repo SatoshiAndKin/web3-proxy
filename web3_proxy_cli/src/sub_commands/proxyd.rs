@@ -29,7 +29,7 @@ pub struct ProxydSubCommand {
 
 impl ProxydSubCommand {
     pub async fn main(self, top_config: TopConfig, top_config_path: PathBuf) -> anyhow::Result<()> {
-        let (frontend_shutdown_sender, _) = broadcast::channel(1);
+        let (frontend_shutdown_sender, _) = watch::channel(false);
         let (watch_consensus_head_sender, _) = watch::channel(None);
         // TODO: i think there is a small race. if config_path changes
 
@@ -49,7 +49,7 @@ impl ProxydSubCommand {
         top_config: TopConfig,
         top_config_path: Option<PathBuf>,
         frontend_port: Arc<AtomicU16>,
-        frontend_shutdown_sender: broadcast::Sender<()>,
+        frontend_shutdown_sender: watch::Sender<bool>,
         watch_consensus_head_sender: watch::Sender<
             Option<web3_proxy::rpcs::blockchain::BlockHeader>,
         >,
@@ -61,11 +61,7 @@ impl ProxydSubCommand {
         // we do not need this receiver. new receivers are made by `shutdown_sender.subscribe()`
         let (app_shutdown_sender, _app_shutdown_receiver) = broadcast::channel(1);
 
-        let frontend_shutdown_receiver = frontend_shutdown_sender.subscribe();
-
-        // TODO: should we use a watch or broadcast for these?
-        let (frontend_shutdown_complete_sender, mut frontend_shutdown_complete_receiver) =
-            broadcast::channel(1);
+        let mut frontend_shutdown_receiver = frontend_shutdown_sender.subscribe();
 
         let mut head_block_receiver = watch_consensus_head_sender.subscribe();
 
@@ -74,6 +70,7 @@ impl ProxydSubCommand {
             frontend_port,
             top_config.clone(),
             app_shutdown_sender.clone(),
+            frontend_shutdown_sender.clone(),
             watch_consensus_head_sender,
         )
         .await?;
@@ -133,6 +130,9 @@ impl ProxydSubCommand {
         let max_wait_until = Instant::now() + Duration::from_secs(60);
         loop {
             select! {
+                _ = frontend_shutdown_receiver.wait_for(|stopping| *stopping) => break,
+                _ = terminate_stream.recv() => { frontend_shutdown_sender.send_replace(true); break; },
+                _ = tokio::signal::ctrl_c() => { frontend_shutdown_sender.send_replace(true); break; },
                 _ = sleep_until(max_wait_until) => {
                     // Sentry captures this panic when it is configured.
                     panic!("oh no! we never got a head block!");
@@ -154,11 +154,7 @@ impl ProxydSubCommand {
         }
 
         // start the frontend port
-        let frontend_handle = tokio::spawn(frontend::serve(
-            spawned_app.app.clone(),
-            frontend_shutdown_receiver,
-            frontend_shutdown_complete_sender,
-        ));
+        let mut frontend_handle = tokio::spawn(frontend::serve(spawned_app.app.clone()));
 
         if let Some(start_script) = spawned_app.app.config.start_script.as_ref() {
             let start_script = Command::new(start_script)
@@ -209,7 +205,7 @@ impl ProxydSubCommand {
             //         }
             //     }
             // }
-            x = frontend_handle => {
+            x = &mut frontend_handle => {
                 frontend_exited = true;
                 match x {
                     Ok(Ok(_)) => info!("frontend exited"),
@@ -260,21 +256,17 @@ impl ProxydSubCommand {
             }
         };
 
-        // TODO: This is also not there on the main branch
-        // if a future above completed, make sure the frontend knows to start turning off
+        frontend_shutdown_sender.send_replace(true);
+        let deadline = Instant::now() + Duration::from_secs(25);
         if !frontend_exited {
-            if let Err(err) = frontend_shutdown_sender.send(()) {
-                // TODO: this is actually expected if the frontend is already shut down
-                warn!(?err, "shutdown sender");
-            };
-        }
-
-        // TODO: Also not there on main branch
-        // TODO: wait until the frontend completes
-        if let Err(err) = frontend_shutdown_complete_receiver.recv().await {
-            warn!(?err, "shutdown completition");
-        } else {
-            info!("frontend exited gracefully");
+            match tokio::time::timeout_at(deadline, &mut frontend_handle).await {
+                Ok(Ok(Ok(()))) => info!("frontend exited gracefully"),
+                _ => {
+                    frontend_handle.abort();
+                    exited_with_err = true;
+                    error!("frontend failed to drain within its deadline");
+                }
+            }
         }
 
         // now that the frontend is complete, tell all the other futures to finish
@@ -288,7 +280,21 @@ impl ProxydSubCommand {
             spawned_app.background_handles.len()
         );
         let mut background_errors = 0;
-        while let Some(x) = spawned_app.background_handles.next().await {
+        loop {
+            let x = match tokio::time::timeout_at(deadline, spawned_app.background_handles.next())
+                .await
+            {
+                Ok(Some(x)) => x,
+                Ok(None) => break,
+                Err(_) => {
+                    for handle in spawned_app.background_handles.iter() {
+                        handle.abort();
+                    }
+                    background_errors += 1;
+                    error!("background shutdown deadline exceeded");
+                    break;
+                }
+            };
             match x {
                 Err(e) => {
                     error!("{:?}", e);

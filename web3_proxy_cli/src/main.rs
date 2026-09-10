@@ -242,7 +242,7 @@ fn main() -> anyhow::Result<()> {
     let num_workers = rt.metrics().num_workers();
     info!("num_workers: {}", num_workers);
 
-    rt.block_on(async {
+    let result = rt.block_on(async {
         match cli_config.sub_command {
             SubCommand::BlockRelay(command) => {
                 command
@@ -267,7 +267,10 @@ fn main() -> anyhow::Result<()> {
                 command.main().await
             }
         }
-    })
+    });
+    // Blocking disk or crypto work must not hold container shutdown indefinitely.
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
 }
 
 fn load_dotenv() -> anyhow::Result<()> {
