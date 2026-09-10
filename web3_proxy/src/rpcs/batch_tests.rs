@@ -1,10 +1,12 @@
 use super::consensus::RankedRpcs;
 use super::many::{Web3Rpcs, Web3RpcsSpawnConfig};
 use super::one::{RequestPermits, Web3Rpc};
+use super::request::OpenRequestHandle;
 use crate::app::App;
 use crate::config::AppConfig;
+use crate::errors::Web3ProxyError;
 use crate::frontend::rpc_proxy_ws::ProxyMode;
-use crate::jsonrpc::{JsonRpcRequestEnum, SingleRequest};
+use crate::jsonrpc::{JsonRpcRequestEnum, SingleRequest, ValidatedRequest};
 use crate::rpcs::blockchain::BlockHeader;
 use alloy::rpc::types::Header;
 use arc_swap::ArcSwapOption;
@@ -93,6 +95,10 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new(concurrency: usize, packet_size: usize) -> Self {
+        Self::named("controlled-backend", concurrency, packet_size).await
+    }
+
+    async fn named(name: &str, concurrency: usize, packet_size: usize) -> Self {
         let (sender, incoming) = mpsc::unbounded_channel();
         let router = Router::new().route("/", post(receive)).with_state(sender);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -100,7 +106,7 @@ impl Harness {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let (hard_limit_until, _) = watch::channel(Instant::now());
         let rpc = Arc::new(Web3Rpc {
-            name: "controlled-backend".into(),
+            name: name.into(),
             healthy: AtomicBool::new(true),
             http_client: Some(reqwest::Client::new()),
             http_url: Some(format!("http://{address}").parse().unwrap()),
@@ -163,10 +169,7 @@ impl Harness {
     fn start(&self, count: usize) -> JoinHandle<Value> {
         let app = self.app.clone();
         tokio::spawn(async move {
-            let requests = (0..count).map(|i| SingleRequest::new(
-                ((i % 2) as u64).into(), "eth_call".into(),
-                sonic_rs::from_str(&json!([{"to":"0x0000000000000000000000000000000000000000", "data":format!("0x{i:04x}")}, "latest"]).to_string()).unwrap(),
-            ).unwrap()).collect();
+            let requests = (0..count).map(client_call).collect();
             let (_, response, _) = app
                 .proxy_web3_rpc(ProxyMode::Best, JsonRpcRequestEnum::Batch(requests), None)
                 .await
@@ -194,6 +197,45 @@ impl Harness {
     fn idle(&self) {
         assert_eq!(self.rpc.active_requests.load(Ordering::SeqCst), 0);
     }
+}
+
+fn client_call(index: usize) -> SingleRequest {
+    SingleRequest::new(
+        ((index % 2) as u64).into(),
+        "eth_call".into(),
+        sonic_rs::json!([{
+            "to": "0x0000000000000000000000000000000000000000",
+            "data": format!("0x{index:04x}"),
+        }, "latest"]),
+    )
+    .unwrap()
+}
+
+fn timeout_answer(id: Value) -> Value {
+    json!({"jsonrpc":"2.0", "id":id, "error":{"code":408, "message":"request timed out"}})
+}
+
+/// Timeout diagnostics include elapsed time and backend metadata. Compare the
+/// complete stable response contract while leaving those diagnostics intact.
+fn assert_timeout_responses(mut actual: Value, expected: Value) {
+    let actual = actual.as_array_mut().unwrap();
+    let expected = expected.as_array().unwrap();
+    assert_eq!(actual.len(), expected.len());
+    for (index, (response, expected)) in actual.iter_mut().zip(expected).enumerate() {
+        if response["error"]["code"] == 408 {
+            let error = response["error"].as_object_mut().unwrap();
+            let diagnostics = error.remove("data").expect("timeouts include diagnostics");
+            assert_eq!(diagnostics["duration"], Value::Null);
+            assert!(diagnostics["request"].is_object());
+        }
+        assert_eq!(response, expected, "response at index {index}");
+    }
+}
+
+async fn advance_to(target: Instant) {
+    tokio::time::pause();
+    tokio::time::advance(target.saturating_duration_since(Instant::now())).await;
+    tokio::time::resume();
 }
 
 fn assert_answers(response: Value, count: usize) {
@@ -273,17 +315,29 @@ async fn batch_failure_recovers_while_other_packet_is_blocked() {
 #[tokio::test]
 async fn batch_mixed_errors_retry_only_rate_limit() {
     let mut h = Harness::new(4, 64).await;
-    let task = h.start(3);
+    let task = h.start(4);
     let packet = h.next().await;
     let calls = packet.body.as_array().unwrap();
     let expected_retry = calls[2]["params"].clone();
     let response = json!([
         answer(&calls[0]),
         {"jsonrpc":"2.0","id":calls[1]["id"],"error":{"code":3,"message":"execution reverted"}},
-        {"jsonrpc":"2.0","id":calls[2]["id"],"error":{"code":-32005,"message":"rate limit exceeded"}}
+        {"jsonrpc":"2.0","id":calls[2]["id"],"error":{"code":-32005,"message":"rate limit exceeded"}},
+        {"jsonrpc":"2.0","id":calls[3]["id"],"error":{"code":-32602,"message":"invalid argument","data":{"field":"to"}}}
     ]);
+    let rejected_at = Instant::now();
     packet.respond(response);
+    assert!(
+        timeout(Duration::from_millis(900), h.incoming.recv())
+            .await
+            .is_err(),
+        "the backend must receive no traffic during cooldown"
+    );
     let retry = h.next().await;
+    assert!(
+        Instant::now() >= rejected_at + Duration::from_secs(1),
+        "retry must wait for the full backend cooldown"
+    );
     assert_eq!(retry.body["params"], expected_retry);
     assert_eq!(retry.body["id"], 0);
     retry.succeed();
@@ -292,7 +346,8 @@ async fn batch_mixed_errors_retry_only_rate_limit() {
         json!([
             {"jsonrpc":"2.0","id":0,"result":"0x0000"},
             {"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}},
-            {"jsonrpc":"2.0","id":0,"result":"0x0002"}
+            {"jsonrpc":"2.0","id":0,"result":"0x0002"},
+            {"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid argument","data":{"field":"to"}}}
         ])
     );
     h.quiet().await;
@@ -398,11 +453,12 @@ async fn batch_stalled_packet_and_queue_keep_original_deadline() {
         .await
         .expect("original deadline must end stalled and queued packets")
         .unwrap();
-    assert_eq!(response.as_array().unwrap().len(), 129);
-    for (i, call) in response.as_array().unwrap().iter().enumerate() {
-        assert_eq!(call["id"], i % 2);
-        assert!(call["error"].is_object());
-    }
+    assert_timeout_responses(
+        response,
+        Value::Array((0..129).map(|i| timeout_answer(json!(i % 2))).collect()),
+    );
+    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 64);
+    assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
     drop(packet);
     h.quiet().await;
     h.idle();
@@ -413,10 +469,9 @@ async fn batch_stalled_packet_and_queue_keep_original_deadline() {
 
 #[tokio::test]
 async fn batch_final_failure_preserves_other_packet_answers() {
-    let mut h = Harness::new(4, 2).await;
+    let mut h = Harness::new(1, 2).await;
     let task = h.start(4);
     let first = h.next().await;
-    let second = h.next().await;
     let completed = first
         .body
         .as_array()
@@ -425,9 +480,9 @@ async fn batch_final_failure_preserves_other_packet_answers() {
         .map(|c| c["params"][0]["data"].clone())
         .collect::<Vec<_>>();
     first.succeed();
-    second.reject();
+    h.next().await.reject();
     let retry_a = h.next().await;
-    let retry_b = h.next().await;
+    h.quiet().await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::time::resume();
@@ -435,16 +490,19 @@ async fn batch_final_failure_preserves_other_packet_answers() {
         .await
         .expect("fallback must use the original deadline")
         .unwrap();
-    for (i, call) in response.as_array().unwrap().iter().enumerate() {
-        assert_eq!(call["id"], i % 2);
-        let value = json!(format!("0x{i:04x}"));
-        if completed.contains(&value) {
-            assert_eq!(call["result"], value);
-        } else {
-            assert!(call["error"].is_object());
-        }
-    }
-    drop((retry_a, retry_b));
+    let expected = (0..4)
+        .map(|i| {
+            let value = json!(format!("0x{i:04x}"));
+            if completed.contains(&value) {
+                json!({"jsonrpc":"2.0", "id":i % 2, "result":value})
+            } else {
+                timeout_answer(json!(i % 2))
+            }
+        })
+        .collect();
+    assert_timeout_responses(response, Value::Array(expected));
+    drop(retry_a);
+    h.quiet().await;
     h.idle();
 }
 
@@ -467,9 +525,12 @@ async fn batch_large_fallback_error_is_checked_before_success() {
 
 #[tokio::test]
 async fn batch_large_fallback_body_obeys_original_deadline() {
-    let mut h = Harness::new(4, 64).await;
+    let mut h = Harness::new(1, 64).await;
     let task = h.start(2);
     h.next().await.reject();
+    let completed = h.next().await;
+    let success = answer(&completed.body);
+    completed.succeed();
     let first = h.next().await;
     let first_id = first.body["id"].clone();
     let prefix = format!(
@@ -489,7 +550,6 @@ async fn batch_large_fallback_body_obeys_original_deadline() {
                 .unwrap(),
         )
         .unwrap();
-    h.next().await.succeed();
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::time::resume();
@@ -497,11 +557,16 @@ async fn batch_large_fallback_body_obeys_original_deadline() {
         .await
         .expect("reading a large fallback must end at the original deadline")
         .unwrap();
-    assert!(response
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r["id"] == first_id && r["error"].is_object()));
+    let expected = (0..2)
+        .map(|i| {
+            if success["id"] == i {
+                success.clone()
+            } else {
+                timeout_answer(json!(i))
+            }
+        })
+        .collect();
+    assert_timeout_responses(response, Value::Array(expected));
     drop(sender);
     h.idle();
 }
@@ -729,4 +794,183 @@ async fn batch_disconnect_after_connection_window_keeps_request_data() {
     retried.sort_by_key(Value::to_string);
     assert_eq!(retried, expected);
     assert_answers(task.await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn batch_failure_at_fifty_seconds_leaves_ten_seconds_for_active_and_queued_fallback() {
+    let mut h = Harness::new(1, 64).await;
+    let started = Instant::now();
+    let mut task = h.start(2);
+    let packet = h.next().await;
+    // Validation starts between task creation and the first backend packet.
+    let deadline_upper_bound = Instant::now() + Duration::from_secs(60);
+    advance_to(started + Duration::from_secs(50)).await;
+    packet.reject();
+    let active = h.next().await;
+    assert!(active.body.is_object());
+    h.quiet().await;
+    advance_to(started + Duration::from_secs(59)).await;
+    assert!(
+        timeout(Duration::from_millis(50), &mut task).await.is_err(),
+        "fallback must remain active while the original request has time left"
+    );
+    advance_to(deadline_upper_bound).await;
+    let response = timeout(Duration::from_millis(500), task)
+        .await
+        .expect("fallback must end at the original deadline, not sixty seconds after the retry")
+        .unwrap();
+    assert_timeout_responses(
+        response,
+        json!([timeout_answer(json!(0)), timeout_answer(json!(1))]),
+    );
+    drop(active);
+    h.quiet().await;
+    assert_eq!(
+        h.rpc.total_requests.load(Ordering::Relaxed),
+        3,
+        "the queued fallback must not reach the backend after expiry"
+    );
+    h.idle();
+}
+
+#[tokio::test]
+async fn batch_failure_uses_another_backend_without_changing_the_selected_block() {
+    let mut first = Harness::named("backend-a", 1, 2).await;
+    let mut second = Harness::named("backend-b", 1, 2).await;
+    let task = first.start(4);
+    let completed = first.next().await;
+    completed.succeed();
+    let failed = first.next().await;
+    let mut expected_calls = failed.body.as_array().unwrap().clone();
+    for call in &mut expected_calls {
+        let index = u64::from_str_radix(
+            call["params"][0]["data"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        call["id"] = json!(index % 2);
+        assert_eq!(call["params"][1], "0x2a");
+    }
+    // Keep A present but unavailable. B becomes ready at a newer head.
+    first.rpc.healthy.store(false, Ordering::SeqCst);
+    let mut header: Header = Header::default();
+    header.inner.number = 43;
+    let head = BlockHeader::new(Arc::new(header));
+    first
+        .app
+        .balanced_rpcs
+        .watch_head_block
+        .as_ref()
+        .unwrap()
+        .send_replace(Some(head.clone()));
+    first
+        .app
+        .balanced_rpcs
+        .by_name
+        .write()
+        .insert(second.rpc.name.clone(), second.rpc.clone());
+    first
+        .app
+        .balanced_rpcs
+        .watch_ranked_rpcs
+        .send_replace(Some(Arc::new(RankedRpcs::from_rpcs(
+            vec![first.rpc.clone(), second.rpc.clone()],
+            Some(head),
+            false,
+        ))));
+    failed.reject();
+    let mut retried = Vec::new();
+    for _ in 0..expected_calls.len() {
+        let call = second.next().await;
+        assert!(call.body.is_object());
+        retried.push(call.body.clone());
+        call.succeed();
+    }
+    retried.sort_by_key(Value::to_string);
+    expected_calls.sort_by_key(Value::to_string);
+    assert_eq!(retried, expected_calls);
+    assert_answers(task.await.unwrap(), 4);
+    first.quiet().await;
+    second.quiet().await;
+    assert_eq!(first.rpc.total_requests.load(Ordering::Relaxed), 4);
+    assert_eq!(first.rpc.backend_batch_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(second.rpc.total_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(second.rpc.backend_batch_requests.load(Ordering::Relaxed), 0);
+    first.idle();
+    second.idle();
+}
+
+#[tokio::test]
+async fn batch_earliest_deadline_expires_only_the_call_without_remaining_time() {
+    let mut h = Harness::new(1, 64).await;
+    let mut requests = Vec::new();
+    for (index, lifetime) in [10, 60].into_iter().enumerate() {
+        requests.push(
+            ValidatedRequest::new_with_app(
+                &h.app,
+                ProxyMode::Best,
+                Some(Duration::from_secs(lifetime)),
+                client_call(index).into(),
+                h.app.balanced_rpcs.head_block(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let earliest = requests[0].expire_at();
+    let later = requests[1].expire_at();
+    let handle = OpenRequestHandle::new(requests[0].clone(), h.rpc.clone(), None).await;
+    let packet_requests = requests.clone();
+    let packet_task = tokio::spawn(async move { handle.request_batch(&packet_requests).await });
+    let packet = h.next().await;
+    advance_to(earliest).await;
+    let result = timeout(Duration::from_millis(500), packet_task)
+        .await
+        .expect("the earliest call deadline must stop the packet")
+        .unwrap();
+    assert!(
+        matches!(result, Err(Web3ProxyError::Timeout(None))),
+        "{result:?}"
+    );
+    assert!(Instant::now() < later);
+    h.idle();
+    let expired = h
+        .app
+        .balanced_rpcs
+        .continue_request::<Arc<sonic_rs::OwnedLazyValue>>(&requests[0])
+        .await;
+    assert!(
+        matches!(expired, Err(Web3ProxyError::Timeout(None))),
+        "{expired:?}"
+    );
+    let balanced = h.app.balanced_rpcs.clone();
+    let remaining = requests[1].clone();
+    let retry_task = tokio::spawn(async move {
+        balanced
+            .continue_request::<Arc<sonic_rs::OwnedLazyValue>>(&remaining)
+            .await
+    });
+    let retry = h.next().await;
+    assert_eq!(
+        retry.body,
+        json!({"jsonrpc":"2.0", "id":1, "method":"eth_call",
+        "params":[{"to":"0x0000000000000000000000000000000000000000","data":"0x0001"}, "0x2a"]})
+    );
+    retry.succeed();
+    let response = retry_task.await.unwrap().unwrap().parsed().await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&sonic_rs::to_string(&response).unwrap()).unwrap(),
+        json!({"jsonrpc":"2.0","id":1,"result":"0x0001"})
+    );
+    assert_eq!(requests[0].expire_at(), earliest);
+    assert_eq!(requests[1].expire_at(), later);
+    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 3);
+    assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
+    drop(packet);
+    h.quiet().await;
+    h.idle();
 }
