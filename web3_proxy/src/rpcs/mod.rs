@@ -5,3 +5,6 @@ pub mod many;
 pub mod one;
 pub mod provider;
 pub mod request;
+
+#[cfg(test)]
+mod batch_tests;

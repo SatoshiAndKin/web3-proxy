@@ -210,6 +210,11 @@ impl Serialize for ValidatedRequest {
 }
 
 impl ValidatedRequest {
+    #[inline]
+    pub fn requires_log_history(&self) -> bool {
+        self.inner.method() == "eth_getLogs"
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn new_with_options(
         app: Option<&App>,
@@ -219,27 +224,30 @@ impl ValidatedRequest {
         mut request: RequestOrMethod,
         request_id: Option<String>,
         proxy_mode: ProxyMode,
+        start_instant: Instant,
     ) -> Web3ProxyResult<Arc<Self>> {
-        let start_instant = Instant::now();
-
+        let connect_timeout = Duration::from_secs(10);
+        let expire_timeout = max_wait
+            .unwrap_or_else(|| Duration::from_secs(60))
+            .max(connect_timeout);
+        if Instant::now() >= start_instant + expire_timeout {
+            return Err(Web3ProxyError::Timeout(None));
+        }
         let request_blocks = if head_block.is_none() {
             RequestBlocks::None
         } else {
             // TODO: wait for a future block if one is requested and update head_block too.
             match &mut request {
                 RequestOrMethod::Request(x) => {
-                    RequestBlocks::new(x, head_block.as_ref(), app).await?
+                    tokio::time::timeout_at(
+                        start_instant + expire_timeout,
+                        RequestBlocks::new(x, head_block.as_ref(), app),
+                    )
+                    .await??
                 }
                 _ => RequestBlocks::None,
             }
         };
-
-        // TODO: what should we do if we want a really short max_wait?
-        let connect_timeout = Duration::from_secs(10);
-
-        let expire_timeout = max_wait
-            .unwrap_or_else(|| Duration::from_secs(60))
-            .max(connect_timeout);
 
         let x = Self {
             response: Mutex::new(Default::default()),
@@ -265,6 +273,27 @@ impl ValidatedRequest {
         head_block: Option<BlockHeader>,
         request_id: Option<String>,
     ) -> Web3ProxyResult<Arc<Self>> {
+        Self::new_with_app_at(
+            app,
+            proxy_mode,
+            max_wait,
+            request,
+            head_block,
+            request_id,
+            Instant::now(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_app_at(
+        app: &App,
+        proxy_mode: ProxyMode,
+        max_wait: Option<Duration>,
+        request: RequestOrMethod,
+        head_block: Option<BlockHeader>,
+        request_id: Option<String>,
+        started_at: Instant,
+    ) -> Web3ProxyResult<Arc<Self>> {
         let chain_id = app.config.chain_id;
 
         Self::new_with_options(
@@ -275,6 +304,7 @@ impl ValidatedRequest {
             request,
             request_id,
             proxy_mode,
+            started_at,
         )
         .await
     }
@@ -310,6 +340,7 @@ impl ValidatedRequest {
                 request.into(),
                 None,
                 ProxyMode::Best,
+                Instant::now(),
             )
             .await
         }
