@@ -490,6 +490,12 @@ impl Web3Rpcs {
         F: Fn(OpenRequestHandle) -> Fut,
         Fut: Future<Output = Web3ProxyResult<jsonrpc::SingleResponse<R>>>,
     {
+        // An already-expired request must report a timeout even if routing
+        // can immediately return a different error before the timer is polled.
+        if web3_request.expired() {
+            return Err(Web3ProxyError::Timeout(None));
+        }
+
         // TODO: collect the most common error. Web3ProxyError isn't Hash + Eq though. And making it so would be a pain
         let mut errors = vec![];
 
@@ -522,6 +528,12 @@ impl Web3Rpcs {
                     errors.push(error);
                 }
             }
+        }
+
+        // The routing stream also stops at the request deadline. Preserve
+        // that cause instead of reporting unavailable data or an earlier error.
+        if web3_request.expired() {
+            return Err(Web3ProxyError::Timeout(None));
         }
 
         // TODO: find the most common error

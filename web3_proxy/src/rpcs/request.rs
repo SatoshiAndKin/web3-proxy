@@ -371,6 +371,11 @@ impl OpenRequestHandle {
         &self,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
         let request_permit = ActiveRequestGuard::acquire(&self.rpc).await?;
+        // A slot may become available in the same poll that expires the call.
+        // Check before counting or submitting a new backend attempt.
+        if self.web3_request.expired() {
+            return Err(Web3ProxyError::Timeout(None));
+        }
         self.rpc
             .total_requests
             .fetch_add(1, atomic::Ordering::Relaxed);
@@ -821,12 +826,9 @@ mod tests {
             hard_limit_until: Some(hard_limit_until),
             ..Default::default()
         });
-        let request = Arc::new(ValidatedRequest {
-            inner: RequestOrMethod::Request(
-                SingleRequest::new(1.into(), "eth_getLogs".into(), json!([])).unwrap(),
-            ),
-            ..Default::default()
-        });
+        let request = ValidatedRequest::new_internal("eth_getLogs".into(), &json!([]), None, None)
+            .await
+            .unwrap();
 
         let response = OpenRequestHandle::new(request, rpc, None)
             .await
@@ -851,12 +853,9 @@ mod tests {
             hard_limit_until: Some(hard_limit_until),
             ..Default::default()
         });
-        let request = Arc::new(ValidatedRequest {
-            inner: RequestOrMethod::Request(
-                SingleRequest::new(1.into(), "eth_call".into(), json!([])).unwrap(),
-            ),
-            ..Default::default()
-        });
+        let request = ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+            .await
+            .unwrap();
 
         let response = OpenRequestHandle::new(request, rpc, None)
             .await
@@ -913,12 +912,9 @@ mod tests {
         let mut requests = Vec::new();
         for _ in 0..3 {
             let rpc = rpc.clone();
-            let request = Arc::new(ValidatedRequest {
-                inner: RequestOrMethod::Request(
-                    SingleRequest::new(1.into(), "eth_call".into(), json!([])).unwrap(),
-                ),
-                ..Default::default()
-            });
+            let request = ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+                .await
+                .unwrap();
             requests.push(tokio::spawn(async move {
                 OpenRequestHandle::new(request, rpc, None)
                     .await
