@@ -7,9 +7,13 @@ use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::jsonrpc::{JsonRpcRequestEnum, SingleRequest};
 use crate::rpcs::blockchain::BlockHeader;
 use alloy::rpc::types::Header;
+use arc_swap::ArcSwapOption;
 use axum::body::{Body, Bytes};
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::Response;
+use axum::response::IntoResponse;
+use axum::routing::get;
 use axum::{routing::post, Router};
 use deduped_broadcast::DedupedBroadcaster;
 use latency::{PeakEwmaLatency, RollingQuantileLatency};
@@ -542,6 +546,152 @@ async fn batch_configuration_accepts_independent_positive_limits() {
                 task.abort();
                 panic!("expected {expected}");
             }
+        }
+    }
+}
+
+async fn websocket_backend(
+    upgrade: WebSocketUpgrade,
+    State(sender): State<mpsc::UnboundedSender<Value>>,
+) -> impl IntoResponse {
+    upgrade.on_upgrade(async move |mut socket| {
+        while let Some(Ok(message)) = socket.recv().await {
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let call: Value = serde_json::from_str(text).unwrap();
+            sender.send(call.clone()).unwrap();
+            socket
+                .send(Message::Text(answer(&call).to_string().into()))
+                .await
+                .unwrap();
+        }
+    })
+}
+
+#[tokio::test]
+async fn batch_ws_only_backend_uses_individual_forwarding() {
+    let mut h = Harness::new(4, 64).await;
+    let (sender, mut incoming) = mpsc::unbounded_channel();
+    let router = Router::new()
+        .route("/", get(websocket_backend))
+        .with_state(sender);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let provider = super::provider::connect_ws(format!("ws://{address}").parse().unwrap())
+        .await
+        .unwrap();
+    let (hard_limit_until, _) = watch::channel(Instant::now());
+    let rpc = Arc::new(Web3Rpc {
+        name: "ws-only".into(),
+        healthy: AtomicBool::new(true),
+        ws_provider: ArcSwapOption::from(Some(Arc::new(provider))),
+        hard_limit_until: Some(hard_limit_until),
+        request_permits: RequestPermits::new(2, 64),
+        peak_latency: Some(PeakEwmaLatency::spawn(
+            Duration::from_secs(15),
+            100,
+            Duration::from_secs(1),
+        )),
+        median_latency: Some(RollingQuantileLatency::spawn_median(100).await),
+        ..Default::default()
+    });
+    let head = h.app.balanced_rpcs.head_block();
+    h.app.balanced_rpcs.by_name.write().clear();
+    h.app
+        .balanced_rpcs
+        .by_name
+        .write()
+        .insert(rpc.name.clone(), rpc.clone());
+    h.app
+        .balanced_rpcs
+        .watch_ranked_rpcs
+        .send_replace(Some(Arc::new(RankedRpcs::from_rpcs(
+            vec![rpc.clone()],
+            head,
+            false,
+        ))));
+    h.rpc = rpc;
+    assert_answers(
+        timeout(Duration::from_secs(2), h.start(4))
+            .await
+            .unwrap()
+            .unwrap(),
+        4,
+    );
+    for _ in 0..4 {
+        let call = incoming.try_recv().unwrap();
+        assert!(call.is_object());
+        assert_eq!(call["method"], "eth_call");
+    }
+    assert!(incoming.try_recv().is_err());
+    assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 0);
+    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 4);
+    h.quiet().await;
+    h.idle();
+    server.abort();
+}
+
+#[tokio::test]
+async fn individual_stream_shares_batch_slots_until_body_ends_or_is_dropped() {
+    for finish_body in [true, false] {
+        let mut h = Harness::new(1, 64).await;
+        let request = crate::jsonrpc::ValidatedRequest::new_internal(
+            "eth_call".into(),
+            &sonic_rs::json!([]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let handle = super::request::OpenRequestHandle::new(request, h.rpc.clone(), None).await;
+        let task = tokio::spawn(handle.request::<Arc<sonic_rs::OwnedLazyValue>>());
+        let incoming = h.next().await;
+        let prefix = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{}",
+            "x".repeat(140_000)
+        );
+        let expected = format!("{prefix}\"}}");
+        let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        sender.send(Ok(Bytes::from(prefix))).await.unwrap();
+        incoming
+            .reply
+            .send(
+                Response::builder()
+                    .header("content-length", expected.len())
+                    .body(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(receiver),
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+        let response = task.await.unwrap().unwrap();
+        assert!(matches!(
+            response,
+            crate::jsonrpc::SingleResponse::Stream(_)
+        ));
+        assert_eq!(h.rpc.active_requests.load(Ordering::SeqCst), 1);
+        let batch = h.start(2);
+        h.quiet().await;
+        let mut body = response.into_response().into_body().into_data_stream();
+        if finish_body {
+            sender.send(Ok(Bytes::from_static(b"\"}"))).await.unwrap();
+            drop(sender);
+            let mut received = Vec::new();
+            while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+                received.extend(chunk.unwrap());
+            }
+            assert_eq!(received, expected.as_bytes());
+            // Keep the completed body alive: EOF itself must release the slot.
+            h.next().await.succeed();
+            assert_answers(batch.await.unwrap(), 2);
+            h.idle();
+        } else {
+            drop(body);
+            h.next().await.succeed();
+            assert_answers(batch.await.unwrap(), 2);
+            h.idle();
         }
     }
 }
