@@ -42,8 +42,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates curl libssl3 && \
-    useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin proxy && \
-    install -d -o proxy -g proxy /var/lib/web3-proxy
+    useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin web3proxy && \
+    install -d -o web3proxy -g web3proxy /var/lib/web3-proxy
 COPY --from=binary /usr/local/bin/web3_proxy_cli /usr/local/bin/web3_proxy_cli
 COPY LICENSE /usr/share/doc/web3-proxy/LICENSE
 ARG VCS_REF
