@@ -20,8 +20,9 @@ use std::cmp::{Ordering, Reverse};
 use std::sync::{atomic, Arc};
 use std::time::Duration;
 use tokio::select;
+use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant};
-use tracing::{debug, enabled, error, info, trace, warn, Level};
+use tracing::{debug, enabled, info, trace, warn, Level};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RpcRanking {
@@ -999,145 +1000,88 @@ fn best_rpc<'a>(rpc_a: &'a Arc<Web3Rpc>, rpc_b: &'a Arc<Web3Rpc>) -> &'a Arc<Web
 */
 
 impl RpcsForRequest {
-    pub async fn open_batch_handles(&self) -> Vec<OpenRequestHandle> {
-        let mut handles = Vec::with_capacity(self.inner.len());
-        for rpc in &self.inner {
-            match rpc.try_request_handle(&self.request, None, false).await {
-                Ok(OpenRequestResult::Handle(handle)) => handles.push(handle),
-                Ok(
-                    OpenRequestResult::RetryAt(_)
-                    | OpenRequestResult::Lagged(_)
-                    | OpenRequestResult::Failed,
-                )
-                | Err(_) => {}
-            }
-        }
-        handles
+    pub(crate) fn batch_connections(&self) -> Vec<Arc<Web3Rpc>> {
+        self.inner
+            .iter()
+            .chain(&self.outer)
+            .filter(|rpc| rpc.supports_batch())
+            .cloned()
+            .collect()
     }
 
-    pub fn to_stream(self) -> impl Stream<Item = OpenRequestHandle> {
+    pub fn to_stream(
+        mut self,
+        mut updates: watch::Receiver<Option<Arc<RankedRpcs>>>,
+    ) -> impl Stream<Item = OpenRequestHandle> {
         stream! {
-            trace!("entered stream");
-            let error_handler = None;
             let mut opened_any = !self.request.backend_rpcs_used().is_empty();
-
-            // todo!("be sure to set server_error if we exit without any rpcs!");
-            while if opened_any {
-                !self.request.expired()
-            } else {
-                !self.request.connect_timeout()
-            } {
+            let mut watching = true;
+            let mut exhausted = HashSet::new();
+            while if opened_any { !self.request.expired() } else { !self.request.connect_timeout() } {
                 let mut earliest_retry_at: Option<Instant> = None;
-                let mut opened = 0;
-                let mut tried = 0;
                 let mut wait_for_sync = Vec::new();
-
-                // TODO: we used to do a neat power of 2 random choices here, but it had bugs. bring that back
-                for rpcs in [self.inner.iter(), self.outer.iter()] {
-                    for best_rpc in rpcs {
-                        tried += 1;
-
-                        match best_rpc
-                            .try_request_handle(&self.request, error_handler, false)
-                            .await
-                        {
-                            Ok(OpenRequestResult::Handle(handle)) => {
-                                trace!("opened handle: {}", best_rpc);
-                                opened += 1;
-                                opened_any = true;
-                                yield handle;
-                                // Sending can put this backend into cooldown. Include that
-                                // retry time even when it was ready before we yielded it.
-                                let now = Instant::now();
-                                let retry_at = best_rpc.next_available(now);
-                                if retry_at > now {
-                                    earliest_retry_at = Some(earliest_retry_at.map_or(
-                                        retry_at, |earliest| earliest.min(retry_at),
-                                    ));
-                                }
+                let mut wait_for_capacity = Vec::new();
+                for rpc in self.inner.iter().chain(&self.outer) {
+                    if exhausted.contains(&rpc.name) { continue; }
+                    match rpc.try_request_handle(&self.request, None, false).await {
+                        Ok(OpenRequestResult::Handle(handle)) => {
+                            opened_any = true;
+                            let submitted = self.request.backend_rpcs_used().len();
+                            yield handle;
+                            if self.request.backend_rpcs_used().len() > submitted && rpc.can_submit(&self.request, false) {
+                                exhausted.insert(rpc.name.clone());
                             }
-                            Ok(OpenRequestResult::RetryAt(retry_at)) => {
-                                trace!(
-                                    "retry on {} @ {}",
-                                    best_rpc,
-                                    retry_at.duration_since(Instant::now()).as_secs_f32()
-                                );
-                                earliest_retry_at = Some(
-                                    earliest_retry_at
-                                        .map_or(retry_at, |earliest| earliest.min(retry_at)),
-                                );
+                            let now = Instant::now();
+                            let retry_at = rpc.next_available(now);
+                            if retry_at > now {
+                                earliest_retry_at = Some(earliest_retry_at.map_or(retry_at, |old| old.min(retry_at)));
                             }
-                            Ok(OpenRequestResult::Lagged(x)) => {
-                                // this will probably always be the same block, right?
-                                trace!("{} is lagged. will not work now", best_rpc);
-                                wait_for_sync.push(x);
-                            }
-                            Ok(OpenRequestResult::Failed) => {
-                                // TODO: log a warning? emit a stat?
-                                trace!("best_rpc not ready: {}", best_rpc);
-                            }
-                            Err(err) => {
-                                trace!("No request handle for {}. err={:?}", best_rpc, err);
+                        }
+                        Ok(OpenRequestResult::Busy(wait)) => {
+                            // Finding a suitable backend ends the connection window.
+                            // Its capacity wait still has the original response deadline.
+                            opened_any = true;
+                            wait_for_capacity.push(wait);
+                        }
+                        Ok(OpenRequestResult::RetryAt(retry_at)) => {
+                            earliest_retry_at = Some(earliest_retry_at.map_or(retry_at, |old| old.min(retry_at)));
+                        }
+                        Ok(OpenRequestResult::Lagged(wait)) => wait_for_sync.push(wait),
+                        Ok(OpenRequestResult::Failed) | Err(_) => {}
+                    }
+                }
+                let deadline = if opened_any { self.request.expire_at() } else { self.request.connect_timeout_at() };
+                if earliest_retry_at.is_none() && wait_for_sync.is_empty() && wait_for_capacity.is_empty() {
+                    break;
+                }
+                let wake_at = earliest_retry_at.unwrap_or(deadline).min(deadline);
+                select! {
+                    handle = async { select_all(wait_for_capacity).await.0 }, if !wait_for_capacity.is_empty() => {
+                        if let Ok(handle) = handle {
+                            let rpc = handle.clone_connection();
+                            let submitted = self.request.backend_rpcs_used().len();
+                            yield handle;
+                            if self.request.backend_rpcs_used().len() > submitted && rpc.can_submit(&self.request, false) {
+                                exhausted.insert(rpc.name.clone());
                             }
                         }
                     }
-                }
-
-                // if we got this far, no inner or outer rpcs are ready. thats suprising since an inner should have been ready. maybe it got rate limited
-                // TODO: log block needed and such
-                warn!(?earliest_retry_at, num_waits=%wait_for_sync.len(), %tried, %opened, "no rpcs ready");
-
-                let min_wait_until = Instant::now() + Duration::from_millis(10);
-                let retry_deadline = if opened_any {
-                    self.request.expire_at()
-                } else {
-                    self.request.connect_timeout_at()
-                };
-
-                // clear earliest_retry_at if it is too far in the future to help us
-                if let Some(retry_at) = earliest_retry_at {
-                    let corrected = retry_at.max(min_wait_until).min(retry_deadline);
-
-                    // set a minimum of 100ms. this is probably actually a bug we should figure out.
-                    earliest_retry_at = Some(corrected);
-                } else if wait_for_sync.is_empty() {
-                    break;
-                } else {
-                    earliest_retry_at = Some(retry_deadline);
-                }
-
-                let retry_until = sleep_until(earliest_retry_at.expect("retry_at should always be set by now"));
-
-                if wait_for_sync.is_empty() {
-                    retry_until.await;
-                } else {
-                    select!{
-                        (x, _, _) = select_all(wait_for_sync) => {
-                            match x {
-                                Ok(rpc) => {
-                                    trace!(%rpc, "rpc ready. it might be used on the next loop");
-
-                                    // TODO: i don't think this sleep should be necessary. but i just want the cpus to cool down
-                                    sleep_until(min_wait_until).await;
-                                },
-                                Err(err) => {
-                                    error!(?err, "problem while waiting for an rpc for a request");
-
-                                    // TODO: break or continue?
-                                    // TODO: i don't think this sleep should be necessary. but i just want the cpus to cool down
-                                    sleep_until(min_wait_until).await;
-                                },
+                    _ = async { select_all(wait_for_sync).await }, if !wait_for_sync.is_empty() => {}
+                    changed = updates.changed(), if watching => {
+                        watching = changed.is_ok();
+                        if watching {
+                            if let Some(next) = updates.borrow_and_update().as_ref().and_then(|ranked| ranked.for_request(&self.request)) {
+                                self = next;
+                            } else {
+                                self.inner.clear();
+                                self.outer.clear();
                             }
-                        },
-                        _ = retry_until => {
-                            // we've waited long enough that trying again might work
-                        },
+                        }
                     }
+                    _ = sleep_until(wake_at) => {}
                 }
             }
         }
-
-        // TODO: log that no servers were available. this might not be a server error. the user might have requested something in the far future (common when people mix up chains)
     }
 }
 
@@ -1343,7 +1287,7 @@ mod tests {
             outer: Vec::new(),
             request,
         };
-        let mut stream = Box::pin(rpcs.to_stream());
+        let mut stream = Box::pin(rpcs.to_stream(watch::channel(None).1));
 
         assert!(timeout(Duration::from_millis(100), stream.next())
             .await
@@ -1379,7 +1323,7 @@ mod tests {
             outer: Vec::new(),
             request,
         };
-        let mut stream = Box::pin(rpcs.to_stream());
+        let mut stream = Box::pin(rpcs.to_stream(watch::channel(None).1));
 
         let first_handle = stream
             .next()

@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::{cmp::Ordering, sync::Arc};
 use tokio::select;
-use tokio::sync::{watch, AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
@@ -55,6 +55,10 @@ impl RequestPermits {
             max_concurrent_requests,
             max_backend_batch_items,
         }
+    }
+
+    pub(super) fn try_acquire(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        self.semaphore.clone().try_acquire_owned()
     }
 
     pub(super) async fn acquire(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
@@ -540,11 +544,11 @@ impl Web3Rpc {
                 "checked log data limit"
             );
 
-            if log_result.is_err() {
-                break;
+            match log_result {
+                Ok(_) => limit = Some(log_data_limit),
+                Err(Web3ProxyError::LogHistoryRequired { .. }) => break,
+                Err(error) => return Err(error.into()),
             }
-
-            limit = Some(log_data_limit);
         }
 
         if let Some(limit) = limit {
@@ -1265,56 +1269,41 @@ impl Web3Rpc {
         error_handler: Option<RequestErrorHandler>,
         allow_unhealthy: bool,
     ) -> Web3ProxyResult<OpenRequestHandle> {
-        let connect_timeout_at = sleep_until(web3_request.connect_timeout_at());
-        tokio::pin!(connect_timeout_at);
-
+        let mut found_backend = !web3_request.backend_rpcs_used().is_empty();
         loop {
+            let deadline = if found_backend {
+                web3_request.expire_at()
+            } else {
+                web3_request.connect_timeout_at()
+            };
+            if web3_request.expired() {
+                return Err(Web3ProxyError::Timeout(None));
+            }
             match self
                 .try_request_handle(web3_request, error_handler, allow_unhealthy)
-                .await
+                .await?
             {
-                Ok(OpenRequestResult::Handle(handle)) => return Ok(handle),
-                Ok(OpenRequestResult::RetryAt(retry_at)) => {
-                    // TODO: emit a stat?
-                    let wait = retry_at.duration_since(Instant::now());
-
-                    trace!(
-                        "waiting {} millis for request handle on {}",
-                        wait.as_millis(),
-                        self
-                    );
-
-                    // if things are slow this could happen in prod. but generally its a problem
-                    debug_assert!(wait > Duration::from_secs(0));
-
-                    // TODO: have connect_timeout in addition to the full ttl
-                    if retry_at > web3_request.connect_timeout_at() {
-                        // break now since we will wait past our maximum wait time
-                        return Err(Web3ProxyError::Timeout(Some(
-                            web3_request.start_instant.elapsed(),
-                        )));
+                OpenRequestResult::Handle(handle) => return Ok(handle),
+                OpenRequestResult::Busy(wait) => {
+                    found_backend = true;
+                    let handle = tokio::time::timeout_at(web3_request.expire_at(), wait).await??;
+                    if self.can_submit(web3_request, allow_unhealthy) {
+                        return Ok(handle);
                     }
-
-                    sleep_until(retry_at).await;
+                    drop(handle);
                 }
-                Ok(OpenRequestResult::Lagged(now_synced_f)) => {
-                    select! {
-                        _ = now_synced_f => {}
-                        _ = &mut connect_timeout_at => {
-                            break;
-                        }
+                OpenRequestResult::RetryAt(retry_at) => {
+                    if Instant::now() >= deadline {
+                        return Err(Web3ProxyError::Timeout(None));
                     }
+                    sleep_until(retry_at.min(deadline)).await;
                 }
-                Ok(OpenRequestResult::Failed) => {
-                    // TODO: when can this happen? log? emit a stat? is breaking the right thing to do?
-                    trace!("{} has no handle ready", self);
-                    break;
+                OpenRequestResult::Lagged(wait) => {
+                    tokio::time::timeout_at(deadline, wait).await??;
                 }
-                Err(err) => return Err(err),
+                OpenRequestResult::Failed => return Err(Web3ProxyError::NoServersSynced),
             }
         }
-
-        Err(Web3ProxyError::NoServersSynced)
     }
 
     async fn wait_for_throttle(self: &Arc<Self>, wait_until: Instant) -> Web3ProxyResult<()> {
@@ -1329,6 +1318,23 @@ impl Web3Rpc {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn supports_batch(&self) -> bool {
+        self.http_client.is_some() && self.http_url.is_some()
+    }
+
+    /// Recheck mutable backend state while holding the reserved slot.
+    pub(super) fn can_submit(&self, request: &ValidatedRequest, allow_unhealthy: bool) -> bool {
+        let now = Instant::now();
+        self.next_available(now) <= now
+            && (allow_unhealthy
+                || (self.healthy.load(atomic::Ordering::SeqCst)
+                    && (self.head_observation_publisher.is_none()
+                        || [request.min_block_needed(), request.max_block_needed()]
+                            .into_iter()
+                            .flatten()
+                            .all(|block| self.has_data_for_request(request, block)))))
     }
 
     pub async fn try_request_handle(
@@ -1444,10 +1450,31 @@ impl Web3Rpc {
             return Ok(OpenRequestResult::RetryAt(retry_at));
         }
 
-        let handle =
-            OpenRequestHandle::new(web3_request.clone(), self.clone(), error_handler).await;
-
-        Ok(handle.into())
+        match self.request_permits.try_acquire() {
+            Ok(permit) => Ok(OpenRequestHandle::new(
+                web3_request.clone(),
+                self.clone(),
+                error_handler,
+                allow_unhealthy,
+                permit,
+            )
+            .into()),
+            Err(TryAcquireError::NoPermits) => {
+                let rpc = self.clone();
+                let request = web3_request.clone();
+                Ok(OpenRequestResult::Busy(Box::pin(async move {
+                    let permit = rpc.request_permits.acquire().await?;
+                    Ok(OpenRequestHandle::new(
+                        request,
+                        rpc,
+                        error_handler,
+                        allow_unhealthy,
+                        permit,
+                    ))
+                })))
+            }
+            Err(TryAcquireError::Closed) => Ok(OpenRequestResult::Failed),
+        }
     }
 
     pub async fn internal_request<P: JsonRpcParams, R: JsonRpcResultData>(
@@ -1491,7 +1518,7 @@ impl Web3Rpc {
             .wait_for_request_handle(web3_request, error_handler, allow_unhealthy)
             .await?;
 
-        let response = handle.request().await?;
+        let response = handle.request_parsed().await?;
         let parsed = response.parsed().await?;
         match parsed.payload {
             jsonrpc::ResponsePayload::Success { result } => Ok(result),

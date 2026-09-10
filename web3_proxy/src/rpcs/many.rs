@@ -502,20 +502,11 @@ impl Web3Rpcs {
         // TODO: limit number of tries
         let rpcs = self.try_rpcs_for_request(web3_request).await?;
 
-        let stream = rpcs.to_stream();
+        let stream = rpcs.to_stream(self.watch_ranked_rpcs.subscribe());
 
         pin!(stream);
 
         while let Some(active_request_handle) = stream.next().await {
-            // TODO: i'd like to get rid of this clone
-            let rpc = active_request_handle.clone_connection();
-
-            {
-                let mut response_lock = web3_request.response.lock();
-
-                response_lock.backend_rpcs.push(rpc);
-            }
-
             match send(active_request_handle).await {
                 Ok(response) => {
                     // TODO: some jsonrpc errors should probably be retried. maybe save in errors
@@ -609,10 +600,24 @@ impl Web3Rpcs {
         &self,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
+        self.try_proxy_connection_with(web3_request, OpenRequestHandle::request::<R>)
+            .await
+    }
+
+    pub(crate) async fn try_proxy_connection_with<R, F, Fut>(
+        &self,
+        web3_request: &Arc<ValidatedRequest>,
+        send: F,
+    ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>>
+    where
+        R: JsonRpcResultData,
+        F: Fn(OpenRequestHandle) -> Fut,
+        Fut: Future<Output = Web3ProxyResult<jsonrpc::SingleResponse<R>>>,
+    {
         let proxy_mode = web3_request.proxy_mode();
 
         match proxy_mode {
-            ProxyMode::Best => self.request_with_metadata(web3_request).await,
+            ProxyMode::Best => self.request_with(web3_request, send).await,
             ProxyMode::Fastest(_x) => todo!("Fastest"),
             ProxyMode::Versus => todo!("Versus"),
         }

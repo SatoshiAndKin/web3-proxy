@@ -1,3 +1,4 @@
+mod batch;
 mod ws;
 
 use crate::config::{AppConfig, TopConfig};
@@ -18,7 +19,6 @@ use alloy::eips::Decodable2718;
 use alloy::primitives::{keccak256, Address, Bytes, TxHash, B256, U256, U64};
 use axum::http::StatusCode;
 use deduped_broadcast::DedupedBroadcaster;
-use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hashbrown::HashSet;
@@ -408,200 +408,121 @@ impl App {
             .head_block()
             .ok_or(Web3ProxyError::NoServersSynced)?;
 
-        if matches!(proxy_mode, ProxyMode::Best)
-            && requests.len() > 1
+        let batch_eligible = matches!(proxy_mode, ProxyMode::Best)
+            && num_requests > 1
             && requests.iter().all(|request| request.method == "eth_call")
-        {
-            if let Some(result) = self
-                .proxy_eth_call_batch(&requests, &head_block, request_id.clone())
-                .await
-            {
-                return result;
-            }
-        }
-
-        // TODO: use streams and buffers so we don't overwhelm our server
-        let responses = join_all(
-            requests
-                .into_iter()
-                .map(|request| {
-                    self.proxy_request(
-                        request,
+            && self
+                .balanced_rpcs
+                .by_name
+                .read()
+                .values()
+                .any(|rpc| rpc.supports_batch());
+        let started_at = Instant::now();
+        // Keep lookup concurrency bounded without blocking later completed lookups
+        // behind an earlier slow lookup. Restore order after validation.
+        let validated =
+            futures::stream::iter(requests.into_iter().enumerate().map(|(index, request)| {
+                let head = head_block.clone();
+                let request_id = request_id.clone();
+                async move {
+                    let id = request.id.clone();
+                    let result = ValidatedRequest::new_with_app_at(
+                        self,
                         proxy_mode,
-                        Some(head_block.clone()),
-                        request_id.clone(),
+                        None,
+                        request.into(),
+                        Some(head),
+                        request_id,
+                        started_at,
                     )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await;
-
-        let mut collected: Vec<jsonrpc::ParsedResponse> = Vec::with_capacity(num_requests);
-        let mut collected_rpc_names: HashSet<String> = HashSet::new();
-        let mut collected_rpcs: Vec<Arc<Web3Rpc>> = vec![];
-        for response in responses {
-            // TODO: any way to attach the tried rpcs to the error? it is likely helpful
-            let (_status_code, response, rpcs) = response;
-
-            // TODO: individual error handling
-            collected.push(response.parsed().await?);
-            collected_rpcs.extend(rpcs.into_iter().filter(|x| {
-                if collected_rpc_names.contains(&x.name) {
-                    false
-                } else {
-                    collected_rpc_names.insert(x.name.clone());
-                    true
+                    .await;
+                    (index, id, result)
                 }
-            }));
-
-            // TODO: what should we do with the status code? check the jsonrpc spec
+            }))
+            .buffer_unordered(64);
+        if !batch_eligible {
+            return self.proxy_validated_batch(validated, num_requests).await;
         }
+        let mut validated = validated.collect::<Vec<_>>().await;
+        validated.sort_by_key(|(index, _, _)| *index);
 
-        Ok((collected, collected_rpcs))
-    }
-
-    async fn proxy_eth_call_batch(
-        self: &Arc<Self>,
-        requests: &[SingleRequest],
-        head_block: &BlockHeader,
-        request_id: Option<String>,
-    ) -> Option<Web3ProxyResult<(Vec<jsonrpc::ParsedResponse>, Vec<Arc<Web3Rpc>>)>> {
-        let mut validated_requests = Vec::with_capacity(requests.len());
-        for request in requests.iter().cloned() {
-            let validated = match ValidatedRequest::new_with_app(
-                self,
-                ProxyMode::Best,
-                None,
-                request.into(),
-                Some(head_block.clone()),
-                request_id.clone(),
-            )
-            .await
+        if validated.iter().all(|(_, _, result)| result.is_ok()) {
+            let requests = validated
+                .iter()
+                .map(|(_, _, result)| result.as_ref().unwrap().clone())
+                .collect::<Vec<_>>();
+            if requests
+                .windows(2)
+                .all(|pair| pair[0].request_blocks == pair[1].request_blocks)
             {
-                Ok(validated) => validated,
-                Err(_) => return None,
-            };
-            validated_requests.push(validated);
-        }
-
-        if validated_requests
-            .windows(2)
-            .any(|pair| pair[0].request_blocks != pair[1].request_blocks)
-        {
-            return None;
-        }
-
-        let handles = match self
-            .balanced_rpcs
-            .try_rpcs_for_request(&validated_requests[0])
-            .await
-        {
-            Ok(rpcs) => rpcs.open_batch_handles().await,
-            Err(_) => Vec::new(),
-        };
-        let mut packets = FuturesUnordered::new();
-        if handles.is_empty() {
-            packets.push(self.proxy_batch_packet(None, &validated_requests, 0));
-        } else {
-            let batch_lengths = weighted_batch_lengths(
-                validated_requests.len(),
-                handles.iter().map(OpenRequestHandle::batch_capacity),
-            );
-            let mut offset = 0;
-            for (handle, count) in handles.into_iter().zip(batch_lengths) {
-                for chunk in validated_requests[offset..offset + count].chunks(handle.batch_size())
-                {
-                    packets.push(self.proxy_batch_packet(
-                        Some(handle.clone_connection()),
-                        chunk,
-                        offset,
-                    ));
-                    offset += chunk.len();
-                }
+                return self.proxy_eth_call_batch(requests).await;
             }
         }
-        let mut completed = Vec::with_capacity(validated_requests.len());
-        while let Some(packet) = packets.next().await {
-            completed.extend(packet);
-        }
-        completed.sort_by_key(|(index, _, _)| *index);
-        let mut responses = Vec::with_capacity(completed.len());
-        let mut used_rpcs = Vec::new();
-        let mut names = HashSet::new();
-        for (_, response, rpcs) in completed {
-            responses.push(response);
-            used_rpcs.extend(
-                rpcs.into_iter()
-                    .filter(|rpc| names.insert(rpc.name.clone())),
-            );
-        }
-        Some(Ok((responses, used_rpcs)))
+
+        self.proxy_validated_batch(futures::stream::iter(validated), num_requests)
+            .await
     }
 
-    /// Finish one packet and immediately recover only its incomplete calls.
-    async fn proxy_batch_packet(
+    async fn proxy_validated_batch<S>(
         self: &Arc<Self>,
-        rpc: Option<Arc<Web3Rpc>>,
-        requests: &[Arc<ValidatedRequest>],
-        offset: usize,
-    ) -> Vec<(usize, jsonrpc::ParsedResponse, Vec<Arc<Web3Rpc>>)> {
-        let outcomes = if let Some(rpc) = rpc {
-            let handle = OpenRequestHandle::new(requests[0].clone(), rpc, None).await;
-            if handle.supports_batch() {
-                handle.request_batch(requests).await.ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let outcomes = outcomes
-            .map(|outcomes| outcomes.into_iter().map(Result::ok).collect())
-            .unwrap_or_else(|| (0..requests.len()).map(|_| None).collect::<Vec<_>>());
-        join_all(requests.iter().zip(outcomes).enumerate().map(
-            |(index, (request, response))| async move {
-                let response = match response {
-                    Some(response) => response,
-                    None => {
-                        match self
-                            .balanced_rpcs
-                            .continue_request::<Arc<OwnedLazyValue>>(request)
-                            .await
-                        {
-                            Ok(SingleResponse::Parsed(mut response)) => {
-                                response.id = request.id();
-                                response
-                            }
-                            Ok(SingleResponse::Stream(_)) => {
-                                unreachable!("continued calls complete their bodies")
-                            }
-                            Err(error) => {
-                                request.set_error_response(&error);
-                                let (_, response) = error
-                                    .as_json_response_parts(request.id(), Some(request.as_ref()));
-                                match response {
-                                    SingleResponse::Parsed(response) => response,
-                                    SingleResponse::Stream(_) => {
-                                        unreachable!("local errors are parsed")
-                                    }
-                                }
-                            }
-                        }
+        validated: S,
+        num_requests: usize,
+    ) -> Web3ProxyResult<(Vec<jsonrpc::ParsedResponse>, Vec<Arc<Web3Rpc>>)>
+    where
+        S: futures::Stream<
+            Item = (
+                usize,
+                OwnedLazyValue,
+                Web3ProxyResult<Arc<ValidatedRequest>>,
+            ),
+        >,
+    {
+        let mut responses = validated
+            .map(|(index, id, result)| async move {
+                let (response, rpcs) = match result {
+                    Ok(request) => {
+                        let (_, response, rpcs) = self
+                            .proxy_validated_request(request, OpenRequestHandle::request_parsed)
+                            .await;
+                        (response, rpcs)
                     }
+                    Err(error) => (
+                        error
+                            .as_json_response_parts(id.clone(), None::<RequestForError>)
+                            .1,
+                        Vec::new(),
+                    ),
                 };
-                {
-                    let mut state = request.response.lock();
-                    state.user_error_response = !state.error_response
-                        && matches!(response.payload, jsonrpc::ResponsePayload::Error { .. });
-                }
-                let response_bytes = sonic_rs::to_string(&response)
-                    .expect("JSON-RPC response serializes")
-                    .len() as u64;
-                request.set_response(response_bytes);
-                (offset + index, response, request.backend_rpcs_used())
-            },
-        ))
-        .await
+                // Finish each body before joining the other calls. A returned stream
+                // can still own the only backend slot those other calls need.
+                let parsed = match response.parsed().await {
+                    Ok(response) => response,
+                    Err(error) => error
+                        .as_json_response_parts(id, None::<RequestForError>)
+                        .1
+                        .parsed()
+                        .await
+                        .expect("local error responses are parsed"),
+                };
+                (index, parsed, rpcs)
+            })
+            .buffer_unordered(num_requests)
+            .collect::<Vec<_>>()
+            .await;
+        responses.sort_by_key(|(index, _, _)| *index);
+        let mut names = HashSet::new();
+        let mut used_rpcs = Vec::new();
+        let responses = responses
+            .into_iter()
+            .map(|(_, response, rpcs)| {
+                used_rpcs.extend(
+                    rpcs.into_iter()
+                        .filter(|rpc| names.insert(rpc.name.clone())),
+                );
+                response
+            })
+            .collect();
+        Ok((responses, used_rpcs))
     }
 
     /// try to send transactions to the best available rpcs with protected/private mempools
@@ -756,6 +677,20 @@ impl App {
             }
         };
 
+        self.proxy_validated_request(web3_request, OpenRequestHandle::request)
+            .await
+    }
+
+    async fn proxy_validated_request<F, Fut>(
+        self: &Arc<Self>,
+        web3_request: Arc<ValidatedRequest>,
+        send: F,
+    ) -> (StatusCode, jsonrpc::SingleResponse, Vec<Arc<Web3Rpc>>)
+    where
+        F: Fn(OpenRequestHandle) -> Fut + Copy,
+        Fut: std::future::Future<Output = Web3ProxyResult<jsonrpc::SingleResponse>>,
+    {
+        let mut ranked_rpcs_recv = self.balanced_rpcs.watch_ranked_rpcs.subscribe();
         let mut last_success = None;
         let mut last_error = None;
 
@@ -767,7 +702,13 @@ impl App {
             // TODO: refresh the request here?
 
             // turn some of the Web3ProxyErrors into Ok results
-            match self._proxy_request(&web3_request).await {
+            match timeout_at(
+                web3_request.expire_at(),
+                self._proxy_request(&web3_request, send),
+            )
+            .await
+            .unwrap_or_else(|error| Err(error.into()))
+            {
                 Ok(response_data) => {
                     last_success = Some(response_data);
                     break;
@@ -777,6 +718,9 @@ impl App {
                 }
             }
 
+            if web3_request.expired() {
+                break;
+            }
             select! {
                 _ = ranked_rpcs_recv.changed() => {
                     // TODO: pass these RankedRpcs to ValidatedRequest::new_with_app
@@ -838,10 +782,15 @@ impl App {
 
     /// Main request logic in a dedicated function so the try operator is easy to use.
     /// TODO: how can we make this generic?
-    async fn _proxy_request(
+    async fn _proxy_request<F, Fut>(
         self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
-    ) -> Web3ProxyResult<jsonrpc::SingleResponse> {
+        send: F,
+    ) -> Web3ProxyResult<jsonrpc::SingleResponse>
+    where
+        F: Fn(OpenRequestHandle) -> Fut + Copy,
+        Fut: std::future::Future<Output = Web3ProxyResult<jsonrpc::SingleResponse>>,
+    {
         if let Some(request) = web3_request.inner.jsonrpc_request() {
             if let Some(response) = self.balanced_rpcs.cached_block_response(request).await {
                 return Ok(response);
@@ -942,9 +891,7 @@ impl App {
             | "eth_getUserOperationReceipt"
             | "eth_supportedEntryPoints"
             | "web3_bundlerVersion" => self.bundler_4337_rpcs
-                        .try_proxy_connection::<Arc<OwnedLazyValue>>(
-                            web3_request,
-                        )
+                        .try_proxy_connection_with(web3_request, send)
                         .await?,
             "eth_accounts" => jsonrpc::ParsedResponse::from_value(json!([]), web3_request.id()).into(),
             "eth_blockNumber" => {
@@ -1003,9 +950,7 @@ impl App {
 
                 let mut result = self
                     .balanced_rpcs
-                    .try_proxy_connection::<Arc<OwnedLazyValue>>(
-                        web3_request,
-                    )
+                    .try_proxy_connection_with(web3_request, send)
                     .await;
 
                 // TODO: helper for doing parsed() inside a result?
@@ -1044,9 +989,7 @@ impl App {
 
                     self
                         .balanced_rpcs
-                        .try_proxy_connection::<Arc<OwnedLazyValue>>(
-                            web3_request,
-                        )
+                        .try_proxy_connection_with(web3_request, send)
                         .await?
                 } else {
 
@@ -1165,7 +1108,7 @@ impl App {
                 let mut response = timeout_at(
                     web3_request.expire_at(),
                     self.balanced_rpcs
-                        .try_proxy_connection::<Arc<OwnedLazyValue>>(web3_request),
+                        .try_proxy_connection_with(web3_request, send),
                 )
                 .await??;
 

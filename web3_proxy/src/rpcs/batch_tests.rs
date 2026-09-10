@@ -1,7 +1,6 @@
 use super::consensus::RankedRpcs;
 use super::many::{Web3Rpcs, Web3RpcsSpawnConfig};
 use super::one::{RequestPermits, Web3Rpc};
-use super::request::OpenRequestHandle;
 use crate::app::App;
 use crate::config::AppConfig;
 use crate::errors::Web3ProxyError;
@@ -689,7 +688,11 @@ async fn individual_stream_shares_batch_slots_until_body_ends_or_is_dropped() {
         )
         .await
         .unwrap();
-        let handle = super::request::OpenRequestHandle::new(request, h.rpc.clone(), None).await;
+        let handle = h
+            .rpc
+            .wait_for_request_handle(&request, None, true)
+            .await
+            .unwrap();
         let task = tokio::spawn(handle.request::<Arc<sonic_rs::OwnedLazyValue>>());
         let incoming = h.next().await;
         let prefix = format!(
@@ -889,7 +892,11 @@ async fn batch_earliest_deadline_expires_only_the_call_without_remaining_time() 
     }
     let earliest = requests[0].expire_at();
     let later = requests[1].expire_at();
-    let handle = OpenRequestHandle::new(requests[0].clone(), h.rpc.clone(), None).await;
+    let handle = h
+        .rpc
+        .wait_for_request_handle(&requests[0], None, true)
+        .await
+        .unwrap();
     let packet_requests = requests.clone();
     let packet_task = tokio::spawn(async move { handle.request_batch(&packet_requests).await });
     let packet = h.next().await;
@@ -1293,5 +1300,115 @@ async fn batch_block_hash_validation_is_bounded_concurrent_and_reused() {
     }
     assert_answers(task.await.unwrap(), 65);
     assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 130);
+    h.idle();
+}
+
+#[tokio::test]
+async fn queued_direct_call_keeps_response_deadline_after_connection_window_and_cooldown() {
+    let mut h = Harness::new(1, 64).await;
+    let held = h.start(2);
+    let occupied = h.next().await;
+    let request = ValidatedRequest::new_internal(
+        "eth_getCode".into(),
+        &sonic_rs::json!(["0x0000000000000000000000000000000000000000", "latest"]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let deadline = request.expire_at();
+    let rpc = h.rpc.clone();
+    let original = request.clone();
+    let queued = tokio::spawn(async move {
+        rpc.authorized_request::<Arc<sonic_rs::OwnedLazyValue>>(&original, None, false)
+            .await
+    });
+    h.quiet().await;
+    advance_to(Instant::now() + Duration::from_secs(11)).await;
+    h.rpc
+        .hard_limit_until
+        .as_ref()
+        .unwrap()
+        .send_replace(Instant::now() + Duration::from_secs(1));
+    occupied.succeed();
+    assert_answers(held.await.unwrap(), 2);
+    h.quiet().await;
+    advance_to(Instant::now() + Duration::from_secs(1)).await;
+    let call = h.next().await;
+    let id = call.body["id"].clone();
+    call.respond(json!({"jsonrpc":"2.0","id":id,"result":"0xbeef"}));
+    let response = queued.await.unwrap().unwrap();
+    assert_eq!(sonic_rs::to_string(&response).unwrap(), "\"0xbeef\"");
+    assert_eq!(request.expire_at(), deadline);
+    h.idle();
+}
+
+#[tokio::test]
+async fn queued_individual_retry_exhausts_a_method_failure_before_trying_another_node() {
+    let mut first = Harness::named("preferred", 1, 64).await;
+    let mut second = Harness::named("second", 1, 64).await;
+    second.rpc.tier.store(10, Ordering::SeqCst);
+    let held_a = first.start(2);
+    let occupied_a = first.next().await;
+    let held_b = second.start(2);
+    let occupied_b = second.next().await;
+    add_backend(&first.app, vec![first.rpc.clone(), second.rpc.clone()]);
+    let task = first.start_requests(vec![code_call(0)]);
+    first.quiet().await;
+    second.quiet().await;
+    occupied_a.succeed();
+    assert_answers(held_a.await.unwrap(), 2);
+    let failed = first.next().await;
+    let id = failed.body["id"].clone();
+    failed.respond(
+        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}}),
+    );
+    first.quiet().await;
+    occupied_b.succeed();
+    assert_answers(held_b.await.unwrap(), 2);
+    let retry = second.next().await;
+    retry.respond(json!({"jsonrpc":"2.0","id":0,"result":"0xbeef"}));
+    assert_eq!(
+        task.await.unwrap(),
+        json!([{"jsonrpc":"2.0","id":0,"result":"0xbeef"}])
+    );
+    assert_eq!(first.rpc.total_requests.load(Ordering::Relaxed), 3);
+    assert_eq!(second.rpc.total_requests.load(Ordering::Relaxed), 3);
+    first.idle();
+    second.idle();
+}
+
+#[tokio::test]
+async fn ordinary_batch_starts_ready_calls_while_other_validation_is_blocked() {
+    let mut h = Harness::new(2, 64).await;
+    let mut historical = client_call(1);
+    historical.params[1] = sonic_rs::json!({"blockHash": format!("0x{:064x}", 1)});
+    let task = h.start_requests(vec![code_call(0), historical]);
+    let first = h.next().await;
+    let second = h.next().await;
+    let (lookup, code) = if first.body["method"] == "eth_getBlockByHash" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(code.body["method"], "eth_getCode");
+    assert_eq!(lookup.body["method"], "eth_getBlockByHash");
+    code.respond(json!({"jsonrpc":"2.0","id":0,"result":"0xbeef"}));
+    h.quiet().await;
+    let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+    block.header.hash = lookup.body["params"][0].as_str().unwrap().parse().unwrap();
+    block.header.inner.number = 1;
+    let id = lookup.body["id"].clone();
+    lookup.respond(json!({"jsonrpc":"2.0","id":id,"result":block}));
+    let call = h.next().await;
+    assert_eq!(call.body["method"], "eth_call");
+    call.succeed();
+    assert_eq!(
+        task.await.unwrap(),
+        json!([
+            {"jsonrpc":"2.0","id":0,"result":"0xbeef"},
+            {"jsonrpc":"2.0","id":1,"result":"0x0001"}
+        ])
+    );
     h.idle();
 }
