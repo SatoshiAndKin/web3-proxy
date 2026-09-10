@@ -119,7 +119,7 @@ impl App {
                 // Pending packets have no fixed backend assignment.
                 updates.borrow_and_update();
                 let connections = match self.balanced_rpcs.try_rpcs_for_request(request).await {
-                    Ok(rpcs) => rpcs.batch_connections(),
+                    Ok(rpcs) => rpcs.connections(),
                     Err(error) => {
                         let error = Arc::new(error);
                         for &index in &pending {
@@ -184,6 +184,11 @@ impl App {
                     .iter()
                     .any(|&i| !calls[i].exhausted.contains(&handle.connection_name()))
             });
+            // Use ready HTTP capacity first. If HTTP cannot take the remaining
+            // work, other transports take calls from this same queue, one per slot.
+            if ready.iter().any(OpenRequestHandle::supports_batch) {
+                ready.retain(OpenRequestHandle::supports_batch);
+            }
             if !ready.is_empty() {
                 let lengths = weighted_batch_lengths(
                     pending.len(),

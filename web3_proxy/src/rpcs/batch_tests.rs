@@ -604,7 +604,11 @@ async fn websocket_backend(
         loop {
             tokio::select! {
                 message = socket.recv() => {
-                    let Some(Ok(Message::Text(text))) = message else { break };
+                    let text = match message {
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                        _ => break,
+                    };
                     let (reply, response) = oneshot::channel();
                     if sender.send(Incoming {
                         body: serde_json::from_str(&text).unwrap(),
@@ -687,12 +691,11 @@ impl WebSocketHarness {
     }
 
     async fn quiet(&mut self) {
-        assert!(
-            timeout(Duration::from_millis(50), self.incoming.recv())
-                .await
-                .is_err(),
-            "unexpected WebSocket request"
-        );
+        match timeout(Duration::from_millis(50), self.incoming.recv()).await {
+            Err(_) => {}
+            Ok(Some(call)) => panic!("unexpected WebSocket request: {}", call.body),
+            Ok(None) => panic!("WebSocket test connection closed"),
+        }
     }
 
     fn completed(&self, calls: usize) {
@@ -850,20 +853,26 @@ async fn batch_mixed_pool_websocket_timeout_and_cancellation_release_slots() {
     for cancel in [false, true] {
         let mut h = Harness::new(1, 64).await;
         let mut ws = WebSocketHarness::new(1).await;
+        add_backend(&h.app, vec![h.rpc.clone(), ws.rpc.clone()]);
+        let task = h.start(3);
+        let failed = h.next().await;
+        assert_eq!(packet_params(&failed).len(), 3);
+        if !cancel {
+            advance_to(Instant::now() + Duration::from_secs(50)).await;
+        }
         h.rpc
             .hard_limit_until
             .as_ref()
             .unwrap()
             .send_replace(Instant::now() + Duration::from_secs(120));
-        add_backend(&h.app, vec![h.rpc.clone(), ws.rpc.clone()]);
-        let task = h.start(3);
+        failed.reject();
         let stalled = ws.next().await;
         ws.quiet().await;
         if cancel {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
         } else {
-            advance_to(Instant::now() + Duration::from_secs(60)).await;
+            advance_to(Instant::now() + Duration::from_secs(10)).await;
             let response = timeout(Duration::from_millis(500), task)
                 .await
                 .unwrap()
@@ -885,7 +894,8 @@ async fn batch_mixed_pool_websocket_timeout_and_cancellation_release_slots() {
         assert_answers(next.await.unwrap(), 2);
         ws.completed(3);
         h.quiet().await;
-        assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 3);
+        assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
         h.idle();
         drop(stalled);
     }

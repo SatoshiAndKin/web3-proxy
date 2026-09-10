@@ -1000,13 +1000,8 @@ fn best_rpc<'a>(rpc_a: &'a Arc<Web3Rpc>, rpc_b: &'a Arc<Web3Rpc>) -> &'a Arc<Web
 */
 
 impl RpcsForRequest {
-    pub(crate) fn batch_connections(&self) -> Vec<Arc<Web3Rpc>> {
-        self.inner
-            .iter()
-            .chain(&self.outer)
-            .filter(|rpc| rpc.supports_batch())
-            .cloned()
-            .collect()
+    pub(crate) fn connections(&self) -> Vec<Arc<Web3Rpc>> {
+        self.inner.iter().chain(&self.outer).cloned().collect()
     }
 
     pub fn to_stream(

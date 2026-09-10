@@ -594,7 +594,11 @@ impl OpenRequestHandle {
         self.request.rpc.request_permits.max_concurrent_requests()
     }
     pub fn batch_size(&self) -> usize {
-        self.request.rpc.request_permits.max_backend_batch_items()
+        if self.supports_batch() {
+            self.request.rpc.request_permits.max_backend_batch_items()
+        } else {
+            1
+        }
     }
     pub fn supports_batch(&self) -> bool {
         self.request.rpc.supports_batch()
@@ -645,7 +649,8 @@ impl OpenRequestHandle {
         Ok(response)
     }
 
-    /// Send exactly one packet. Packet failures leave all its calls for recovery.
+    /// Send one physical request, batching calls when the transport supports it.
+    /// Failures leave unfinished calls in the scheduler's queue for recovery.
     pub async fn request_batch(
         self,
         requests: &[Arc<ValidatedRequest>],
@@ -660,6 +665,17 @@ impl OpenRequestHandle {
             permit,
         } = self;
         request.web3_request = requests[0].clone();
+        if !request.rpc.supports_batch() {
+            if requests.len() != 1 {
+                return Err(
+                    anyhow::anyhow!("backend transport requires one call per request").into(),
+                );
+            }
+            return match (Self { request, permit }).request_parsed().await? {
+                jsonrpc::SingleResponse::Parsed(response) => Ok(vec![Ok(response)]),
+                jsonrpc::SingleResponse::Stream(_) => unreachable!("response was fully parsed"),
+            };
+        }
         request.check_submission()?;
         if Instant::now() >= deadline {
             return Err(Web3ProxyError::Timeout(None));
