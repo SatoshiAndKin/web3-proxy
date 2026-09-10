@@ -117,14 +117,14 @@ impl Target {
             match self.validate(chain_id).await {
                 Ok(()) => {
                     let mut s = stats.lock();
-                    let t = s.targets.entry(self.name.clone()).or_default();
+                    let t = s.execution_targets.entry(self.name.clone()).or_default();
                     t.health.connected = true;
                     t.health.detail = "Engine V4 ready".into();
                     break;
                 }
                 Err(error) => {
                     let mut s = stats.lock();
-                    let t = s.targets.entry(self.name.clone()).or_default();
+                    let t = s.execution_targets.entry(self.name.clone()).or_default();
                     t.health.connected = false;
                     t.health.errors += 1;
                     t.health.detail = error.to_string();
@@ -141,7 +141,7 @@ impl Target {
                 if self.has_block(hash, number).await.unwrap_or(false) {
                     *self.uncertain.lock() = None;
                     let mut s = stats.lock();
-                    let t = s.targets.entry(self.name.clone()).or_default();
+                    let t = s.execution_targets.entry(self.name.clone()).or_default();
                     t.health.connected = true;
                     t.health.detail = "Engine response lost; RPC has confirmed the block".into();
                 } else {
@@ -156,7 +156,7 @@ impl Target {
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
                         stats
                             .lock()
-                            .targets
+                            .execution_targets
                             .entry(self.name.clone())
                             .or_default()
                             .queue_dropped += n;
@@ -168,7 +168,7 @@ impl Target {
                     pending.pop_front();
                     stats
                         .lock()
-                        .targets
+                        .execution_targets
                         .entry(self.name.clone())
                         .or_default()
                         .queue_dropped += 1;
@@ -189,7 +189,7 @@ impl Target {
                         Ok(work) => work,
                         Err(broadcast::error::RecvError::Closed) => return,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            stats.lock().targets.entry(self.name.clone()).or_default().queue_dropped += n; continue;
+                            stats.lock().execution_targets.entry(self.name.clone()).or_default().queue_dropped += n; continue;
                         }
                     }
                 }
@@ -208,7 +208,7 @@ impl Target {
                 self.wake_children(p.hash, &mut waiting, &mut pending, &stats);
                 stats
                     .lock()
-                    .targets
+                    .execution_targets
                     .entry(self.name.clone())
                     .or_default()
                     .skipped_known += 1;
@@ -224,7 +224,7 @@ impl Target {
             if previous.is_some() && !parent_became_valid {
                 stats
                     .lock()
-                    .targets
+                    .execution_targets
                     .entry(self.name.clone())
                     .or_default()
                     .skipped_known += 1;
@@ -238,7 +238,7 @@ impl Target {
                 handled.insert(p.hash, Delivery::invalid_ancestor()).await;
                 stats
                     .lock()
-                    .targets
+                    .execution_targets
                     .entry(self.name.clone())
                     .or_default()
                     .skipped_invalid_ancestor += 1;
@@ -265,7 +265,7 @@ impl Target {
                     } else {
                         stats
                             .lock()
-                            .targets
+                            .execution_targets
                             .entry(self.name.clone())
                             .or_default()
                             .queue_dropped += 1;
@@ -319,7 +319,7 @@ impl Target {
                 pending.pop_front();
                 stats
                     .lock()
-                    .targets
+                    .execution_targets
                     .entry(self.name.clone())
                     .or_default()
                     .queue_dropped += 1;
@@ -330,7 +330,7 @@ impl Target {
     async fn deliver(&self, payload: &RelayPayload, stats: &Shared) -> Result<PayloadStatus> {
         stats
             .lock()
-            .targets
+            .execution_targets
             .entry(self.name.clone())
             .or_default()
             .sent += 1;
@@ -346,7 +346,7 @@ impl Target {
             *self.uncertain.lock() = Some((payload.hash, payload.number));
         }
         let mut s = stats.lock();
-        let t = s.targets.entry(self.name.clone()).or_default();
+        let t = s.execution_targets.entry(self.name.clone()).or_default();
         t.engine_latency.record(stats::micros(start.elapsed()));
         match &result {
             Ok(status) => match &status.status {
@@ -419,7 +419,7 @@ impl Target {
         if !anchored || chain.is_empty() {
             stats
                 .lock()
-                .targets
+                .execution_targets
                 .entry(self.name.clone())
                 .or_default()
                 .repair_gaps += 1;
@@ -427,7 +427,7 @@ impl Target {
         }
         stats
             .lock()
-            .targets
+            .execution_targets
             .entry(self.name.clone())
             .or_default()
             .repairs += 1;
@@ -460,20 +460,8 @@ impl Target {
             }
         }
     }
-    pub async fn observe(&self, work: Arc<Work>, stats: Shared) -> Option<u64> {
-        let mut sample = Sample {
-            hash: work.payload.hash,
-            slot: work.payload.slot,
-            source: work.source.clone(),
-            announcement_source: work.announcement_source.clone(),
-            event: work.event,
-            mode: work.mode,
-            acquired_us: stats::micros(work.acquired.duration_since(work.first_seen)),
-            target: self.name.clone(),
-            last_missing_us: None,
-            first_ready_us: None,
-            canonical_us: None,
-        };
+    pub async fn observe(&self, work: Arc<Work>, stats: Shared) -> stats::Observation {
+        let mut sample = Sample::new(&work, &self.name, stats::Layer::Execution);
         let permit = tokio::time::timeout_at(work.deadline, self.probes.acquire())
             .await
             .ok()
@@ -519,7 +507,7 @@ impl Target {
         }
         let ready = sample.first_ready_us;
         let mut s = stats.lock();
-        let t = s.targets.entry(self.name.clone()).or_default();
+        let t = s.execution_targets.entry(self.name.clone()).or_default();
         if let Some(ready) = ready {
             t.ready += 1;
             t.ready_latency.record(ready);
@@ -532,7 +520,11 @@ impl Target {
         if let Some(canonical) = sample.canonical_us {
             t.canonical_latency.record(canonical);
         }
+        let observation = stats::Observation {
+            ready,
+            canonical: sample.canonical_us,
+        };
         s.sample(sample);
-        ready
+        observation
     }
 }

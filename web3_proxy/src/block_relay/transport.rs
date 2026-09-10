@@ -6,6 +6,105 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
 use url::Url;
 
+/// The same private Beacon transport serves source reads and consensus targets.
+pub(super) struct BeaconHttp {
+    pub client: reqwest::Client,
+    pub headers: reqwest::header::HeaderMap,
+    base: Url,
+    reads: tokio::sync::Semaphore,
+    blob_reads: tokio::sync::Semaphore,
+}
+impl BeaconHttp {
+    pub fn new(base: &str, values: &std::collections::BTreeMap<String, String>) -> Result<Self> {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut headers = HeaderMap::new();
+        for (key, value) in values {
+            let key = HeaderName::from_bytes(key.as_bytes())
+                .map_err(|_| anyhow::anyhow!("invalid Beacon header name"))?;
+            let mut value = HeaderValue::from_str(value)
+                .map_err(|_| anyhow::anyhow!("invalid Beacon header value"))?;
+            value.set_sensitive(true);
+            headers.insert(key, value);
+        }
+        Ok(Self {
+            client: client()?,
+            headers,
+            base: super::config::url(base)?,
+            reads: tokio::sync::Semaphore::new(2),
+            blob_reads: tokio::sync::Semaphore::new(2),
+        })
+    }
+    pub fn endpoint(&self, path: &str) -> Url {
+        let mut url = self.base.clone();
+        url.set_path(&format!(
+            "{}{}",
+            self.base.path().trim_end_matches('/'),
+            path
+        ));
+        url
+    }
+    pub async fn get_bytes(&self, path: &str) -> Result<Option<bytes::Bytes>> {
+        let pool = if path.starts_with("/eth/v1/beacon/blobs/") {
+            &self.blob_reads
+        } else {
+            &self.reads
+        };
+        let operation = async {
+            let _permit = pool.acquire().await?;
+            let response = self
+                .client
+                .get(self.endpoint(path))
+                .headers(self.headers.clone())
+                .send()
+                .await
+                .map_err(|_| anyhow::anyhow!("Beacon transport error"))?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            Ok(Some(body(response).await?))
+        };
+        tokio::time::timeout(READ_TIMEOUT, operation)
+            .await
+            .map_err(|_| anyhow::anyhow!("Beacon read timeout"))?
+    }
+    pub async fn get_optional<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
+        self.get_bytes(path)
+            .await?
+            .map(|bytes| {
+                sonic_rs::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid Beacon response"))
+            })
+            .transpose()
+    }
+    pub async fn publish(&self, payload: &super::payload::ConsensusPayload) -> Result<u16> {
+        let operation = async {
+            let mut url = self.endpoint("/eth/v2/beacon/blocks");
+            url.query_pairs_mut()
+                .append_pair("broadcast_validation", "gossip");
+            let response = self
+                .client
+                .post(url)
+                .headers(self.headers.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header("Eth-Consensus-Version", &payload.block.fork)
+                .body(payload.body.clone())
+                .send()
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("Beacon publication transport error; result unknown")
+                })?;
+            // Never expose response text: providers can echo URLs, credentials, or payloads.
+            let status = response.status().as_u16();
+            if response.status().is_success() {
+                let _ = body(response).await?;
+            }
+            Ok(status)
+        };
+        tokio::time::timeout(ENGINE_TIMEOUT, operation)
+            .await
+            .map_err(|_| anyhow::anyhow!("Beacon publication timeout; result unknown"))?
+    }
+}
+
 pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;

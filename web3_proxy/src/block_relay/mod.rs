@@ -1,5 +1,6 @@
-//! Observe Beacon sources and import complete payloads into owned execution clients.
+//! Relay execution payloads and complete signed Beacon blocks to owned clients.
 pub mod config;
+mod consensus;
 pub mod payload;
 mod service;
 mod source;

@@ -61,14 +61,14 @@ async fn rpc_confirmed_parent_wakes_its_waiting_child() {
         .tx
         .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].repair_gaps == 1).await;
+    until(|| worker.stats.lock().execution_targets["a"].repair_gaps == 1).await;
     let parent = work(1, 0, 1, config::Mode::Inject, &["a"]);
     rpc.state.lock().known.insert(parent.payload.hash, 1);
     parent.known["a"].store(true, Ordering::Release);
     worker.tx.send(parent).unwrap();
     let result = timeout(
         Duration::from_millis(500),
-        until(|| worker.stats.lock().targets["a"].valid == 1),
+        until(|| worker.stats.lock().execution_targets["a"].valid == 1),
     )
     .await;
     worker.finish().await;
@@ -100,7 +100,7 @@ async fn rejected_repair_ancestor_blocks_the_entire_remaining_chain() {
         .tx
         .send(work(3, 2, 3, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].invalid == 1).await;
+    until(|| worker.stats.lock().execution_targets["a"].invalid == 1).await;
     worker
         .tx
         .send(work(4, 3, 4, config::Mode::Inject, &["a"]))
@@ -112,7 +112,10 @@ async fn rejected_repair_ancestor_blocks_the_entire_remaining_chain() {
         rpc.payload_hashes(),
         vec![B256::with_last_byte(3), B256::with_last_byte(2)]
     );
-    assert_eq!(stats.lock().targets["a"].skipped_invalid_ancestor, 1);
+    assert_eq!(
+        stats.lock().execution_targets["a"].skipped_invalid_ancestor,
+        1
+    );
 }
 
 #[tokio::test]
@@ -138,8 +141,13 @@ async fn equivalent_engine_url_reload_preserves_unknown_import_suspension() {
     let mut block = beacon(&network);
     let root = beacon_source.add(&block);
     beacon_source.announce("block", root, block.data.message.slot);
-    until(|| relay.snapshot()["targets"]["a"]["unknown"].as_u64() == Some(1)).await;
-    config.targets.get_mut("a").unwrap().engine_url.push('/');
+    until(|| relay.snapshot()["execution_targets"]["a"]["unknown"].as_u64() == Some(1)).await;
+    config
+        .execution_targets
+        .get_mut("a")
+        .unwrap()
+        .engine_url
+        .push('/');
     relay.apply(Some(&config)).await.unwrap();
     until(|| {
         beacon_source.state.lock().queries.len() == 2 && beacon_source.events.receiver_count() == 1

@@ -19,9 +19,15 @@ pub struct Config {
     pub mode: Mode,
     pub network: Network,
     pub sources: BTreeMap<String, Source>,
-    pub targets: BTreeMap<String, Target>,
+    pub execution_targets: BTreeMap<String, ExecutionTarget>,
+    pub consensus_targets: BTreeMap<String, ConsensusTarget>,
+    #[serde(default = "proof_workers")]
+    pub proof_workers: usize,
     #[serde(default = "cache_bytes")]
     pub cache_max_bytes: u64,
+}
+fn proof_workers() -> usize {
+    2
 }
 fn cache_bytes() -> u64 {
     128 * 1024 * 1024
@@ -79,19 +85,31 @@ pub struct Source {
 }
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Target {
+pub struct ExecutionTarget {
     pub engine_url: String,
     pub rpc_url: String,
     pub jwt_secret_path: PathBuf,
+}
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConsensusTarget {
+    pub beacon_url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+impl fmt::Debug for ConsensusTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConsensusTarget { credentials: [REDACTED] }")
+    }
 }
 impl fmt::Debug for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Source { credentials: [REDACTED] }")
     }
 }
-impl fmt::Debug for Target {
+impl fmt::Debug for ExecutionTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Target { credentials: [REDACTED] }")
+        f.write_str("ExecutionTarget { credentials: [REDACTED] }")
     }
 }
 pub fn url(value: &str) -> Result<Url> {
@@ -107,12 +125,18 @@ pub fn url(value: &str) -> Result<Url> {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            !self.sources.is_empty() && !self.targets.is_empty(),
+            !self.sources.is_empty()
+                && !(self.execution_targets.is_empty() && self.consensus_targets.is_empty()),
             "relay requires sources and targets"
         );
         ensure!(
-            self.sources.len() <= 16 && self.targets.len() <= 64,
+            self.sources.len() <= 16
+                && self.execution_targets.len() + self.consensus_targets.len() <= 64,
             "relay supports at most 16 sources and 64 targets per process"
+        );
+        ensure!(
+            (1..=16).contains(&self.proof_workers),
+            "proof workers must be between 1 and 16"
         );
         ensure!(
             self.network.seconds_per_slot > 0 && self.network.seconds_per_slot <= 60,
@@ -139,12 +163,19 @@ impl Config {
             url(&source.beacon_url)?;
         }
         let mut engines = std::collections::BTreeSet::new();
-        for target in self.targets.values() {
+        for target in self.execution_targets.values() {
             ensure!(
                 engines.insert(url(&target.engine_url)?.to_string()),
                 "duplicate Engine endpoint"
             );
             url(&target.rpc_url)?;
+        }
+        let mut beacons = std::collections::BTreeSet::new();
+        for target in self.consensus_targets.values() {
+            ensure!(
+                beacons.insert(url(&target.beacon_url)?.to_string()),
+                "duplicate Beacon target endpoint"
+            );
         }
         Ok(())
     }

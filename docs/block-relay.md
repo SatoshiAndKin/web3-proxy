@@ -1,12 +1,14 @@
 # Block relay
 
-The objective is to reduce the time until **every execution node returns a new
-block through its direct RPC**. This feature is an experiment, not a proven speed
-improvement. It can also add execution contention and make a node slower.
+The objective is to reduce the time until every execution and consensus node
+imports a new block, and every stack exposes the canonical head. This feature is
+an experiment, not a proven speed improvement. Duplicate execution and consensus
+work can make a node slower. Measure the whole fleet before retaining injection.
 
 Use the existing Geth, Reth, and Lighthouse instances. Do not start more
-Ethereum clients for this feature. No node configuration or peer
-topology changes form part of this change.
+Ethereum clients for this feature. Keep their existing native peer connections.
+Full blob reconstruction may require a measured data-custody change on an
+existing consensus node. That change is a separate experiment from injection.
 
 ## Cross-client contract
 
@@ -14,10 +16,16 @@ The relay submits complete execution payloads through the private, JWT-protected
 `engine_newPayloadV4` method. It does not use a Reth-specific block import method.
 The Engine specification permits additional payload producers when only one
 consensus client controls fork choice. This relay never calls
-`engine_forkchoiceUpdated`, requests payload builds, or publishes unverified
-blocks to consensus gossip. Each existing Lighthouse instance keeps sole control
+`engine_forkchoiceUpdated` or requests payload builds. Each existing Lighthouse instance keeps sole control
 of its execution node's chain head.
 [Engine API common definitions](https://github.com/ethereum/execution-apis/blob/main/src/engine/common.md#load-balancing-and-advanced-configurations).
+
+Consensus targets receive the original signed Beacon block and complete blob
+contents through `POST /eth/v2/beacon/blocks?broadcast_validation=gossip`. The
+`Eth-Consensus-Version` header selects the fork. Electra uses blob proofs; Fulu
+uses cell proofs. The relay checks each blob against its commitment and generates
+the proofs with Ethereum's trusted KZG setup. Lighthouse still checks the proposer
+signature and consensus rules. The relay does not sign blocks or need validator keys.
 
 This implementation supports Electra/Fulu blocks with the mainnet SSZ preset.
 It checks network genesis, slot duration, configured fork versions and epochs,
@@ -32,20 +40,24 @@ assume it works. The relay does not support PoW or arbitrary EVM chains.
 Existing local Lighthouse instances + external Beacon APIs
                    │ block_gossip / block events
                    ▼
-  Race full-block reads → verify roots → encode one Engine V4 body
+  Race full-block reads → verify roots and execution hash
                    │
-         ┌─────────┼─────────┐
-         ▼         ▼         ▼
-       Geth      Reth     next client
-       Engine    Engine     Engine
-         │         │         │
-       Direct RPC readiness probes, independent of delivery
+         ┌─────────┴─────────────────┐
+         ▼                           ▼
+  Engine V4 payload          Race blobs → verify commitments
+         │                           │ generate fork-correct proofs
+         ▼                           ▼
+  All execution targets       All consensus targets
+         │                           │
+  Direct RPC probes           Non-optimistic Beacon header probes
+         └─────────────┬─────────────┘
+                Full-fleet readiness
 ```
 
 Sources never enter `balanced_rpcs`, `private_rpcs`, or the proxy's readiness
 quorum. Local and external sources use the same path. A local first arrival can
 therefore reach the other configured targets. “Peers” here means configured
-Engine targets, not arbitrary Ethereum P2P peers.
+execution and consensus destinations, not arbitrary Ethereum P2P peers.
 
 Each source must provide genesis, fork schedule, spec, full-block, header, and
 event endpoints from the standard Beacon API. Alchemy documents a separate
@@ -64,14 +76,16 @@ The source requests both `block_gossip` and `block`. It falls back to `block` if
 the server rejects the combined topics. A gossip event can precede full-block
 availability. An imported event wakes the pending fetch after a 404. Reads race
 all verified sources; the first **verified full block**, not the first HTTP
-response, wins. A reconnect reconciles up to eight recent ancestors by root.
+response, wins. Retry ready sources while slower requests remain pending. A
+reconnect reconciles up to eight recent ancestors by root.
 
 The relay checks the complete Beacon root, execution block hash, payload
 timestamp, and transaction/blob-commitment order. It includes the parent Beacon
 root and SSZ-encoded, type-prefixed execution requests. Empty request types stay
 absent. These checks bind the data to the announced root; they do **not** verify
-the proposer signature, consensus state, or blob availability. Configure trusted
-sources. The execution clients still validate the payload.
+the proposer signature or consensus state. Execution delivery does not wait for
+blobs. Consensus delivery waits for complete, checked blobs and locally generated
+proofs. Configure trusted sources. Destination clients retain native validation.
 [Engine V4 parameters](https://github.com/ethereum/execution-apis/blob/main/src/engine/prague.md#engine_newpayloadv4).
 
 Each target has one delivery worker. It prefers recent slots, retains competing
@@ -80,6 +94,16 @@ another. Readiness probes run separately; they do not add a read round trip befo
 each submission. The worker skips a block when a completed probe has already
 confirmed it. Concurrent arrival can still cause a duplicate submission. Measure
 that cost, especially when the local Lighthouse was the first source.
+
+Multiple forwarders can submit to the same complete destination list. Each sender
+keeps its own bounded queues and duplicate suppression. There is no cross-host
+leader, target partition, exclusion lock, or delay for the second sender.
+
+Consensus publication responses do not establish readiness. In particular, HTTP
+202 can mean the block was broadcast but not imported. Confirm the requested
+header root and non-optimistic execution status. Track canonical availability
+separately. Repair at most eight cached Beacon ancestors and bound child retries.
+Keep competing roots at the same slot. Native sync handles larger gaps.
 
 `VALID`, `ACCEPTED`, `SYNCING`, and `INVALID` remain distinct. `VALID` must name the
 submitted hash. It is not evidence that direct RPC or canonical queries are ready.
@@ -91,8 +115,9 @@ The Engine response deadline is eight seconds. A timeout or malformed response
 does not prove that the node stopped execution. The worker suspends new submissions
 until direct RPC confirms that block. This state survives configuration reloads
 for a retained Engine URL. Removing the relay or restarting its process clears
-in-memory state; first resolve any unknown imports. Never run two injecting relay
-processes against the same targets.
+in-memory state; first resolve any unknown imports before restarting this version.
+This limitation remains until the durable journal is installed; do not deploy
+the intermediate implementation for production injection.
 Do not list one physical Engine endpoint through multiple DNS or URL aliases.
 Pair each Engine URL with the direct RPC URL of that same execution instance.
 
@@ -100,7 +125,9 @@ Pair each Engine URL with the direct RPC URL of that same execution instance.
 
 Use [the example config](block-relay.example.toml). Set `GETH_JWT_PATH` and
 `RETH_JWT_PATH` to the **existing** secret files, as seen by this process. The
-process needs read access. Keep Engine URLs on the private network. Do not expose
+process needs read access. Configure `execution_targets` and `consensus_targets`
+separately. These replace the old, unreleased execution-only target configuration;
+there is no alias for that format. Keep Engine and Beacon publication URLs on the private network. Do not expose
 JWT files, put their contents in config, or commit account keys.
 The example uses loopback addresses. Adjust ports to match the existing clients;
 use private host addresses if the relay runs on a different machine.
@@ -118,18 +145,24 @@ stops intake and lets an outstanding Engine request finish or reach its deadline
 Alternatively, add `[block_relay]` to the existing proxy config and use `proxyd`.
 The same service then appears under `block_relay` in `/status`. Its failure does
 not change proxy readiness. The proxy's existing config watcher uses its normal
-reload interval. Use only one deployment path for a given target fleet.
+reload interval. Do not enable this embedded service on a proxy host that already
+runs a standalone forwarder. Independent forwarders on different hosts can each
+submit to the full target fleet.
 
 Omit the section to disable the service. `mode = "observe"` is the default. It
 checks capabilities, fetches and verifies blocks, and probes direct RPCs, but
-never submits a payload. Change only `mode` to `"inject"` for an approved trial.
+never sends Engine payloads or Beacon publications. Change only `mode` to
+`"inject"` for an approved trial.
 Mode-only reloads retain streams and warm caches. Switching back to observe
 prevents queued imports and ancestor repairs; an import already sent may finish.
 Other config changes drain the previous workers before they start replacements.
+Changing the proof-worker count requires a process restart. KZG setup runs on the
+blocking pool during preparation, before source intake. Blob decoding uses
+heap-backed bytes; proof work has its own bounded pool and cannot occupy the
+execution decoder pool or its source-read permits.
 Invalid local config leaves the previous config active.
 
-No deployment or injection against the existing fleet occurred during implementation.
-A read-only check verified a real Fulu Beacon root and execution hash against
+The initial read-only check verified a real Fulu Beacon root and execution hash against
 Geth 1.17.5 and Reth 2.5.1, using the existing Lighthouse 8.2.2 API. Repeat it with:
 
 ```sh
@@ -154,7 +187,7 @@ of `BlockRelay::samples()`. Public `/status` omits those records, URLs, headers,
 JWT paths, and JWT contents. Its histograms are cumulative since the last full
 config reload and mix modes; do not use them as the trial comparison.
 
-Each record includes the block hash and slot, announcement source, successful
+Each record includes its execution/consensus layer, Beacon root, execution hash and slot, announcement source, successful
 fetch source, mode, acquisition time, target, last confirmed absence, first RPC
 readiness, and canonical readiness. Times use one process's monotonic clock and
 start at its first Beacon announcement. No clock synchronization between nodes
@@ -168,8 +201,9 @@ seconds; a final response can cross the one-slot observation deadline.
 
 For each block, calculate the maximum target readiness time and the difference
 between the last and first target. Report p50, p95, and p99 for both. Also report
-canonical readiness, incomplete observations, left-censoring, dropped work,
-source outages, and Engine outcomes. Never discard timeouts to improve a percentile.
+canonical readiness across all targets, incomplete observations, left-censoring,
+dropped work, source outages, Engine outcomes, and Beacon publication responses.
+Never discard timeouts to improve a percentile. A successful POST is not a speed result.
 
 Use a preselected, randomized sequence of epoch-sized observe/inject windows.
 Exclude the first two slots after each mode transition from latency comparisons
@@ -192,8 +226,10 @@ the existing Lighthouse gossip path and node execution timings first.
 The payload cache defaults to 128 MiB with a two-epoch TTL. It is not a total
 process memory cap: requests, queued work, and observations can retain payloads.
 The process allows 16 sources, 64 targets, eight concurrent acquisitions, four
-concurrent decoding tasks, two full reads per source, and four probe sessions per
-target. Announcement intake holds 256 events. Target delivery and pending queues
+concurrent execution decoding tasks, a separate bounded proof pool, two block
+reads and two blob reads per source, and four probe sessions per target.
+Consensus contents use a separate cache with the same configured byte bound.
+Announcement intake holds 256 events. Target delivery and pending queues
 hold 128 blocks each. Observations hold at most 128 block sessions. HTTP responses
 have a 32 MiB limit. SSE connections recycle after 1 MiB to bound parser memory.
 Overflow counters are visible. Use modest source/target counts, private monitoring,

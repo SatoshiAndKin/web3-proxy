@@ -519,6 +519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "417dc664965e36fc43a4f9c8eb8b2d14067a29c430e23470d2c923c1c977bac7"
 dependencies = [
  "alloy-primitives",
+ "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-serde",
  "serde",
@@ -6259,6 +6260,7 @@ dependencies = [
  "serde_json",
  "shellexpand",
  "sonic-rs",
+ "tempfile",
  "test-log",
  "tokio",
  "tokio-stream",

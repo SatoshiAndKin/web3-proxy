@@ -39,6 +39,40 @@ pub struct TargetStats {
     pub canonical_latency: Distribution,
 }
 
+#[derive(Serialize, Default)]
+pub struct ConsensusStats {
+    pub health: Endpoint,
+    pub sent: u64,
+    pub published: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub unknown: u64,
+    pub skipped_known: u64,
+    pub queue_dropped: u64,
+    pub repairs: u64,
+    pub repair_gaps: u64,
+    pub ready: u64,
+    pub optimistic: u64,
+    pub incomplete: u64,
+    pub left_censored: u64,
+    pub publish_latency: Distribution,
+    pub ready_latency: Distribution,
+    pub canonical_latency: Distribution,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layer {
+    Execution,
+    Consensus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Observation {
+    pub ready: Option<u64>,
+    pub canonical: Option<u64>,
+}
+
 pub struct Distribution(Histogram<u64>);
 impl Default for Distribution {
     fn default() -> Self {
@@ -75,7 +109,8 @@ pub struct Stats {
     pub mode: Mode,
     pub config_error: Option<String>,
     pub sources: BTreeMap<String, Endpoint>,
-    pub targets: BTreeMap<String, TargetStats>,
+    pub execution_targets: BTreeMap<String, TargetStats>,
+    pub consensus_targets: BTreeMap<String, ConsensusStats>,
     pub acquired: u64,
     pub acquisition_failed: u64,
     pub acquisition_dropped: u64,
@@ -86,6 +121,12 @@ pub struct Stats {
     pub fleet_spread: Distribution,
     pub fleet_incomplete: u64,
     pub observation_dropped: u64,
+    pub consensus_acquired: u64,
+    pub consensus_acquisition_failed: u64,
+    pub consensus_acquisition_dropped: u64,
+    pub consensus_acquisition_latency: Distribution,
+    pub fleet_canonical_latency: Distribution,
+    pub fleet_canonical_incomplete: u64,
     #[serde(skip)]
     pub samples: VecDeque<Sample>,
 }
@@ -93,6 +134,8 @@ pub struct Stats {
 /// Private diagnostic records. `/status` exposes aggregates only.
 #[derive(Clone, Debug, Serialize)]
 pub struct Sample {
+    pub layer: Layer,
+    pub beacon_root: alloy::primitives::B256,
     pub hash: alloy::primitives::B256,
     pub slot: u64,
     pub source: String,
@@ -104,6 +147,25 @@ pub struct Sample {
     pub last_missing_us: Option<u64>,
     pub first_ready_us: Option<u64>,
     pub canonical_us: Option<u64>,
+}
+impl Sample {
+    pub(super) fn new(work: &super::Work, target: &str, layer: Layer) -> Self {
+        Self {
+            layer,
+            beacon_root: work.payload.beacon_root,
+            hash: work.payload.hash,
+            slot: work.payload.slot,
+            source: work.source.clone(),
+            announcement_source: work.announcement_source.clone(),
+            event: work.event,
+            mode: work.mode,
+            acquired_us: micros(work.acquired.duration_since(work.first_seen)),
+            target: target.into(),
+            last_missing_us: None,
+            first_ready_us: None,
+            canonical_us: None,
+        }
+    }
 }
 impl Stats {
     pub fn source_error(&mut self, name: &str, detail: &str) {

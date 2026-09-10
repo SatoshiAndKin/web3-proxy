@@ -13,6 +13,7 @@ use tokio::{
     time::{timeout, Instant},
 };
 
+mod consensus;
 mod mocks;
 mod review;
 use mocks::{MockBeacon, MockRpc, Server};
@@ -264,6 +265,9 @@ fn work(hash: u8, parent: u8, number: u64, mode: config::Mode, names: &[&str]) -
             beacon_root: hash,
             parent_beacon_root: B256::ZERO,
             body,
+            fork: "electra".into(),
+            signed_block: bytes::Bytes::from_static(b"{}"),
+            blob_commitments: Vec::new(),
         }),
         first_seen: now,
         acquired: now,
@@ -308,7 +312,7 @@ impl Worker {
         until(|| {
             stats
                 .lock()
-                .targets
+                .execution_targets
                 .get(&target.name)
                 .is_some_and(|t| t.health.connected)
         })
@@ -338,11 +342,14 @@ async fn observe_never_posts_and_rpc_errors_are_not_missing_blocks() {
     let mut block = work(1, 0, 1, config::Mode::Observe, &["a"]);
     Arc::get_mut(&mut block).unwrap().deadline = Instant::now() + Duration::from_millis(30);
     worker.tx.send(block.clone()).unwrap();
-    assert_eq!(target.observe(block, worker.stats.clone()).await, None);
+    assert_eq!(
+        target.observe(block, worker.stats.clone()).await,
+        stats::Observation::default()
+    );
     let sample = worker.stats.lock().samples.back().unwrap().clone();
     assert_eq!(sample.last_missing_us, None);
     assert_eq!(sample.first_ready_us, None);
-    assert_eq!(worker.stats.lock().targets["a"].incomplete, 1);
+    assert_eq!(worker.stats.lock().execution_targets["a"].incomplete, 1);
     worker.finish().await;
     assert_eq!(rpc.payload_hashes(), Vec::<B256>::new());
     assert_eq!(rpc.state.lock().bad_jwt, 0);
@@ -360,7 +367,7 @@ async fn deduplicates_by_hash_and_keeps_competing_blocks_at_the_same_slot() {
         .tx
         .send(work(2, 0, 1, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].valid == 2).await;
+    until(|| worker.stats.lock().execution_targets["a"].valid == 2).await;
     worker.finish().await;
     let mut hashes = rpc.payload_hashes();
     hashes.sort();
@@ -397,8 +404,8 @@ async fn repairs_cached_ancestors_oldest_first_then_retries_syncing_child_once()
         .tx
         .send(work(3, 2, 3, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].valid == 2).await;
-    assert_eq!(worker.stats.lock().targets["a"].repairs, 1);
+    until(|| worker.stats.lock().execution_targets["a"].valid == 2).await;
+    assert_eq!(worker.stats.lock().execution_targets["a"].repairs, 1);
     worker.finish().await;
     assert_eq!(
         rpc.payload_hashes(),
@@ -423,12 +430,12 @@ async fn invalid_ancestor_blocks_descendants_without_retry() {
         .tx
         .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].invalid == 1).await;
+    until(|| worker.stats.lock().execution_targets["a"].invalid == 1).await;
     worker
         .tx
         .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].skipped_invalid_ancestor == 1).await;
+    until(|| worker.stats.lock().execution_targets["a"].skipped_invalid_ancestor == 1).await;
     worker.finish().await;
     assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
 }
@@ -449,7 +456,8 @@ async fn slow_target_does_not_delay_others_and_shutdown_drains_current_import() 
     let block = work(1, 0, 1, config::Mode::Inject, &["a", "b"]);
     a.tx.send(block.clone()).unwrap();
     b.tx.send(block).unwrap();
-    until(|| b.stats.lock().targets["b"].valid == 1 && slow.payload_hashes().len() == 1).await;
+    until(|| b.stats.lock().execution_targets["b"].valid == 1 && slow.payload_hashes().len() == 1)
+        .await;
     a.tx.send(work(2, 1, 2, config::Mode::Inject, &["a"]))
         .unwrap();
     a.stop.send_replace(true);
@@ -487,7 +495,7 @@ async fn switching_to_observe_stops_queued_injections() {
         .unwrap();
     worker.mode.send_replace(config::Mode::Observe);
     gate.notify_one();
-    until(|| worker.stats.lock().targets["a"].valid == 1).await;
+    until(|| worker.stats.lock().execution_targets["a"].valid == 1).await;
     // FIFO marker: the worker must consume the queued item without posting it.
     until(|| worker.tx.is_empty()).await;
     worker.finish().await;
@@ -497,12 +505,14 @@ async fn switching_to_observe_stops_queued_injections() {
 fn relay_config(
     network: config::Network,
     sources: &[(&str, &str)],
-    targets: &[(&str, &str)],
+    execution_targets: &[(&str, &str)],
 ) -> config::Config {
     config::Config {
         mode: config::Mode::Observe,
         network,
         cache_max_bytes: 1024 * 1024,
+        consensus_targets: BTreeMap::new(),
+        proof_workers: 2,
         sources: sources
             .iter()
             .map(|(name, url)| {
@@ -515,12 +525,12 @@ fn relay_config(
                 )
             })
             .collect(),
-        targets: targets
+        execution_targets: execution_targets
             .iter()
             .map(|(name, url)| {
                 (
                     name.to_string(),
-                    config::Target {
+                    config::ExecutionTarget {
                         engine_url: url.to_string(),
                         rpc_url: url.to_string(),
                         jwt_secret_path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -558,8 +568,10 @@ async fn complete_pipeline_races_valid_sources_deduplicates_and_reloads_mode_wit
     until(|| {
         local.events.receiver_count() == 1
             && external.events.receiver_count() == 1
-            && relay.snapshot()["targets"]["a"]["health"]["connected"].as_bool() == Some(true)
-            && relay.snapshot()["targets"]["b"]["health"]["connected"].as_bool() == Some(true)
+            && relay.snapshot()["execution_targets"]["a"]["health"]["connected"].as_bool()
+                == Some(true)
+            && relay.snapshot()["execution_targets"]["b"]["health"]["connected"].as_bool()
+                == Some(true)
     })
     .await;
     let block = beacon(&network);
@@ -597,8 +609,8 @@ async fn complete_pipeline_races_valid_sources_deduplicates_and_reloads_mode_wit
     local.announce("block_gossip", root, competitor.data.message.slot);
     external.announce("block", root, competitor.data.message.slot);
     until(|| {
-        relay.snapshot()["targets"]["a"]["valid"].as_u64() == Some(1)
-            && relay.snapshot()["targets"]["b"]["valid"].as_u64() == Some(1)
+        relay.snapshot()["execution_targets"]["a"]["valid"].as_u64() == Some(1)
+            && relay.snapshot()["execution_targets"]["b"]["valid"].as_u64() == Some(1)
     })
     .await;
     assert_eq!(a.payload_hashes(), vec![expected.hash]);
@@ -736,7 +748,8 @@ async fn rejects_wrong_network_capability_and_bad_config_without_losing_current_
     let relay = BlockRelay::new();
     relay.apply(Some(&config)).await.unwrap();
     let mut bad = config.clone();
-    bad.targets.get_mut("a").unwrap().jwt_secret_path = "/missing/credential-must-not-leak".into();
+    bad.execution_targets.get_mut("a").unwrap().jwt_secret_path =
+        "/missing/credential-must-not-leak".into();
     assert_eq!(
         relay.apply(Some(&bad)).await.unwrap_err().to_string(),
         "cannot read a target JWT secret"
@@ -775,7 +788,7 @@ async fn unknown_timeout_suspends_target_until_rpc_confirms_without_blind_retry(
     worker.tx.send(block).unwrap();
     until(|| rpc.payload_hashes().len() == 1).await;
     timeout(Duration::from_secs(10), async {
-        while worker.stats.lock().targets["a"].unknown != 1 {
+        while worker.stats.lock().execution_targets["a"].unknown != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -788,7 +801,7 @@ async fn unknown_timeout_suspends_target_until_rpc_confirms_without_blind_retry(
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
     gate.notify_one();
-    until(|| worker.stats.lock().targets["a"].valid == 1).await;
+    until(|| worker.stats.lock().execution_targets["a"].valid == 1).await;
     worker.finish().await;
     assert_eq!(
         rpc.payload_hashes(),
@@ -810,12 +823,12 @@ async fn retries_syncing_child_when_missing_parent_arrives_later() {
         .tx
         .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].repair_gaps == 1).await;
+    until(|| worker.stats.lock().execution_targets["a"].repair_gaps == 1).await;
     worker
         .tx
         .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].valid == 2).await;
+    until(|| worker.stats.lock().execution_targets["a"].valid == 2).await;
     worker.finish().await;
     assert_eq!(
         rpc.payload_hashes(),
@@ -838,9 +851,9 @@ async fn validates_response_hash_and_does_not_count_engine_valid_as_rpc_readines
         .tx
         .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
         .unwrap();
-    until(|| worker.stats.lock().targets["a"].unknown == 1).await;
-    assert_eq!(worker.stats.lock().targets["a"].valid, 0);
-    assert_eq!(worker.stats.lock().targets["a"].ready, 0);
+    until(|| worker.stats.lock().execution_targets["a"].unknown == 1).await;
+    assert_eq!(worker.stats.lock().execution_targets["a"].valid, 0);
+    assert_eq!(worker.stats.lock().execution_targets["a"].ready, 0);
     worker.finish().await;
     assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
 }
@@ -885,15 +898,15 @@ fn sample_config_is_separate_from_routing_and_defaults_are_safe() {
         "electra"
     );
     assert_eq!(relay.sources.len(), 2);
-    assert_eq!(relay.targets.len(), 2);
+    assert_eq!(relay.execution_targets.len(), 2);
     relay.network.seconds_per_slot = 0;
     assert_eq!(
         relay.validate().unwrap_err().to_string(),
         "invalid slot duration"
     );
     relay.network.seconds_per_slot = 12;
-    let geth = relay.targets["geth"].clone();
-    relay.targets.insert("duplicate".into(), geth);
+    let geth = relay.execution_targets["geth"].clone();
+    relay.execution_targets.insert("duplicate".into(), geth);
     assert_eq!(
         relay.validate().unwrap_err().to_string(),
         "duplicate Engine endpoint"

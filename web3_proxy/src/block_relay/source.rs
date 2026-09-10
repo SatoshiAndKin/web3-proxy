@@ -11,7 +11,6 @@ use alloy_rpc_types_beacon::{
 use anyhow::{ensure, Result};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{de::DeserializeOwned, Deserialize};
 use std::{
     sync::{
@@ -21,7 +20,6 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::mpsc, time::Instant};
-use url::Url;
 
 /// Retry failed sources without canceling or waiting for unrelated pending reads.
 pub(super) async fn race_sources<T, F, Fut>(
@@ -78,105 +76,87 @@ pub struct Announcement {
 
 pub struct BeaconSource {
     pub name: String,
-    base: Url,
-    client: reqwest::Client,
-    headers: HeaderMap,
+    pub(super) http: transport::BeaconHttp,
     pub verified: AtomicBool,
-    pub reads: tokio::sync::Semaphore,
 }
 impl BeaconSource {
     pub fn new(name: String, config: &Source) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        for (key, value) in &config.headers {
-            let key = HeaderName::from_bytes(key.as_bytes())
-                .map_err(|_| anyhow::anyhow!("invalid source header name"))?;
-            let mut value = HeaderValue::from_str(value)
-                .map_err(|_| anyhow::anyhow!("invalid source header value"))?;
-            value.set_sensitive(true);
-            headers.insert(key, value);
-        }
         Ok(Self {
             name,
-            base: super::config::url(&config.beacon_url)?,
-            client: transport::client()?,
-            headers,
+            http: transport::BeaconHttp::new(&config.beacon_url, &config.headers)?,
             verified: AtomicBool::new(false),
-            reads: tokio::sync::Semaphore::new(2),
         })
     }
-    fn endpoint(&self, path: &str) -> Url {
-        let mut url = self.base.clone();
-        url.set_path(&format!(
-            "{}{}",
-            self.base.path().trim_end_matches('/'),
-            path
-        ));
-        url
-    }
     pub async fn get_bytes(&self, path: &str) -> Result<bytes::Bytes> {
-        let _permit = self.reads.acquire().await?;
-        let response = self
-            .client
-            .get(self.endpoint(path))
-            .headers(self.headers.clone())
-            .timeout(transport::READ_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| anyhow::anyhow!("Beacon transport error"))?;
-        transport::body(response).await
+        self.http
+            .get_bytes(path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Beacon block not found"))
     }
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         sonic_rs::from_slice(&self.get_bytes(path).await?)
             .map_err(|_| anyhow::anyhow!("invalid Beacon response"))
     }
     pub async fn validate(&self, network: &Network) -> Result<()> {
-        let (genesis, schedule, spec) = tokio::try_join!(
-            self.get::<GenesisResponse>("/eth/v1/beacon/genesis"),
-            self.get::<ForkScheduleResponse>("/eth/v1/config/fork_schedule"),
-            self.get::<SpecResponse>("/eth/v1/config/spec"),
-        )?;
-        ensure!(
-            genesis.data.genesis_validators_root == network.genesis_validators_root
-                && genesis.data.genesis_time == network.genesis_time,
-            "Beacon genesis mismatch"
-        );
-        ensure!(
-            spec.data.get("PRESET_BASE").is_some_and(|s| s == "mainnet"),
-            "unsupported Beacon preset"
-        );
-        ensure!(
-            spec.data
-                .get("SECONDS_PER_SLOT")
-                .and_then(|s| s.parse::<u64>().ok())
-                == Some(network.seconds_per_slot),
-            "slot duration mismatch"
-        );
-        for fork in &network.forks {
-            ensure!(
-                schedule
-                    .data
-                    .iter()
-                    .any(|f| f.current_version == fork.version && f.epoch == fork.epoch),
-                "Beacon fork schedule mismatch"
-            );
-        }
-        // Older forks may be omitted from our short-horizon schedule. New ones may not.
-        let first = network.forks.first().expect("validated config").epoch;
-        for fork in schedule
-            .data
-            .iter()
-            .filter(|f| f.epoch >= first && f.epoch != u64::MAX)
-        {
-            ensure!(
-                network
-                    .forks
-                    .iter()
-                    .any(|f| f.version == fork.current_version && f.epoch == fork.epoch),
-                "unconfigured Beacon fork; update relay schedule"
-            );
-        }
-        Ok(())
+        validate_network(&self.http, network).await
     }
+}
+
+pub(super) async fn validate_network(
+    http: &transport::BeaconHttp,
+    network: &Network,
+) -> Result<()> {
+    let (genesis, schedule, spec) = tokio::try_join!(
+        http.get_optional::<GenesisResponse>("/eth/v1/beacon/genesis"),
+        http.get_optional::<ForkScheduleResponse>("/eth/v1/config/fork_schedule"),
+        http.get_optional::<SpecResponse>("/eth/v1/config/spec"),
+    )?;
+    let genesis = genesis.ok_or_else(|| anyhow::anyhow!("missing Beacon genesis"))?;
+    let schedule = schedule.ok_or_else(|| anyhow::anyhow!("missing Beacon fork schedule"))?;
+    let spec = spec.ok_or_else(|| anyhow::anyhow!("missing Beacon spec"))?;
+    ensure!(
+        genesis.data.genesis_validators_root == network.genesis_validators_root
+            && genesis.data.genesis_time == network.genesis_time,
+        "Beacon genesis mismatch"
+    );
+    ensure!(
+        spec.data.get("PRESET_BASE").is_some_and(|s| s == "mainnet"),
+        "unsupported Beacon preset"
+    );
+    ensure!(
+        spec.data
+            .get("SECONDS_PER_SLOT")
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(network.seconds_per_slot),
+        "slot duration mismatch"
+    );
+    for fork in &network.forks {
+        ensure!(
+            schedule
+                .data
+                .iter()
+                .any(|f| f.current_version == fork.version && f.epoch == fork.epoch),
+            "Beacon fork schedule mismatch"
+        );
+    }
+    // Older forks may be omitted from our short-horizon schedule. New ones may not.
+    let first = network.forks.first().expect("validated config").epoch;
+    for fork in schedule
+        .data
+        .iter()
+        .filter(|f| f.epoch >= first && f.epoch != u64::MAX)
+    {
+        ensure!(
+            network
+                .forks
+                .iter()
+                .any(|f| f.version == fork.current_version && f.epoch == fork.epoch),
+            "unconfigured Beacon fork; update relay schedule"
+        );
+    }
+    Ok(())
+}
+impl BeaconSource {
     async fn reconcile(&self, tx: &mpsc::Sender<Announcement>, network: &Network) -> Result<()> {
         // Follow roots, not slot numbers, so skipped slots and reorgs remain well-defined.
         let mut id = "head".to_string();
@@ -228,16 +208,22 @@ impl BeaconSource {
         tx: &mpsc::Sender<Announcement>,
         stats: &super::stats::Shared,
     ) -> Result<()> {
-        let mut url = self.endpoint("/eth/v1/events");
+        let mut url = self.http.endpoint("/eth/v1/events");
         url.query_pairs_mut()
             .append_pair("topics", "block_gossip,block");
-        let send = |url| self.client.get(url).headers(self.headers.clone()).send();
+        let send = |url| {
+            self.http
+                .client
+                .get(url)
+                .headers(self.http.headers.clone())
+                .send()
+        };
         let mut response = tokio::time::timeout(transport::ENGINE_TIMEOUT, send(url))
             .await?
             .map_err(|_| anyhow::anyhow!("event stream connection error"))?;
         let mut topic = "block_gossip,block";
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
-            let mut url = self.endpoint("/eth/v1/events");
+            let mut url = self.http.endpoint("/eth/v1/events");
             url.query_pairs_mut().append_pair("topics", "block");
             response = tokio::time::timeout(transport::ENGINE_TIMEOUT, send(url))
                 .await?

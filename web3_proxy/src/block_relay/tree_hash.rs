@@ -88,7 +88,7 @@ fn indexed(a: &IndexedAttestation) -> Result<B256> {
         vector(a.signature.as_slice()),
     ]))
 }
-fn header(h: &BeaconBlockHeader) -> B256 {
+pub(super) fn header(h: &BeaconBlockHeader) -> B256 {
     container(&[
         uint(h.slot),
         uint(h.proposer_index),
@@ -143,6 +143,12 @@ fn execution(p: &ExecutionPayloadV3) -> Result<B256> {
 }
 
 pub fn block_root(block: &BeaconBlock<BeaconBlockBodyElectra<BeaconPayload>>) -> Result<B256> {
+    Ok(header(&block_header(block)?))
+}
+
+pub(super) fn block_header(
+    block: &BeaconBlock<BeaconBlockBodyElectra<BeaconPayload>>,
+) -> Result<BeaconBlockHeader> {
     let b = &block.body;
     let ExecutionPayload::V3(payload) = &b.execution_payload.0 else {
         anyhow::bail!("unsupported execution payload");
@@ -288,11 +294,11 @@ pub fn block_root(block: &BeaconBlock<BeaconBlockBodyElectra<BeaconPayload>>) ->
             list(&consolidations, MAX_CONSOLIDATION_REQUESTS_PER_BLOCK)?,
         ]),
     ]);
-    Ok(container(&[
-        uint(block.slot),
-        uint(block.proposer_index),
-        block.parent_root,
-        block.state_root,
-        body,
-    ]))
+    Ok(BeaconBlockHeader {
+        slot: block.slot,
+        proposer_index: block.proposer_index,
+        parent_root: block.parent_root,
+        state_root: block.state_root,
+        body_root: body,
+    })
 }

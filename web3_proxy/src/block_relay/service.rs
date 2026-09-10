@@ -1,6 +1,7 @@
 use super::{
     config::{Config, Mode, SLOTS_PER_EPOCH},
-    payload::RelayPayload,
+    consensus::{ConsensusTarget, ConsensusWork},
+    payload::{ConsensusPayload, RelayPayload},
     source::{race_sources, Announcement, BeaconSource},
     stats::{self, Shared, Stats},
     target::Target,
@@ -9,7 +10,7 @@ use super::{
 use alloy::primitives::B256;
 use alloy_rpc_types_engine::JwtSecret;
 use anyhow::Result;
-use futures_util::{stream::FuturesUnordered, StreamExt};
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moka::future::Cache;
 use parking_lot::Mutex;
 use std::{
@@ -39,19 +40,31 @@ pub(super) struct Work {
 struct Prepared {
     config: Config,
     sources: Vec<Arc<BeaconSource>>,
-    targets: Vec<Arc<Target>>,
+    execution_targets: Vec<Arc<Target>>,
+    consensus_targets: Vec<Arc<ConsensusTarget>>,
     decoders: Arc<tokio::sync::Semaphore>,
+    proof_workers: Arc<tokio::sync::Semaphore>,
 }
 impl Prepared {
     fn new(config: Config, previous: Option<Arc<Self>>) -> Result<Self> {
         config.validate()?;
+        if !config.consensus_targets.is_empty() {
+            // Prepared::new runs on the blocking pool, before any source intake starts.
+            let _ = alloy::eips::eip4844::env_settings::EnvKzgSettings::Default.get();
+        }
+        if let Some(previous) = &previous {
+            anyhow::ensure!(
+                previous.config.proof_workers == config.proof_workers,
+                "changing proof workers requires a process restart"
+            );
+        }
         let sources = config
             .sources
             .iter()
             .map(|(name, config)| BeaconSource::new(name.clone(), config).map(Arc::new))
             .collect::<Result<_>>()?;
         let targets = config
-            .targets
+            .execution_targets
             .iter()
             .map(|(name, config)| {
                 let engine_url = super::config::url(&config.engine_url)?;
@@ -61,12 +74,14 @@ impl Prepared {
                     .as_ref()
                     .and_then(|p| {
                         p.config
-                            .targets
+                            .execution_targets
                             .iter()
                             .find(|(_, t)| {
                                 super::config::url(&t.engine_url).as_ref().ok() == Some(&engine_url)
                             })
-                            .and_then(|(name, _)| p.targets.iter().find(|t| &t.name == name))
+                            .and_then(|(name, _)| {
+                                p.execution_targets.iter().find(|t| &t.name == name)
+                            })
                     })
                     .map(|t| t.uncertain.clone())
                     .unwrap_or_default();
@@ -80,13 +95,26 @@ impl Prepared {
             })
             .collect::<Result<_>>()?;
         let decoders = previous
+            .as_ref()
             .map(|p| p.decoders.clone())
             .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(4)));
+        let proof_workers = previous
+            .as_ref()
+            .map(|p| p.proof_workers.clone())
+            .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(config.proof_workers)));
+        let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * config.network.seconds_per_slot);
+        let consensus_targets = config
+            .consensus_targets
+            .iter()
+            .map(|(name, config)| ConsensusTarget::new(name.clone(), config, ttl).map(Arc::new))
+            .collect::<Result<_>>()?;
         Ok(Self {
             config,
             sources,
-            targets,
+            execution_targets: targets,
+            consensus_targets,
             decoders,
+            proof_workers,
         })
     }
 }
@@ -171,8 +199,13 @@ impl BlockRelay {
                         .iter()
                         .map(|s| (s.name.clone(), Default::default()))
                         .collect(),
-                    targets: prepared
-                        .targets
+                    execution_targets: prepared
+                        .execution_targets
+                        .iter()
+                        .map(|t| (t.name.clone(), Default::default()))
+                        .collect(),
+                    consensus_targets: prepared
+                        .consensus_targets
                         .iter()
                         .map(|t| (t.name.clone(), Default::default()))
                         .collect(),
@@ -206,6 +239,46 @@ impl BlockRelay {
             }
         }
     }
+}
+
+async fn acquire_consensus(
+    prepared: Arc<Prepared>,
+    work: Arc<Work>,
+    notify: Arc<Notify>,
+) -> Result<(Arc<ConsensusPayload>, String)> {
+    if work.payload.blob_commitments.is_empty() {
+        let block = work.payload.clone();
+        let permit = prepared.proof_workers.clone().acquire_owned().await?;
+        let payload = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            ConsensusPayload::from_blobs(block, Vec::new())
+        })
+        .await??;
+        return Ok((Arc::new(payload), work.source.clone()));
+    }
+    race_sources(&prepared.sources, work.deadline, &notify, |source| {
+        let block = work.payload.clone();
+        let workers = prepared.proof_workers.clone();
+        async move {
+            let bytes = source
+                .get_bytes(&format!("/eth/v1/beacon/blobs/{}", block.beacon_root))
+                .await?;
+            let permit = workers.acquire_owned().await?;
+            let payload = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                #[derive(serde::Deserialize)]
+                struct Blobs {
+                    data: Vec<alloy::primitives::Bytes>,
+                }
+                let blobs: Blobs = sonic_rs::from_slice(&bytes)
+                    .map_err(|_| anyhow::anyhow!("invalid blob response"))?;
+                ConsensusPayload::from_blobs(block, blobs.data)
+            })
+            .await??;
+            Ok(Arc::new(payload))
+        }
+    })
+    .await
 }
 
 async fn acquire(
@@ -247,7 +320,7 @@ async fn run_generation(
     let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * prepared.config.network.seconds_per_slot);
     let payloads = Cache::<B256, Arc<RelayPayload>>::builder()
         .max_capacity(prepared.config.cache_max_bytes)
-        .weigher(|_, p| p.body.len().min(u32::MAX as usize) as u32)
+        .weigher(|_, p| p.cache_bytes())
         .time_to_live(ttl)
         .build();
     let seen = Cache::<B256, ()>::builder()
@@ -256,10 +329,20 @@ async fn run_generation(
         .build();
     let (announcements, mut incoming) = mpsc::channel::<Announcement>(256);
     let (delivery, _) = broadcast::channel::<Arc<Work>>(128);
+    let (consensus_delivery, _) = broadcast::channel::<Arc<ConsensusWork>>(128);
+    let consensus_cache = Cache::<B256, Arc<ConsensusPayload>>::builder()
+        .max_capacity(prepared.config.cache_max_bytes)
+        .weigher(|_, p| {
+            (p.body.len() as u64 + u64::from(p.block.cache_bytes())).min(u32::MAX as u64) as u32
+        })
+        .time_to_live(ttl)
+        .build();
     let mut source_tasks = JoinSet::new();
     let mut target_tasks = JoinSet::new();
     let mut acquisitions = JoinSet::new();
     let mut observations = JoinSet::new();
+    let mut blob_acquisitions = JoinSet::new();
+    let mut blobs_in_progress = HashMap::<B256, Arc<Notify>>::new();
     let mut in_progress = HashMap::<B256, Arc<Notify>>::new();
     let (worker_stop, worker_stop_rx) = watch::channel(false);
     for source in &prepared.sources {
@@ -269,7 +352,7 @@ async fn run_generation(
             stats.clone(),
         ));
     }
-    for target in &prepared.targets {
+    for target in &prepared.execution_targets {
         target_tasks.spawn(target.clone().run(
             delivery.subscribe(),
             super::target::WorkerContext {
@@ -277,6 +360,19 @@ async fn run_generation(
                 stop: worker_stop_rx.clone(),
                 mode: mode.clone(),
                 cache: payloads.clone(),
+                stats: stats.clone(),
+                ttl,
+            },
+        ));
+    }
+    for target in &prepared.consensus_targets {
+        target_tasks.spawn(target.clone().run(
+            consensus_delivery.subscribe(),
+            super::consensus::Context {
+                network: prepared.config.network.clone(),
+                stop: worker_stop_rx.clone(),
+                mode: mode.clone(),
+                cache: consensus_cache.clone(),
                 stats: stats.clone(),
                 ttl,
             },
@@ -295,6 +391,7 @@ async fn run_generation(
                 if event.slot > current.saturating_add(1) || current.saturating_sub(event.slot) > 2 * SLOTS_PER_EPOCH {
                     stats.lock().stale_events += 1; continue;
                 }
+                if let Some(notify) = blobs_in_progress.get(&event.root) { notify.notify_one(); }
                 if seen.contains_key(&event.root) { stats.lock().duplicates += 1; continue; }
                 if let Some(notify) = in_progress.get(&event.root) {
                     notify.notify_one(); stats.lock().duplicates += 1; continue;
@@ -322,38 +419,74 @@ async fn run_generation(
                 let work = Arc::new(Work { payload, first_seen: event.at, acquired,
                     deadline: event.at + Duration::from_secs(prepared.config.network.seconds_per_slot),
                     source, announcement_source: event.source, event: event.kind, mode: *mode.borrow(),
-                    known: prepared.targets.iter().map(|t| (t.name.clone(), AtomicBool::new(false))).collect() });
+                    known: prepared.execution_targets.iter().map(|t| (t.name.clone(), AtomicBool::new(false))).collect() });
                 {
                     let mut s = stats.lock(); s.acquired += 1;
                     s.acquisition_latency.record(stats::micros(acquired.duration_since(event.at)));
                 }
                 let _ = delivery.send(work.clone());
+                if !prepared.consensus_targets.is_empty() {
+                    if blob_acquisitions.len() < 8 {
+                        let notify = Arc::new(Notify::new());
+                        blobs_in_progress.insert(work.payload.beacon_root, notify.clone());
+                        let prepared = prepared.clone(); let work = work.clone();
+                        blob_acquisitions.spawn(async move {
+                            let result = tokio::time::timeout_at(work.deadline, acquire_consensus(prepared, work.clone(), notify)).await;
+                            (work, result)
+                        });
+                    } else { stats.lock().consensus_acquisition_dropped += 1; }
+                }
                 if observations.len() >= 128 { stats.lock().observation_dropped += 1; continue; }
                 // Probes cannot delay fanout. They use each target's direct RPC endpoint.
-                let targets = prepared.targets.clone(); let stats = stats.clone();
+                let targets = prepared.execution_targets.clone(); let stats = stats.clone();
+                let consensus_targets = prepared.consensus_targets.clone();
                 observations.spawn(async move {
                     let mut probes = FuturesUnordered::new();
-                    for target in &targets { probes.push(target.observe(work.clone(), stats.clone())); }
+                    for target in &targets { probes.push(target.observe(work.clone(), stats.clone()).boxed()); }
+                    for target in &consensus_targets { probes.push(target.observe(work.clone(), stats.clone()).boxed()); }
                     let mut ready = Vec::new();
-                    while let Some(result) = probes.next().await { if let Some(value) = result { ready.push(value); } }
+                    let mut canonical = Vec::new();
+                    while let Some(result) = probes.next().await {
+                        if let Some(value) = result.ready { ready.push(value); }
+                        if let Some(value) = result.canonical { canonical.push(value); }
+                    }
                     let mut s = stats.lock();
-                    if ready.len() == targets.len() {
+                    let count = targets.len() + consensus_targets.len();
+                    if ready.len() == count {
                         let last = *ready.iter().max().expect("nonempty targets");
                         let first = *ready.iter().min().expect("nonempty targets");
                         s.fleet_ready_latency.record(last); s.fleet_spread.record(last - first);
                     } else { s.fleet_incomplete += 1; }
+                    if canonical.len() == count { s.fleet_canonical_latency.record(*canonical.iter().max().expect("nonempty targets")); }
+                    else { s.fleet_canonical_incomplete += 1; }
                 });
+            }
+            acquired = blob_acquisitions.join_next(), if !blob_acquisitions.is_empty() => {
+                let Some(Ok((work, result))) = acquired else { break Err(anyhow::anyhow!("blob worker failed")); };
+                blobs_in_progress.remove(&work.payload.beacon_root);
+                match result {
+                    Ok(Ok((payload, _blob_source))) => {
+                        { let mut s = stats.lock(); s.consensus_acquired += 1;
+                          s.consensus_acquisition_latency.record(stats::micros(work.first_seen.elapsed())); }
+                        consensus_cache.insert(payload.block.beacon_root, payload.clone()).await;
+                        let _ = consensus_delivery.send(Arc::new(ConsensusWork { work, payload }));
+                    }
+                    _ => stats.lock().consensus_acquisition_failed += 1,
+                }
             }
         }
     };
     source_tasks.abort_all();
     acquisitions.abort_all();
+    blob_acquisitions.abort_all();
     observations.abort_all();
     // On worker failure, drop senders and stop peers as well; do not leave detached imports.
     drop(delivery);
+    drop(consensus_delivery);
     worker_stop.send_replace(true);
     while target_tasks.join_next().await.is_some() {}
     while source_tasks.join_next().await.is_some() {}
+    while blob_acquisitions.join_next().await.is_some() {}
     while acquisitions.join_next().await.is_some() {}
     while observations.join_next().await.is_some() {}
     result

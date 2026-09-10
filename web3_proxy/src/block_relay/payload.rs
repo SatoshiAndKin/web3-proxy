@@ -1,6 +1,6 @@
 //! Convert a complete Beacon block to a standard Engine request.
 use alloy::consensus::{Transaction, TxEnvelope};
-use alloy::eips::eip4844::kzg_to_versioned_hash;
+use alloy::eips::eip4844::{kzg_to_versioned_hash, Blob, Bytes48};
 use alloy::primitives::{Bytes, B256};
 use alloy_rpc_types_beacon::block::{BeaconBlockBodyElectra, BlockResponse};
 use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadV3};
@@ -27,6 +27,9 @@ pub struct RelayPayload {
     pub slot: u64,
     pub number: u64,
     pub body: bytes::Bytes,
+    pub fork: String,
+    pub signed_block: bytes::Bytes,
+    pub blob_commitments: Vec<Bytes48>,
 }
 
 impl RelayPayload {
@@ -73,6 +76,7 @@ impl RelayPayload {
     }
 
     fn from_beacon(response: BeaconResponse, root: B256) -> Result<Self> {
+        let signed_block = sonic_rs::to_vec(&response.data)?.into();
         let message = response.data.message;
         let ExecutionPayload::V3(payload) = message.body.execution_payload.0 else {
             anyhow::bail!("expected ExecutionPayloadV3");
@@ -112,7 +116,74 @@ impl RelayPayload {
             slot: message.slot,
             number,
             body,
+            fork: response.version,
+            signed_block,
+            blob_commitments: message.body.blob_kzg_commitments,
         })
+    }
+
+    pub fn cache_bytes(&self) -> u32 {
+        (self.body.len() + self.signed_block.len() + self.blob_commitments.len() * 48)
+            .min(u32::MAX as usize) as u32
+    }
+}
+
+/// Complete, locally verified publication contents. Construct this off the async runtime.
+#[derive(Debug)]
+pub struct ConsensusPayload {
+    pub block: std::sync::Arc<RelayPayload>,
+    pub body: bytes::Bytes,
+}
+
+impl ConsensusPayload {
+    pub fn from_blobs(block: std::sync::Arc<RelayPayload>, blobs: Vec<Bytes>) -> Result<Self> {
+        use alloy::eips::eip4844::{c_kzg, env_settings::EnvKzgSettings, AsAlloy, AsCkzg};
+        ensure!(
+            blobs.len() == block.blob_commitments.len(),
+            "blob count mismatch"
+        );
+        ensure!(
+            matches!(block.fork.as_str(), "electra" | "fulu"),
+            "unsupported Beacon fork"
+        );
+        let mut proofs = Vec::<Bytes48>::new();
+        for (blob, expected) in blobs.iter().zip(&block.blob_commitments) {
+            // Deserialize into heap-backed bytes, then borrow the fixed-size KZG type.
+            // Deserializing a 128-KiB inline array can overflow a Tokio worker's stack.
+            let blob: &Blob = blob
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid blob length"))?;
+            let settings = EnvKzgSettings::Default.get();
+            let commitment = settings.blob_to_kzg_commitment(blob.as_ckzg())?;
+            ensure!(
+                commitment.to_bytes().as_ref() == expected.as_slice(),
+                "blob commitment mismatch"
+            );
+            if block.fork == "fulu" {
+                let (_, cell_proofs) = settings.compute_cells_and_kzg_proofs(blob.as_ckzg())?;
+                proofs.extend_from_slice(c_kzg::KzgProof::slice_as_alloy(cell_proofs.as_ref()));
+            } else {
+                proofs.push(Bytes48::from_ckzg(
+                    settings
+                        .compute_blob_kzg_proof(blob.as_ckzg(), expected.as_ckzg())?
+                        .to_bytes(),
+                ));
+            }
+        }
+        #[derive(Serialize)]
+        struct Contents<'a> {
+            signed_block: sonic_rs::LazyValue<'a>,
+            kzg_proofs: &'a [Bytes48],
+            blobs: &'a [Bytes],
+        }
+        let contents = Contents {
+            signed_block: sonic_rs::from_slice(&block.signed_block)?,
+            kzg_proofs: &proofs,
+            blobs: &blobs,
+        };
+        let body = sonic_rs::to_vec(&contents)?.into();
+        Ok(Self { block, body })
     }
 }
 

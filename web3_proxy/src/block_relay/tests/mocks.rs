@@ -28,7 +28,13 @@ impl Server {
         Self::start(Router::new().route("/", post(handle_rpc)).with_state(rpc)).await
     }
     pub async fn beacon(beacon: MockBeacon) -> Self {
-        Self::start(Router::new().fallback(handle_beacon).with_state(beacon)).await
+        Self::start(
+            Router::new()
+                .fallback(handle_beacon)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
+                .with_state(beacon),
+        )
+        .await
     }
 }
 
@@ -40,6 +46,15 @@ pub struct BeaconState {
     pub block_gates: BTreeMap<B256, Arc<tokio::sync::Notify>>,
     pub gossip_supported: bool,
     pub queries: Vec<String>,
+    pub blobs: BTreeMap<B256, Vec<u8>>,
+    pub blob_reads: Vec<B256>,
+    pub blob_gates: BTreeMap<B256, Arc<tokio::sync::Notify>>,
+    pub headers: BTreeMap<B256, alloy_rpc_types_beacon::header::HeaderResponse>,
+    pub publications: Vec<(B256, String, sonic_rs::Value)>,
+    pub publication_gates: BTreeMap<B256, Arc<tokio::sync::Notify>>,
+    pub publication_status: u16,
+    pub import_publications: bool,
+    pub require_parent: bool,
 }
 #[derive(Clone)]
 pub struct MockBeacon {
@@ -57,6 +72,15 @@ impl MockBeacon {
                 block_gates: Default::default(),
                 gossip_supported: true,
                 queries: Vec::new(),
+                blobs: Default::default(),
+                blob_reads: Default::default(),
+                blob_gates: Default::default(),
+                headers: Default::default(),
+                publications: Default::default(),
+                publication_gates: Default::default(),
+                publication_status: 200,
+                import_publications: true,
+                require_parent: false,
             })),
             events: broadcast::channel(128).0,
         }
@@ -78,15 +102,86 @@ impl MockBeacon {
             ))
             .unwrap();
     }
+    pub fn import(
+        &self,
+        block: &payload::BeaconResponse,
+        optimistic: bool,
+        canonical: bool,
+    ) -> B256 {
+        use alloy_rpc_types_beacon::header::{Header, HeaderData, HeaderResponse};
+        let message = tree_hash::block_header(&block.data.message).unwrap();
+        let root = tree_hash::header(&message);
+        self.state.lock().headers.insert(
+            root,
+            HeaderResponse {
+                execution_optimistic: optimistic,
+                finalized: false,
+                data: HeaderData {
+                    root,
+                    canonical,
+                    header: Header {
+                        message,
+                        signature: block.data.signature.as_slice().to_vec().into(),
+                    },
+                },
+            },
+        );
+        root
+    }
 }
-async fn handle_beacon(State(beacon): State<MockBeacon>, uri: axum::http::Uri) -> Response {
+async fn handle_beacon(
+    State(beacon): State<MockBeacon>,
+    uri: axum::http::Uri,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
     use axum::response::sse::{Event, Sse};
+    if method == axum::http::Method::POST && uri.path() == "/eth/v2/beacon/blocks" {
+        assert_eq!(uri.query(), Some("broadcast_validation=gossip"));
+        let fork = headers["Eth-Consensus-Version"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let contents: sonic_rs::Value = sonic_rs::from_slice(&bytes).unwrap();
+        let block: payload::BeaconResponse = sonic_rs::from_value(
+            &json!({"version": fork, "data": contents["signed_block"].clone()}),
+        )
+        .unwrap();
+        let root = tree_hash::block_root(&block.data.message).unwrap();
+        let (gate, status, import) = {
+            let mut state = beacon.state.lock();
+            state.publications.push((root, fork, contents));
+            let missing_parent = state.require_parent
+                && !state.headers.contains_key(&block.data.message.parent_root);
+            (
+                state.publication_gates.get(&root).cloned(),
+                if missing_parent {
+                    202
+                } else {
+                    state.publication_status
+                },
+                state.import_publications && !missing_parent,
+            )
+        };
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        if import && (200..300).contains(&status) {
+            beacon.import(&block, false, true);
+        }
+        return StatusCode::from_u16(status).unwrap().into_response();
+    }
     let gate = {
         let mut state = beacon.state.lock();
         if uri.path().starts_with("/eth/v2/beacon/blocks/") {
             let root = uri.path().rsplit('/').next().unwrap().parse().unwrap();
             state.block_reads.push(root);
             state.block_gates.get(&root).cloned()
+        } else if uri.path().starts_with("/eth/v1/beacon/blobs/") {
+            let root = uri.path().rsplit('/').next().unwrap().parse().unwrap();
+            state.blob_reads.push(root);
+            state.blob_gates.get(&root).cloned()
         } else {
             None
         }
@@ -131,6 +226,25 @@ async fn handle_beacon(State(beacon): State<MockBeacon>, uri: axum::http::Uri) -
                 Some(bytes) => bytes.clone().into_response(),
                 None => StatusCode::NOT_FOUND.into_response(),
             }
+        }
+        path if path.starts_with("/eth/v1/beacon/blobs/") => {
+            let root: B256 = path.rsplit('/').next().unwrap().parse().unwrap();
+            state
+                .blobs
+                .get(&root)
+                .cloned()
+                .map(IntoResponse::into_response)
+                .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+        }
+        path if path.starts_with("/eth/v1/beacon/headers/") => {
+            let id = path.rsplit('/').next().unwrap();
+            let header = id
+                .parse::<B256>()
+                .ok()
+                .and_then(|root| state.headers.get(&root));
+            header
+                .map(|h| response(sonic_rs::to_value(h).unwrap()))
+                .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
