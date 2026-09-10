@@ -491,80 +491,117 @@ impl App {
             return None;
         }
 
-        let normalized_requests = validated_requests
-            .iter()
-            .map(|request| {
-                request
-                    .inner
-                    .jsonrpc_request()
-                    .expect("validated external request contains JSON-RPC data")
-                    .clone()
-            })
-            .collect::<Vec<_>>();
-        let rpcs = match self
+        let handles = match self
             .balanced_rpcs
             .try_rpcs_for_request(&validated_requests[0])
             .await
         {
-            Ok(rpcs) => rpcs,
-            Err(error) => return Some(Err(error)),
+            Ok(rpcs) => rpcs.open_batch_handles().await,
+            Err(_) => Vec::new(),
         };
-        let mut handles = rpcs.open_batch_handles().await;
+        let mut packets = FuturesUnordered::new();
         if handles.is_empty() {
-            let stream = rpcs.to_stream();
-            pin!(stream);
-            let Some(handle) = stream.next().await else {
-                return Some(Err(Web3ProxyError::NoServersSynced));
-            };
-            handles.push(handle);
+            packets.push(self.proxy_batch_packet(None, &validated_requests, 0));
+        } else {
+            let batch_lengths = weighted_batch_lengths(
+                validated_requests.len(),
+                handles.iter().map(OpenRequestHandle::batch_capacity),
+            );
+            let mut offset = 0;
+            for (handle, count) in handles.into_iter().zip(batch_lengths) {
+                for chunk in validated_requests[offset..offset + count].chunks(handle.batch_size())
+                {
+                    packets.push(self.proxy_batch_packet(
+                        Some(handle.clone_connection()),
+                        chunk,
+                        offset,
+                    ));
+                    offset += chunk.len();
+                }
+            }
         }
-
-        let batch_lengths = weighted_batch_lengths(
-            normalized_requests.len(),
-            handles.iter().map(OpenRequestHandle::batch_capacity),
-        );
-        let mut offset = 0;
-        let batches =
-            handles
-                .into_iter()
-                .zip(batch_lengths)
-                .filter_map(|(handle, request_count)| {
-                    let start = offset;
-                    offset += request_count;
-                    let requests = normalized_requests.get(start..offset)?;
-                    (!requests.is_empty()).then_some(async move {
-                        let rpc = handle.clone_connection();
-                        handle
-                            .request_batch(requests)
-                            .await
-                            .map(|responses| (rpc, responses))
-                    })
-                });
-        let mut responses = Vec::with_capacity(normalized_requests.len());
-        let mut response_rpcs = Vec::with_capacity(normalized_requests.len());
+        let mut completed = Vec::with_capacity(validated_requests.len());
+        while let Some(packet) = packets.next().await {
+            completed.extend(packet);
+        }
+        completed.sort_by_key(|(index, _, _)| *index);
+        let mut responses = Vec::with_capacity(completed.len());
         let mut used_rpcs = Vec::new();
-        for result in join_all(batches).await {
-            let (rpc, batch_responses) = match result {
-                Ok(result) => result,
-                Err(error) => return Some(Err(error)),
-            };
-            response_rpcs.extend(std::iter::repeat_n(rpc.clone(), batch_responses.len()));
-            used_rpcs.push(rpc);
-            responses.extend(batch_responses);
+        let mut names = HashSet::new();
+        for (_, response, rpcs) in completed {
+            responses.push(response);
+            used_rpcs.extend(
+                rpcs.into_iter()
+                    .filter(|rpc| names.insert(rpc.name.clone())),
+            );
         }
-        for ((request, response), rpc) in validated_requests
-            .iter()
-            .zip(&responses)
-            .zip(&response_rpcs)
-        {
-            request.response.lock().backend_rpcs.push(rpc.clone());
-            let response_bytes = sonic_rs::to_string(response)
-                .expect("JSON-RPC response must serialize")
-                .len() as u64;
-            request.set_response(response_bytes);
-        }
-
         Some(Ok((responses, used_rpcs)))
+    }
+
+    /// Finish one packet and immediately recover only its incomplete calls.
+    async fn proxy_batch_packet(
+        self: &Arc<Self>,
+        rpc: Option<Arc<Web3Rpc>>,
+        requests: &[Arc<ValidatedRequest>],
+        offset: usize,
+    ) -> Vec<(usize, jsonrpc::ParsedResponse, Vec<Arc<Web3Rpc>>)> {
+        let outcomes = if let Some(rpc) = rpc {
+            let handle = OpenRequestHandle::new(requests[0].clone(), rpc, None).await;
+            if handle.supports_batch() {
+                handle.request_batch(requests).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let outcomes = outcomes
+            .map(|outcomes| outcomes.into_iter().map(Result::ok).collect())
+            .unwrap_or_else(|| (0..requests.len()).map(|_| None).collect::<Vec<_>>());
+        join_all(requests.iter().zip(outcomes).enumerate().map(
+            |(index, (request, response))| async move {
+                let response = match response {
+                    Some(response) => response,
+                    None => {
+                        match self
+                            .balanced_rpcs
+                            .continue_request::<Arc<OwnedLazyValue>>(request)
+                            .await
+                        {
+                            Ok(SingleResponse::Parsed(mut response)) => {
+                                response.id = request.id();
+                                response
+                            }
+                            Ok(SingleResponse::Stream(_)) => {
+                                unreachable!("continued calls complete their bodies")
+                            }
+                            Err(error) => {
+                                request.set_error_response(&error);
+                                let (_, response) = error
+                                    .as_json_response_parts(request.id(), Some(request.as_ref()));
+                                match response {
+                                    SingleResponse::Parsed(response) => response,
+                                    SingleResponse::Stream(_) => {
+                                        unreachable!("local errors are parsed")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                {
+                    let mut state = request.response.lock();
+                    state.user_error_response = !state.error_response
+                        && matches!(response.payload, jsonrpc::ResponsePayload::Error { .. });
+                }
+                let response_bytes = sonic_rs::to_string(&response)
+                    .expect("JSON-RPC response serializes")
+                    .len() as u64;
+                request.set_response(response_bytes);
+                (offset + index, response, request.backend_rpcs_used())
+            },
+        ))
+        .await
     }
 
     /// try to send transactions to the best available rpcs with protected/private mempools

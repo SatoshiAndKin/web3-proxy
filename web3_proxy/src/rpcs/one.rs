@@ -37,13 +37,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::{cmp::Ordering, sync::Arc};
 use tokio::select;
-use tokio::sync::{watch, AcquireError, Semaphore, SemaphorePermit};
+use tokio::sync::{watch, AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
 
 pub(super) struct RequestPermits {
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
     max_concurrent_requests: usize,
     max_backend_batch_items: usize,
 }
@@ -51,22 +51,14 @@ pub(super) struct RequestPermits {
 impl RequestPermits {
     pub(super) fn new(max_concurrent_requests: usize, max_backend_batch_items: usize) -> Self {
         Self {
-            semaphore: Semaphore::new(max_concurrent_requests),
+            semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
             max_concurrent_requests,
             max_backend_batch_items,
         }
     }
 
-    pub(super) async fn acquire(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
-        self.semaphore.acquire().await
-    }
-
-    pub(super) async fn acquire_many(
-        &self,
-        permits: usize,
-    ) -> Result<SemaphorePermit<'_>, AcquireError> {
-        let permits = u32::try_from(permits).expect("backend batch chunk exceeds u32::MAX");
-        self.semaphore.acquire_many(permits).await
+    pub(super) async fn acquire(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        self.semaphore.clone().acquire_owned().await
     }
 
     pub(super) fn max_backend_batch_items(&self) -> usize {
@@ -211,12 +203,6 @@ impl Web3Rpc {
         if config.max_backend_batch_items == 0 {
             return Err(anyhow!("max_backend_batch_items must be greater than zero"));
         }
-        if config.max_backend_batch_items > config.max_concurrent_requests {
-            return Err(anyhow!(
-                "max_backend_batch_items must not exceed max_concurrent_requests"
-            ));
-        }
-
         let (head_block, _) = watch::channel(None);
 
         // Spawn the task for calculting average peak latency
@@ -1375,7 +1361,11 @@ impl Web3Rpc {
                         trace!(%web3_request, %block_needed, "{} cannot serve this request. Missing max block", self);
 
                         let rpc = self.clone();
-                        let connect_timeout_at = web3_request.connect_timeout_at();
+                        let connect_timeout_at = if web3_request.backend_rpcs_used().is_empty() {
+                            web3_request.connect_timeout_at()
+                        } else {
+                            web3_request.expire_at()
+                        };
 
                         let mut head_block_receiver =
                             self.head_block_sender.as_ref().unwrap().subscribe();

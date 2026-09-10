@@ -1019,7 +1019,7 @@ impl RpcsForRequest {
         stream! {
             trace!("entered stream");
             let error_handler = None;
-            let mut opened_any = false;
+            let mut opened_any = !self.request.backend_rpcs_used().is_empty();
 
             // todo!("be sure to set server_error if we exit without any rpcs!");
             while if opened_any {
@@ -1046,6 +1046,15 @@ impl RpcsForRequest {
                                 opened += 1;
                                 opened_any = true;
                                 yield handle;
+                                // Sending can put this backend into cooldown. Include that
+                                // retry time even when it was ready before we yielded it.
+                                let now = Instant::now();
+                                let retry_at = best_rpc.next_available(now);
+                                if retry_at > now {
+                                    earliest_retry_at = Some(earliest_retry_at.map_or(
+                                        retry_at, |earliest| earliest.min(retry_at),
+                                    ));
+                                }
                             }
                             Ok(OpenRequestResult::RetryAt(retry_at)) => {
                                 trace!(

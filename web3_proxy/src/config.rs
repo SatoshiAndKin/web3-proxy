@@ -257,7 +257,8 @@ pub struct Web3RpcConfig {
     pub http_url: Option<String>,
     /// while not absolutely required, a ipc connection should be fastest
     pub ipc_path: Option<PathBuf>,
-    /// maximum number of requests that can concurrently use this backend
+    /// Maximum number of physical requests sent concurrently to this backend.
+    /// Each batch packet occupies one slot, regardless of its item count.
     #[serde_inline_default(448usize)]
     pub max_concurrent_requests: usize,
     /// maximum number of calls grouped into one backend JSON-RPC batch packet

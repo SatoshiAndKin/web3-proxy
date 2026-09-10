@@ -695,3 +695,38 @@ async fn individual_stream_shares_batch_slots_until_body_ends_or_is_dropped() {
         }
     }
 }
+
+#[tokio::test]
+async fn batch_disconnect_after_connection_window_keeps_request_data() {
+    let mut h = Harness::new(4, 64).await;
+    let task = h.start(2);
+    let packet = h.next().await;
+    let expected = packet
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["params"].clone())
+        .collect::<Vec<_>>();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::time::resume();
+    packet
+        .reply
+        .send(Response::new(Body::from_stream(futures::stream::iter([
+            Err::<Bytes, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "backend disconnected",
+            )),
+        ]))))
+        .unwrap();
+    let mut retried = Vec::new();
+    for _ in 0..2 {
+        let call = h.next().await;
+        retried.push(call.body["params"].clone());
+        call.succeed();
+    }
+    retried.sort_by_key(Value::to_string);
+    assert_eq!(retried, expected);
+    assert_answers(task.await.unwrap(), 2);
+}
