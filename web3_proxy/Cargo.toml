@@ -65,7 +65,7 @@ serde-inline-default = "1.0.2"
 serde_json = { version = "1.0.151", default-features = false, features = ["raw_value"] }
 shellexpand = { version = "3.1.2", default-features = false, features = ["base-0"] }
 sonic-rs = "0.5.8"
-tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
 tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
 toml = "1.1.4"
 tower-http = { version = "0.7.0", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }

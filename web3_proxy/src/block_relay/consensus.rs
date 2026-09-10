@@ -387,6 +387,8 @@ impl ConsensusTarget {
         let mut s = stats.lock();
         let t = s.consensus_targets.entry(self.name.clone()).or_default();
         if let Some(ready) = ready {
+            t.health.progress(work.payload.slot);
+            t.health.connected = true;
             t.ready += 1;
             t.ready_latency.record(ready);
             if sample.last_missing_us.is_none() {

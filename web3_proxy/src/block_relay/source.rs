@@ -67,6 +67,7 @@ where
 
 #[derive(Clone, Debug)]
 pub struct Announcement {
+    pub at_unix_us: u64,
     pub root: B256,
     pub slot: u64,
     pub source: String,
@@ -167,6 +168,7 @@ impl BeaconSource {
                 break;
             }
             tx.send(Announcement {
+                at_unix_us: super::stats::unix_micros(),
                 root: header.data.root,
                 slot: h.slot,
                 source: self.name.clone(),
@@ -297,8 +299,8 @@ impl BeaconSource {
                     struct BlockEvent { block: B256, slot: String }
                     let event: BlockEvent = sonic_rs::from_str(&event.data).map_err(|_| anyhow::anyhow!("invalid block event"))?;
                     let slot = event.slot.parse().map_err(|_| anyhow::anyhow!("invalid event slot"))?;
-                    stats.lock().source_event(&self.name);
-                    tx.send(Announcement { root: event.block, slot, source: self.name.clone(), kind, at: Instant::now() }).await?;
+                    if network.slot().abs_diff(slot) <= 3 { stats.lock().source_event(&self.name, slot); }
+                    tx.send(Announcement { root: event.block, slot, source: self.name.clone(), kind, at: Instant::now(), at_unix_us: super::stats::unix_micros() }).await?;
                 }
             }
         }

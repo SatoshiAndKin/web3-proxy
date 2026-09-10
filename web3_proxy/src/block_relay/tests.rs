@@ -258,6 +258,7 @@ fn work(hash: u8, parent: u8, number: u64, mode: config::Mode, names: &[&str]) -
     ]})).unwrap().into();
     let now = Instant::now();
     Arc::new(Work {
+        first_seen_unix_us: stats::unix_micros(),
         payload: Arc::new(payload::RelayPayload {
             hash,
             parent_hash,

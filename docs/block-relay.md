@@ -147,7 +147,26 @@ cargo run --release -p web3_proxy_cli -- --config docs/block-relay.example.toml 
 
 The command starts neither an RPC proxy nor an Ethereum node. It reports status
 every 30 seconds and checks the config file every second. `Ctrl-C` or `SIGTERM`
-stops intake and lets an outstanding Engine request finish or reach its deadline.
+stops intake and drains current imports within a 25-second application deadline.
+Its private status listener defaults to `127.0.0.1:18550`. Use `--status-address`
+to set the container listener address; keep the host port private.
+
+- `/live` checks the status server only.
+- `/health` requires recent block events from every configured source, recent
+  readiness evidence from both target layers, and a working measurement log.
+  Keepalives and HTTP 200 alone do not pass. A suspended Engine does not pass.
+- `/status` returns counters, latency distributions, source freshness, and
+  target health. It accepts no control writes.
+
+The service writes private JSONL files below `state_dir/observations`. These
+include source events, acquisition failures, blob readiness, and per-target
+observations with their mode, slot, root, and missing/ready bounds. Durations use
+a monotonic clock. Wall-clock timestamps only help join observer records.
+The writer has a bounded queue, syncs each second, rotates at 16 MiB, and stops
+at 512 MiB total. It does not erase trial evidence. Archive measurements before
+that limit. A queue overflow makes readiness fail; a writer failure stops the
+generation and drains its imports. The last unsynced records can be lost on a
+crash. Reconcile recorded roots against the chain before evaluating a trial.
 
 Alternatively, add `[block_relay]` to the existing proxy config and use `proxyd`.
 The same service then appears under `block_relay` in `/status`. Its failure does

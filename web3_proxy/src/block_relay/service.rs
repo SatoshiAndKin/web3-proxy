@@ -3,6 +3,7 @@ use super::{
     consensus::{ConsensusTarget, ConsensusWork},
     journal::StateStore,
     payload::{ConsensusPayload, RelayPayload},
+    recording::{Record, Recording},
     source::{race_sources, Announcement, BeaconSource},
     stats::{self, Shared, Stats},
     target::Target,
@@ -29,6 +30,7 @@ use tokio::{
 pub(super) struct Work {
     pub payload: Arc<RelayPayload>,
     pub first_seen: Instant,
+    pub first_seen_unix_us: u64,
     pub acquired: Instant,
     pub deadline: Instant,
     pub source: String,
@@ -122,6 +124,12 @@ pub struct BlockRelay {
     stats: Shared,
 }
 impl BlockRelay {
+    pub fn ready(&self) -> bool {
+        self.stats.lock().ready()
+    }
+    pub fn config_failed(&self) {
+        self.stats.lock().config_error = Some("cannot read or validate relay config".into());
+    }
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             desired: watch::channel(None).0,
@@ -189,6 +197,7 @@ impl BlockRelay {
                 *stats = Stats {
                     enabled: true,
                     mode: *self.mode.borrow(),
+                    seconds_per_slot: prepared.config.network.seconds_per_slot,
                     sources: prepared
                         .sources
                         .iter()
@@ -220,11 +229,13 @@ impl BlockRelay {
                 _ = shutdown.recv() => true,
                 _ = desired.changed() => false,
                 result = &mut generation => {
+                    self.stats.lock().enabled = false;
                     self.stats.lock().config_error = Some(format!("relay worker stopped: {}", result.err().map(|e| e.to_string()).unwrap_or_default()));
                     tokio::select! { _ = shutdown.recv() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
                     continue;
                 }
             };
+            self.stats.lock().enabled = false;
             stop.send_replace(true);
             // Finish an outstanding Engine request before starting a replacement target worker.
             let _ = generation.await;
@@ -312,6 +323,10 @@ async fn run_generation(
     stats: Shared,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
+    let recording = Recording::open(&prepared.config.state_dir).await?;
+    let (record_tx, record_rx) = mpsc::channel(1024);
+    stats.lock().recorder = Some(record_tx);
+    let mut recording = tokio::spawn(recording.run(record_rx));
     let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * prepared.config.network.seconds_per_slot);
     let payloads = Cache::<B256, Arc<RelayPayload>>::builder()
         .max_capacity(prepared.config.cache_max_bytes)
@@ -377,11 +392,17 @@ async fn run_generation(
     let result = loop {
         tokio::select! {
             _ = stop.changed() => break Ok(()),
+            result = &mut recording => {
+                stats.lock().recorder = None;
+                break match result { Ok(result) => result, Err(_) => Err(anyhow::anyhow!("measurement task failed")) };
+            },
             ended = source_tasks.join_next(), if !source_tasks.is_empty() => break Err(anyhow::anyhow!("source worker stopped: {}", ended.is_some())),
             ended = target_tasks.join_next(), if !target_tasks.is_empty() => break Err(anyhow::anyhow!("target worker stopped: {}", ended.is_some())),
             _ = observations.join_next(), if !observations.is_empty() => {},
             event = incoming.recv() => {
                 let Some(event) = event else { break Err(anyhow::anyhow!("all Beacon sources stopped")); };
+                stats.lock().record(Record::Announcement { root: event.root, slot: event.slot,
+                    source: event.source.clone(), event: event.kind, at_unix_us: event.at_unix_us });
                 let current = prepared.config.network.slot();
                 if event.slot > current.saturating_add(1) || current.saturating_sub(event.slot) > 2 * SLOTS_PER_EPOCH {
                     stats.lock().stale_events += 1; continue;
@@ -405,13 +426,15 @@ async fn run_generation(
                 in_progress.remove(&event.root);
                 let (payload, source) = match acquired {
                     Ok(value) => value,
-                    Err(_) => { stats.lock().acquisition_failed += 1; continue; }
+                    Err(_) => { let mut s = stats.lock(); s.acquisition_failed += 1;
+                        s.record(Record::AcquisitionFailed { root: event.root, slot: event.slot, consensus: false }); continue; }
                 };
                 if payload.slot != event.slot { stats.lock().acquisition_failed += 1; continue; }
                 seen.insert(event.root, ()).await;
                 payloads.insert(payload.hash, payload.clone()).await;
                 let acquired = Instant::now();
                 let work = Arc::new(Work { payload, first_seen: event.at, acquired,
+                    first_seen_unix_us: event.at_unix_us,
                     deadline: event.at + Duration::from_secs(prepared.config.network.seconds_per_slot),
                     source, announcement_source: event.source, event: event.kind, mode: *mode.borrow(),
                     known: prepared.execution_targets.iter().map(|t| (t.name.clone(), AtomicBool::new(false))).collect() });
@@ -460,13 +483,16 @@ async fn run_generation(
                 let Some(Ok((work, result))) = acquired else { break Err(anyhow::anyhow!("blob worker failed")); };
                 blobs_in_progress.remove(&work.payload.beacon_root);
                 match result {
-                    Ok(Ok((payload, _blob_source))) => {
+                    Ok(Ok((payload, blob_source))) => {
                         { let mut s = stats.lock(); s.consensus_acquired += 1;
+                          s.record(Record::BlobReady { root: work.payload.beacon_root, slot: work.payload.slot,
+                            mode: work.mode, source: blob_source, ready_us: stats::micros(work.first_seen.elapsed()) });
                           s.consensus_acquisition_latency.record(stats::micros(work.first_seen.elapsed())); }
                         consensus_cache.insert(payload.block.beacon_root, payload.clone()).await;
                         let _ = consensus_delivery.send(Arc::new(ConsensusWork { work, payload }));
                     }
-                    _ => stats.lock().consensus_acquisition_failed += 1,
+                    _ => { let mut s = stats.lock(); s.consensus_acquisition_failed += 1;
+                        s.record(Record::AcquisitionFailed { root: work.payload.beacon_root, slot: work.payload.slot, consensus: true }); },
                 }
             }
         }
@@ -484,5 +510,10 @@ async fn run_generation(
     while blob_acquisitions.join_next().await.is_some() {}
     while acquisitions.join_next().await.is_some() {}
     while observations.join_next().await.is_some() {}
+    if stats.lock().recorder.take().is_some() {
+        recording
+            .await
+            .map_err(|_| anyhow::anyhow!("measurement task failed"))??;
+    }
     result
 }

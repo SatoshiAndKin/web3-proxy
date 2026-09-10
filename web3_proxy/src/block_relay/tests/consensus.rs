@@ -399,6 +399,7 @@ fn consensus_work(
     let block = Arc::new(decode(response, network));
     let now = Instant::now();
     let work = Arc::new(Work {
+        first_seen_unix_us: stats::unix_micros(),
         payload: block.clone(),
         first_seen: now,
         acquired: now,
