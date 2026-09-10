@@ -4,9 +4,7 @@ use super::{
 };
 use alloy::primitives::B256;
 use alloy_rpc_types_beacon::{
-    config::{ForkScheduleResponse, SpecResponse},
-    genesis::GenesisResponse,
-    header::HeaderResponse,
+    config::ForkScheduleResponse, genesis::GenesisResponse, header::HeaderResponse,
 };
 use anyhow::{ensure, Result};
 use eventsource_stream::Eventsource;
@@ -103,6 +101,20 @@ impl BeaconSource {
     }
 }
 
+// Decode only the required network fields. The Beacon spec also contains arrays
+// such as BLOB_SCHEDULE, so its values cannot all be decoded as strings.
+#[derive(Deserialize)]
+struct NetworkSpecResponse {
+    data: NetworkSpec,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+struct NetworkSpec {
+    preset_base: String,
+    seconds_per_slot: String,
+}
+
 pub(super) async fn validate_network(
     http: &transport::BeaconHttp,
     network: &Network,
@@ -110,7 +122,7 @@ pub(super) async fn validate_network(
     let (genesis, schedule, spec) = tokio::try_join!(
         http.get_optional::<GenesisResponse>("/eth/v1/beacon/genesis"),
         http.get_optional::<ForkScheduleResponse>("/eth/v1/config/fork_schedule"),
-        http.get_optional::<SpecResponse>("/eth/v1/config/spec"),
+        http.get_optional::<NetworkSpecResponse>("/eth/v1/config/spec"),
     )?;
     let genesis = genesis.ok_or_else(|| anyhow::anyhow!("missing Beacon genesis"))?;
     let schedule = schedule.ok_or_else(|| anyhow::anyhow!("missing Beacon fork schedule"))?;
@@ -121,14 +133,11 @@ pub(super) async fn validate_network(
         "Beacon genesis mismatch"
     );
     ensure!(
-        spec.data.get("PRESET_BASE").is_some_and(|s| s == "mainnet"),
+        spec.data.preset_base == "mainnet",
         "unsupported Beacon preset"
     );
     ensure!(
-        spec.data
-            .get("SECONDS_PER_SLOT")
-            .and_then(|s| s.parse::<u64>().ok())
-            == Some(network.seconds_per_slot),
+        spec.data.seconds_per_slot.parse::<u64>().ok() == Some(network.seconds_per_slot),
         "slot duration mismatch"
     );
     for fork in &network.forks {

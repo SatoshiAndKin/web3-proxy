@@ -16,6 +16,7 @@ use tokio::{
 mod consensus;
 mod journal;
 mod mocks;
+mod network;
 mod review;
 use mocks::{MockBeacon, MockRpc, Server};
 

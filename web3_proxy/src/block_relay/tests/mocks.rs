@@ -40,6 +40,7 @@ impl Server {
 
 pub struct BeaconState {
     pub network: config::Network,
+    pub spec: sonic_rs::Value,
     pub blocks: BTreeMap<B256, Vec<u8>>,
     pub hidden: std::collections::BTreeSet<B256>,
     pub block_reads: Vec<B256>,
@@ -65,6 +66,14 @@ impl MockBeacon {
     pub fn new(network: config::Network) -> Self {
         Self {
             state: Arc::new(Mutex::new(BeaconState {
+                spec: json!({
+                    "PRESET_BASE": "mainnet",
+                    "SECONDS_PER_SLOT": network.seconds_per_slot.to_string(),
+                    "BLOB_SCHEDULE": [
+                        {"EPOCH": "412672", "MAX_BLOBS_PER_BLOCK": "15"},
+                        {"EPOCH": "419072", "MAX_BLOBS_PER_BLOCK": "21"}
+                    ]
+                }),
                 network,
                 blocks: BTreeMap::new(),
                 hidden: Default::default(),
@@ -201,9 +210,7 @@ async fn handle_beacon(
             "current_version": f.version, "previous_version": "0x00000000", "epoch": f.epoch.to_string()
         })).collect::<Vec<_>>()}))
         }
-        "/eth/v1/config/spec" => response(
-            json!({"data": {"PRESET_BASE": "mainnet", "SECONDS_PER_SLOT": network.seconds_per_slot.to_string()}}),
-        ),
+        "/eth/v1/config/spec" => response(json!({"data": state.spec.clone()})),
         "/eth/v1/events" => {
             let query = uri.query().unwrap_or_default();
             state.queries.push(query.to_string());
