@@ -313,7 +313,7 @@ async fn optimistic_headers_are_not_completed_imports_or_missing_blocks() {
         )
         .unwrap(),
     );
-    let mut w = work(1, 0, 1, config::Mode::Observe, &[]);
+    let mut w = work(1, 0, 1, config::Mode::Observe);
     let w_mut = Arc::get_mut(&mut w).unwrap();
     w_mut.payload = Arc::new(decode(&response, &network));
     w_mut.deadline = Instant::now() + Duration::from_millis(60);
@@ -341,7 +341,7 @@ async fn publication_202_without_import_does_not_count_as_ready() {
         )
         .unwrap(),
     );
-    let mut w = work(1, 0, 1, config::Mode::Inject, &[]);
+    let mut w = work(1, 0, 1, config::Mode::Inject);
     let w_mut = Arc::get_mut(&mut w).unwrap();
     w_mut.payload = Arc::new(decode(&response, &network));
     w_mut.deadline = Instant::now() + Duration::from_millis(200);
@@ -408,7 +408,6 @@ fn consensus_work(
         announcement_source: "test".into(),
         event: "block",
         mode: config::Mode::Inject,
-        known: BTreeMap::new(),
     });
     Arc::new(ConsensusWork {
         work,

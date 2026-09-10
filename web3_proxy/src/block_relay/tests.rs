@@ -3,11 +3,7 @@ use alloy::primitives::B256;
 use alloy_rpc_types_beacon::block::{BeaconBlock, BeaconBlockBodyElectra};
 use alloy_rpc_types_engine::ExecutionPayload;
 use sonic_rs::{json, JsonValueTrait};
-use std::{
-    collections::BTreeMap,
-    sync::{atomic::AtomicBool, Arc},
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, watch},
     time::{timeout, Instant},
@@ -251,7 +247,7 @@ fn requires_complete_execution_requests_even_when_empty() {
     );
 }
 
-fn work(hash: u8, parent: u8, number: u64, mode: config::Mode, names: &[&str]) -> Arc<Work> {
+fn work(hash: u8, parent: u8, number: u64, mode: config::Mode) -> Arc<Work> {
     let hash = B256::with_last_byte(hash);
     let parent_hash = B256::with_last_byte(parent);
     let body = sonic_rs::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": "engine_newPayloadV4", "params": [
@@ -279,10 +275,6 @@ fn work(hash: u8, parent: u8, number: u64, mode: config::Mode, names: &[&str]) -
         announcement_source: "local".into(),
         event: "block_gossip",
         mode,
-        known: names
-            .iter()
-            .map(|name| (name.to_string(), AtomicBool::new(false)))
-            .collect(),
     })
 }
 
@@ -348,7 +340,7 @@ async fn observe_never_posts_and_rpc_errors_are_not_missing_blocks() {
     let server = Server::rpc(rpc.clone()).await;
     let target = rpc.target(&server.url, "a");
     let worker = Worker::start(target.clone(), config::Mode::Observe).await;
-    let mut block = work(1, 0, 1, config::Mode::Observe, &["a"]);
+    let mut block = work(1, 0, 1, config::Mode::Observe);
     Arc::get_mut(&mut block).unwrap().deadline = Instant::now() + Duration::from_millis(30);
     worker.tx.send(block.clone()).unwrap();
     assert_eq!(
@@ -369,13 +361,10 @@ async fn deduplicates_by_hash_and_keeps_competing_blocks_at_the_same_slot() {
     let rpc = MockRpc::new();
     let server = Server::rpc(rpc.clone()).await;
     let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    let a = work(1, 0, 1, config::Mode::Inject, &["a"]);
+    let a = work(1, 0, 1, config::Mode::Inject);
     worker.tx.send(a.clone()).unwrap();
     worker.tx.send(a).unwrap();
-    worker
-        .tx
-        .send(work(2, 0, 1, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(2, 0, 1, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].valid == 2).await;
     worker.finish().await;
     let mut hashes = rpc.payload_hashes();
@@ -404,15 +393,12 @@ async fn repairs_cached_ancestors_oldest_first_then_retries_syncing_child_once()
         .replies
         .insert(B256::with_last_byte(3), ["SYNCING", "VALID"].into());
     let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    let parent = work(2, 1, 2, config::Mode::Inject, &["a"]);
+    let parent = work(2, 1, 2, config::Mode::Inject);
     worker
         .cache
         .insert(parent.payload.hash, parent.payload.clone())
         .await;
-    worker
-        .tx
-        .send(work(3, 2, 3, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(3, 2, 3, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].valid == 2).await;
     assert_eq!(worker.stats.lock().execution_targets["a"].repairs, 1);
     worker.finish().await;
@@ -435,15 +421,9 @@ async fn invalid_ancestor_blocks_descendants_without_retry() {
         .replies
         .insert(B256::with_last_byte(1), ["INVALID"].into());
     let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    worker
-        .tx
-        .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(1, 0, 1, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].invalid == 1).await;
-    worker
-        .tx
-        .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].skipped_invalid_ancestor == 1).await;
     worker.finish().await;
     assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
@@ -462,13 +442,12 @@ async fn slow_target_does_not_delay_others_and_shutdown_drains_current_import() 
         .insert(B256::with_last_byte(1), gate.clone());
     let mut a = Worker::start(slow.target(&slow_server.url, "a"), config::Mode::Inject).await;
     let b = Worker::start(fast.target(&fast_server.url, "b"), config::Mode::Inject).await;
-    let block = work(1, 0, 1, config::Mode::Inject, &["a", "b"]);
+    let block = work(1, 0, 1, config::Mode::Inject);
     a.tx.send(block.clone()).unwrap();
     b.tx.send(block).unwrap();
     until(|| b.stats.lock().execution_targets["b"].valid == 1 && slow.payload_hashes().len() == 1)
         .await;
-    a.tx.send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    a.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     a.stop.send_replace(true);
     assert!(
         timeout(Duration::from_millis(20), &mut a.task)
@@ -493,15 +472,9 @@ async fn switching_to_observe_stops_queued_injections() {
         .gates
         .insert(B256::with_last_byte(1), gate.clone());
     let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    worker
-        .tx
-        .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(1, 0, 1, config::Mode::Inject)).unwrap();
     until(|| rpc.payload_hashes().len() == 1).await;
-    worker
-        .tx
-        .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     worker.mode.send_replace(config::Mode::Observe);
     gate.notify_one();
     until(|| worker.stats.lock().execution_targets["a"].valid == 1).await;
@@ -814,7 +787,7 @@ async fn unknown_timeout_suspends_target_until_rpc_confirms_without_blind_retry(
         .gates
         .insert(B256::with_last_byte(1), gate.clone());
     let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    let block = work(1, 0, 1, config::Mode::Inject, &["a"]);
+    let block = work(1, 0, 1, config::Mode::Inject);
     worker.tx.send(block.clone()).unwrap();
     worker.tx.send(block).unwrap();
     until(|| rpc.payload_hashes().len() == 1).await;
@@ -825,10 +798,7 @@ async fn unknown_timeout_suspends_target_until_rpc_confirms_without_blind_retry(
     })
     .await
     .unwrap();
-    worker
-        .tx
-        .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
     gate.notify_one();
@@ -850,15 +820,9 @@ async fn retries_syncing_child_when_missing_parent_arrives_later() {
         .replies
         .insert(B256::with_last_byte(2), ["SYNCING", "VALID"].into());
     let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    worker
-        .tx
-        .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].repair_gaps == 1).await;
-    worker
-        .tx
-        .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(1, 0, 1, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].valid == 2).await;
     worker.finish().await;
     assert_eq!(
@@ -878,10 +842,7 @@ async fn validates_response_hash_and_does_not_count_engine_valid_as_rpc_readines
     rpc.state.lock().wrong_valid_hash = true;
     let target = rpc.target(&server.url, "a");
     let worker = Worker::start(target, config::Mode::Inject).await;
-    worker
-        .tx
-        .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(1, 0, 1, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].unknown == 1).await;
     assert_eq!(worker.stats.lock().execution_targets["a"].valid, 0);
     assert_eq!(worker.stats.lock().execution_targets["a"].ready, 0);

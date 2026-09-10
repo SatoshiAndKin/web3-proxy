@@ -15,11 +15,7 @@ use anyhow::Result;
 use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moka::future::Cache;
 use parking_lot::Mutex;
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{atomic::AtomicBool, Arc},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc, watch, Notify},
     task::JoinSet,
@@ -37,7 +33,6 @@ pub(super) struct Work {
     pub announcement_source: String,
     pub event: &'static str,
     pub mode: Mode,
-    pub known: BTreeMap<String, AtomicBool>,
 }
 
 struct Prepared {
@@ -75,6 +70,7 @@ impl Prepared {
             .iter()
             .map(|(name, config)| BeaconSource::new(name.clone(), config).map(Arc::new))
             .collect::<Result<_>>()?;
+        let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * config.network.seconds_per_slot);
         let targets = config
             .execution_targets
             .iter()
@@ -87,6 +83,8 @@ impl Prepared {
                     rpc: Rpc::new(&config.rpc_url, None)?,
                     journal: store.journal(&config.engine_url)?,
                     probes: tokio::sync::Semaphore::new(4),
+                    confirmed: Cache::builder().max_capacity(512).time_to_live(ttl).build(),
+                    evidence: Notify::new(),
                 }))
             })
             .collect::<Result<_>>()?;
@@ -98,7 +96,6 @@ impl Prepared {
             .as_ref()
             .map(|p| p.proof_workers.clone())
             .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(config.proof_workers)));
-        let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * config.network.seconds_per_slot);
         let consensus_targets = config
             .consensus_targets
             .iter()
@@ -436,8 +433,7 @@ async fn run_generation(
                 let work = Arc::new(Work { payload, first_seen: event.at, acquired,
                     first_seen_unix_us: event.at_unix_us,
                     deadline: event.at + Duration::from_secs(prepared.config.network.seconds_per_slot),
-                    source, announcement_source: event.source, event: event.kind, mode: *mode.borrow(),
-                    known: prepared.execution_targets.iter().map(|t| (t.name.clone(), AtomicBool::new(false))).collect() });
+                    source, announcement_source: event.source, event: event.kind, mode: *mode.borrow() });
                 {
                     let mut s = stats.lock(); s.acquired += 1;
                     s.acquisition_latency.record(stats::micros(acquired.duration_since(event.at)));

@@ -1,5 +1,135 @@
 use super::*;
-use std::sync::atomic::Ordering;
+
+#[tokio::test]
+async fn repeated_parent_evidence_and_redelivery_do_not_retry_syncing_forever() {
+    let rpc = MockRpc::new();
+    let server = Server::rpc(rpc.clone()).await;
+    let target = rpc.target(&server.url, "a");
+    rpc.state
+        .lock()
+        .replies
+        .insert(B256::with_last_byte(2), ["SYNCING", "SYNCING"].into());
+    let worker = Worker::start(target.clone(), config::Mode::Inject).await;
+    let child = work(2, 1, 2, config::Mode::Inject);
+    worker.tx.send(child.clone()).unwrap();
+    until(|| worker.stats.lock().execution_targets["a"].repair_gaps == 1).await;
+    let parent = work(1, 0, 1, config::Mode::Inject);
+    rpc.state.lock().known.insert(parent.payload.hash, 1);
+    target.observe(parent.clone(), worker.stats.clone()).await;
+    until(|| worker.stats.lock().execution_targets["a"].syncing == 2).await;
+    for _ in 0..3 {
+        target.observe(parent.clone(), worker.stats.clone()).await;
+        worker.tx.send(child.clone()).unwrap();
+    }
+    until(|| worker.stats.lock().execution_targets["a"].skipped_known == 3).await;
+    worker.finish().await;
+    assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(2); 2]);
+    assert_eq!(rpc.state.lock().max_inflight, 1);
+}
+
+#[tokio::test]
+async fn rpc_confirmation_does_not_revive_rejected_ancestry() {
+    let rpc = MockRpc::new();
+    let server = Server::rpc(rpc.clone()).await;
+    let target = rpc.target(&server.url, "a");
+    rpc.state
+        .lock()
+        .replies
+        .insert(B256::with_last_byte(1), ["INVALID"].into());
+    let worker = Worker::start(target.clone(), config::Mode::Inject).await;
+    let parent = work(1, 0, 1, config::Mode::Inject);
+    worker.tx.send(parent.clone()).unwrap();
+    until(|| worker.stats.lock().execution_targets["a"].invalid == 1).await;
+    rpc.state.lock().known.insert(parent.payload.hash, 1);
+    target.observe(parent.clone(), worker.stats.clone()).await;
+    worker.tx.send(parent).unwrap();
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
+    until(|| worker.stats.lock().execution_targets["a"].skipped_invalid_ancestor == 1).await;
+    worker.tx.send(work(3, 2, 3, config::Mode::Inject)).unwrap();
+    until(|| worker.stats.lock().execution_targets["a"].skipped_invalid_ancestor == 2).await;
+    worker.finish().await;
+    assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
+}
+
+#[tokio::test]
+async fn late_rpc_parent_observation_wakes_child_without_redelivery() {
+    let rpc = MockRpc::new();
+    let server = Server::rpc(rpc.clone()).await;
+    let target = rpc.target(&server.url, "a");
+    {
+        let mut state = rpc.state.lock();
+        state
+            .replies
+            .insert(B256::with_last_byte(1), ["SYNCING"].into());
+        state
+            .replies
+            .insert(B256::with_last_byte(2), ["SYNCING", "VALID"].into());
+    }
+    let worker = Worker::start(target.clone(), config::Mode::Inject).await;
+    let parent = work(1, 0, 1, config::Mode::Inject);
+    worker.tx.send(parent.clone()).unwrap();
+    until(|| worker.stats.lock().execution_targets["a"].repair_gaps == 1).await;
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
+    until(|| worker.stats.lock().execution_targets["a"].repair_gaps == 2).await;
+
+    rpc.state.lock().known.insert(parent.payload.hash, 1);
+    let observation = target.observe(parent, worker.stats.clone()).await;
+    assert!(observation.ready.is_some());
+    assert!(observation.canonical.is_some());
+    let result = timeout(
+        Duration::from_millis(500),
+        until(|| worker.stats.lock().execution_targets["a"].valid == 1),
+    )
+    .await;
+    worker.finish().await;
+    assert!(
+        result.is_ok(),
+        "RPC observation did not wake the idle execution worker"
+    );
+    assert_eq!(
+        rpc.payload_hashes(),
+        vec![
+            B256::with_last_byte(1),
+            B256::with_last_byte(2),
+            B256::with_last_byte(2)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn parent_confirmed_during_repair_retries_child_without_redelivery() {
+    let rpc = MockRpc::new();
+    let server = Server::rpc(rpc.clone()).await;
+    let target = rpc.target(&server.url, "a");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = rpc.state.lock();
+        state
+            .replies
+            .insert(B256::with_last_byte(2), ["SYNCING", "VALID"].into());
+        state.gates.insert(B256::with_last_byte(2), gate.clone());
+    }
+    let worker = Worker::start(target, config::Mode::Inject).await;
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
+    until(|| rpc.payload_hashes() == vec![B256::with_last_byte(2)]).await;
+    {
+        let mut state = rpc.state.lock();
+        state.known.insert(B256::with_last_byte(1), 1);
+        state.gates.remove(&B256::with_last_byte(2));
+    }
+    gate.notify_one();
+    let result = timeout(
+        Duration::from_millis(500),
+        until(|| worker.stats.lock().execution_targets["a"].valid == 1),
+    )
+    .await;
+    worker.finish().await;
+    assert!(
+        result.is_ok(),
+        "repair discarded new immediate-parent evidence"
+    );
+    assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(2); 2]);
+}
 
 #[tokio::test]
 async fn ready_source_retries_before_an_unrelated_read_finishes() {
@@ -56,15 +186,13 @@ async fn rpc_confirmed_parent_wakes_its_waiting_child() {
         .lock()
         .replies
         .insert(B256::with_last_byte(2), ["SYNCING", "VALID"].into());
-    let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    worker
-        .tx
-        .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    let target = rpc.target(&server.url, "a");
+    let worker = Worker::start(target.clone(), config::Mode::Inject).await;
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].repair_gaps == 1).await;
-    let parent = work(1, 0, 1, config::Mode::Inject, &["a"]);
+    let parent = work(1, 0, 1, config::Mode::Inject);
     rpc.state.lock().known.insert(parent.payload.hash, 1);
-    parent.known["a"].store(true, Ordering::Release);
+    target.observe(parent.clone(), worker.stats.clone()).await;
     worker.tx.send(parent).unwrap();
     let result = timeout(
         Duration::from_millis(500),
@@ -91,20 +219,14 @@ async fn rejected_repair_ancestor_blocks_the_entire_remaining_chain() {
             .insert(B256::with_last_byte(3), ["SYNCING"].into());
     }
     let worker = Worker::start(rpc.target(&server.url, "a"), config::Mode::Inject).await;
-    let parent = work(2, 1, 2, config::Mode::Inject, &["a"]);
+    let parent = work(2, 1, 2, config::Mode::Inject);
     worker
         .cache
         .insert(parent.payload.hash, parent.payload.clone())
         .await;
-    worker
-        .tx
-        .send(work(3, 2, 3, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(3, 2, 3, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].invalid == 1).await;
-    worker
-        .tx
-        .send(work(4, 3, 4, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(4, 3, 4, config::Mode::Inject)).unwrap();
     until(|| worker.tx.is_empty()).await;
     let stats = worker.stats.clone();
     worker.finish().await;

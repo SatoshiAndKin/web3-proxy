@@ -113,15 +113,9 @@ async fn journal_storage_failure_prevents_the_engine_post() {
     // Remove the pathname without changing the held lock or deleting any data.
     std::fs::rename(&state_path, directory.path().join("moved-state")).unwrap();
     let worker = Worker::start(target, config::Mode::Inject).await;
-    worker
-        .tx
-        .send(work(1, 0, 1, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(1, 0, 1, config::Mode::Inject)).unwrap();
     until(|| !worker.stats.lock().execution_targets["a"].health.connected).await;
-    worker
-        .tx
-        .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     worker.finish().await;
     assert!(rpc.payload_hashes().is_empty());
 }
@@ -144,10 +138,7 @@ async fn restart_waits_for_rpc_confirmation_before_submitting_next_block() {
     let mut target = rpc.target(&server.url, "a");
     Arc::get_mut(&mut target).unwrap().journal = store.journal(&server.url).unwrap();
     let worker = Worker::spawn(target, config::Mode::Inject);
-    worker
-        .tx
-        .send(work(2, 1, 2, config::Mode::Inject, &["a"]))
-        .unwrap();
+    worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     until(|| {
         worker
             .stats

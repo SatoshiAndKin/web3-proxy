@@ -306,6 +306,11 @@ impl MockRpc {
             rpc: transport::Rpc::new(url, None).unwrap(),
             journal: self.store.journal(url).unwrap(),
             probes: tokio::sync::Semaphore::new(4),
+            confirmed: moka::future::Cache::builder()
+                .max_capacity(512)
+                .time_to_live(Duration::from_secs(768))
+                .build(),
+            evidence: tokio::sync::Notify::new(),
         })
     }
 }

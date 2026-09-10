@@ -13,11 +13,11 @@ use moka::future::Cache;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
-    sync::{broadcast, watch},
+    sync::{broadcast, watch, Notify},
     time::Instant,
 };
 
@@ -29,23 +29,34 @@ pub struct Target {
     /// target suspended until RPC confirms the block, including after a restart.
     pub journal: Arc<Journal>,
     pub probes: tokio::sync::Semaphore,
+    pub(super) confirmed: Cache<B256, ()>,
+    pub(super) evidence: Notify,
 }
 #[derive(Clone)]
 enum Delivery {
-    Status(PayloadStatusEnum),
+    Valid,
+    Accepted,
+    Syncing { parent_was_valid: bool },
+    Invalid,
     Unknown,
 }
 impl Delivery {
+    fn from_status(status: PayloadStatusEnum, parent_was_valid: bool) -> Self {
+        match status {
+            PayloadStatusEnum::Valid => Self::Valid,
+            PayloadStatusEnum::Accepted => Self::Accepted,
+            PayloadStatusEnum::Syncing => Self::Syncing { parent_was_valid },
+            PayloadStatusEnum::Invalid { .. } => Self::Invalid,
+        }
+    }
     fn invalid_ancestor() -> Self {
-        Self::Status(PayloadStatusEnum::Invalid {
-            validation_error: "invalid ancestor".into(),
-        })
+        Self::Invalid
     }
     fn is_invalid(&self) -> bool {
-        matches!(self, Self::Status(s) if s.is_invalid())
+        matches!(self, Self::Invalid)
     }
     fn is_valid(&self) -> bool {
-        matches!(self, Self::Status(s) if s.is_valid())
+        matches!(self, Self::Valid)
     }
 }
 #[derive(Deserialize)]
@@ -90,6 +101,10 @@ impl Target {
             block.hash == hash && block.number.to::<u64>() == number,
             "RPC block identity mismatch"
         );
+        if !self.confirmed.contains_key(&hash) {
+            self.confirmed.insert(hash, ()).await;
+            self.evidence.notify_one();
+        }
         Ok(true)
     }
     pub async fn run(
@@ -145,12 +160,7 @@ impl Target {
                     .unwrap_or(false)
                     && self.journal.complete(pending_import).await.is_ok()
                 {
-                    handled
-                        .insert(
-                            pending_import.hash,
-                            Delivery::Status(PayloadStatusEnum::Valid),
-                        )
-                        .await;
+                    handled.insert(pending_import.hash, Delivery::Valid).await;
                     self.wake_children(pending_import.hash, &mut waiting, &mut pending, &stats);
                     let mut s = stats.lock();
                     let t = s.execution_targets.entry(self.name.clone()).or_default();
@@ -168,6 +178,41 @@ impl Target {
                 );
                 tokio::select! { _ = stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
                 continue;
+            }
+            // RPC probes and repair reads report through the same target state.
+            // Process it before dequeuing work, including after an idle wake-up.
+            for (hash, ()) in self.confirmed.iter() {
+                if !handled
+                    .get(hash.as_ref())
+                    .await
+                    .is_some_and(|s| s.is_invalid() || s.is_valid())
+                {
+                    handled.insert(*hash, Delivery::Valid).await;
+                }
+            }
+            waiting.retain(|_, work| Instant::now() < work.deadline);
+            let mut completed = Vec::new();
+            let mut parents = Vec::new();
+            for (hash, child) in &waiting {
+                match handled.get(hash).await {
+                    Some(Delivery::Valid | Delivery::Invalid) => completed.push(*hash),
+                    Some(Delivery::Syncing {
+                        parent_was_valid: false,
+                    }) if handled
+                        .get(&child.payload.parent_hash)
+                        .await
+                        .is_some_and(|s| s.is_valid()) =>
+                    {
+                        parents.push(child.payload.parent_hash);
+                    }
+                    _ => {}
+                }
+            }
+            for hash in completed {
+                waiting.remove(&hash);
+            }
+            for parent in parents {
+                self.wake_children(parent, &mut waiting, &mut pending, &stats);
             }
             // Drain to a bounded local queue, then prefer the newest slot. Preserve competitors.
             loop {
@@ -205,8 +250,9 @@ impl Target {
             } else {
                 tokio::select! {
                     _ = stop.changed() => return,
+                    _ = self.evidence.notified() => continue,
                     work = incoming.recv() => match work {
-                        Ok(work) => work,
+                        Ok(work) => { pending.push_back(work); continue; },
                         Err(broadcast::error::RecvError::Closed) => return,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             stats.lock().execution_targets.entry(self.name.clone()).or_default().queue_dropped += n; continue;
@@ -221,10 +267,11 @@ impl Target {
                 continue;
             }
             let p = &work.payload;
-            if work.known[&self.name].load(Ordering::Acquire) {
-                handled
-                    .insert(p.hash, Delivery::Status(PayloadStatusEnum::Valid))
-                    .await;
+            let previous = handled.get(&p.hash).await;
+            if self.confirmed.contains_key(&p.hash)
+                && !previous.as_ref().is_some_and(|s| s.is_invalid())
+            {
+                handled.insert(p.hash, Delivery::Valid).await;
                 self.wake_children(p.hash, &mut waiting, &mut pending, &stats);
                 stats
                     .lock()
@@ -234,13 +281,15 @@ impl Target {
                     .skipped_known += 1;
                 continue;
             }
-            let previous = handled.get(&p.hash).await;
-            let parent_became_valid =
-                matches!(previous, Some(Delivery::Status(PayloadStatusEnum::Syncing)))
-                    && handled
-                        .get(&p.parent_hash)
-                        .await
-                        .is_some_and(|s| s.is_valid());
+            let parent_became_valid = matches!(
+                previous,
+                Some(Delivery::Syncing {
+                    parent_was_valid: false
+                })
+            ) && handled
+                .get(&p.parent_hash)
+                .await
+                .is_some_and(|s| s.is_valid());
             if previous.is_some() && !parent_became_valid {
                 stats
                     .lock()
@@ -264,11 +313,19 @@ impl Target {
                     .skipped_invalid_ancestor += 1;
                 continue;
             }
+            let parent_was_valid = self.confirmed.contains_key(&p.parent_hash)
+                || handled
+                    .get(&p.parent_hash)
+                    .await
+                    .is_some_and(|s| s.is_valid());
             let result = self.deliver(p, &stats).await;
             if let Ok(status) = result {
                 let syncing = status.is_syncing();
                 handled
-                    .insert(p.hash, Delivery::Status(status.status))
+                    .insert(
+                        p.hash,
+                        Delivery::from_status(status.status, parent_was_valid),
+                    )
                     .await;
                 if syncing && !*stop.borrow() && Instant::now() < work.deadline {
                     self.repair(&work, &cache, &handled, &stats, &stop, &mode)
@@ -278,7 +335,7 @@ impl Target {
                 if handled
                     .get(&p.hash)
                     .await
-                    .is_some_and(|s| matches!(s, Delivery::Status(PayloadStatusEnum::Syncing)))
+                    .is_some_and(|s| matches!(s, Delivery::Syncing { .. }))
                 {
                     if waiting.len() < 128 {
                         waiting.insert(p.hash, work.clone());
@@ -455,13 +512,18 @@ impl Target {
             number = number.saturating_sub(1);
             chain.push(parent);
         }
-        if !anchored || chain.is_empty() {
+        if !anchored {
             stats
                 .lock()
                 .execution_targets
                 .entry(self.name.clone())
                 .or_default()
                 .repair_gaps += 1;
+            return;
+        }
+        // A newly confirmed immediate parent is enough evidence for the worker
+        // to retry. It does not require an ancestor payload to be re-imported.
+        if chain.is_empty() {
             return;
         }
         stats
@@ -479,13 +541,21 @@ impl Target {
             {
                 return;
             }
+            let parent_was_valid = self.confirmed.contains_key(&payload.parent_hash)
+                || handled
+                    .get(&payload.parent_hash)
+                    .await
+                    .is_some_and(|s| s.is_valid());
             let Ok(status) = self.deliver(&payload, stats).await else {
                 return;
             };
             let valid = status.is_valid();
             let invalid = status.is_invalid();
             handled
-                .insert(payload.hash, Delivery::Status(status.status))
+                .insert(
+                    payload.hash,
+                    Delivery::from_status(status.status, parent_was_valid),
+                )
                 .await;
             if !valid {
                 if invalid {
@@ -511,7 +581,6 @@ impl Target {
                 match self.has_block(work.payload.hash, work.payload.number).await {
                     Ok(true) => {
                         sample.first_ready_us = Some(stats::micros(work.first_seen.elapsed()));
-                        work.known[&self.name].store(true, Ordering::Release);
                     }
                     Ok(false) => {
                         sample.last_missing_us =
