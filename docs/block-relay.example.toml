@@ -9,6 +9,7 @@ chain_id = 1
 [block_relay]
 # Default: no Engine or Beacon writes. Enable injection only for a measured trial.
 mode = "observe"
+state_dir = "/var/lib/web3-proxy/block-relay"
 cache_max_bytes = 134217728
 proof_workers = 2
 

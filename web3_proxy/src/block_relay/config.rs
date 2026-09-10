@@ -17,6 +17,7 @@ pub enum Mode {
 pub struct Config {
     #[serde(default)]
     pub mode: Mode,
+    pub state_dir: PathBuf,
     pub network: Network,
     pub sources: BTreeMap<String, Source>,
     pub execution_targets: BTreeMap<String, ExecutionTarget>,
@@ -124,6 +125,10 @@ pub fn url(value: &str) -> Result<Url> {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.state_dir.is_absolute(),
+            "relay state directory must be absolute"
+        );
         ensure!(
             !self.sources.is_empty()
                 && !(self.execution_targets.is_empty() && self.consensus_targets.is_empty()),

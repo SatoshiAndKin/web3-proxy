@@ -1,6 +1,7 @@
 //! Relay execution payloads and complete signed Beacon blocks to owned clients.
 pub mod config;
 mod consensus;
+mod journal;
 pub mod payload;
 mod service;
 mod source;

@@ -113,11 +113,18 @@ and missing state. Invalid ancestors prevent descendant submissions.
 
 The Engine response deadline is eight seconds. A timeout or malformed response
 does not prove that the node stopped execution. The worker suspends new submissions
-until direct RPC confirms that block. This state survives configuration reloads
-for a retained Engine URL. Removing the relay or restarting its process clears
-in-memory state; first resolve any unknown imports before restarting this version.
-This limitation remains until the durable journal is installed; do not deploy
-the intermediate implementation for production injection.
+until direct RPC confirms that block. Before each Engine request, it writes and
+syncs a local journal. It clears that record only after a valid Engine response
+or matching RPC confirmation. Suspension survives reloads and process restarts.
+Corrupt records and storage failures stop injection. Do not delete a journal to
+clear an unknown import.
+
+Set `state_dir` to an absolute path on persistent local storage. Each forwarder
+owns its directory with a local file lock. Different hosts use different
+directories and can submit to the same targets independently. The directory
+must survive container replacement. Changing it requires a process restart.
+Journal filenames hash normalized Engine URLs; records contain no credentials.
+Avoid changing an Engine endpoint's DNS identity while its import is unresolved.
 Do not list one physical Engine endpoint through multiple DNS or URL aliases.
 Pair each Engine URL with the direct RPC URL of that same execution instance.
 

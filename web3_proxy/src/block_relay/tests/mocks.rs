@@ -273,10 +273,15 @@ pub struct RpcState {
 #[derive(Clone)]
 pub struct MockRpc {
     pub state: Arc<Mutex<RpcState>>,
+    store: Arc<crate::block_relay::journal::StateStore>,
+    _directory: Arc<tempfile::TempDir>,
 }
 impl MockRpc {
     pub fn new() -> Self {
+        let directory = Arc::new(tempfile::tempdir().unwrap());
         Self {
+            store: crate::block_relay::journal::StateStore::open(directory.path()).unwrap(),
+            _directory: directory,
             state: Arc::new(Mutex::new(RpcState {
                 chain_id: 1,
                 supports_v4: true,
@@ -292,7 +297,7 @@ impl MockRpc {
             name: name.to_string(),
             engine: transport::Rpc::new(url, Some(secret())).unwrap(),
             rpc: transport::Rpc::new(url, None).unwrap(),
-            uncertain: Default::default(),
+            journal: self.store.journal(url).unwrap(),
             probes: tokio::sync::Semaphore::new(4),
         })
     }

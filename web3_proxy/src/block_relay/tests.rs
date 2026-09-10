@@ -14,6 +14,7 @@ use tokio::{
 };
 
 mod consensus;
+mod journal;
 mod mocks;
 mod review;
 use mocks::{MockBeacon, MockRpc, Server};
@@ -293,6 +294,20 @@ struct Worker {
 }
 impl Worker {
     async fn start(target: Arc<target::Target>, mode: config::Mode) -> Self {
+        let name = target.name.clone();
+        let worker = Self::spawn(target, mode);
+        until(|| {
+            worker
+                .stats
+                .lock()
+                .execution_targets
+                .get(&name)
+                .is_some_and(|t| t.health.connected)
+        })
+        .await;
+        worker
+    }
+    fn spawn(target: Arc<target::Target>, mode: config::Mode) -> Self {
         let (tx, rx) = broadcast::channel(128);
         let (stop, stop_rx) = watch::channel(false);
         let (mode, mode_rx) = watch::channel(mode);
@@ -309,14 +324,6 @@ impl Worker {
                 ttl: Duration::from_secs(768),
             },
         ));
-        until(|| {
-            stats
-                .lock()
-                .execution_targets
-                .get(&target.name)
-                .is_some_and(|t| t.health.connected)
-        })
-        .await;
         Self {
             tx,
             stop,
@@ -502,13 +509,31 @@ async fn switching_to_observe_stops_queued_injections() {
     assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
 }
 
+#[derive(Clone, Debug)]
+struct ConfigFixture {
+    config: config::Config,
+    _directory: Arc<tempfile::TempDir>,
+}
+impl std::ops::Deref for ConfigFixture {
+    type Target = config::Config;
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+impl std::ops::DerefMut for ConfigFixture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
+}
 fn relay_config(
     network: config::Network,
     sources: &[(&str, &str)],
     execution_targets: &[(&str, &str)],
-) -> config::Config {
-    config::Config {
+) -> ConfigFixture {
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let config = config::Config {
         mode: config::Mode::Observe,
+        state_dir: directory.path().to_owned(),
         network,
         cache_max_bytes: 1024 * 1024,
         consensus_targets: BTreeMap::new(),
@@ -539,6 +564,10 @@ fn relay_config(
                 )
             })
             .collect(),
+    };
+    ConfigFixture {
+        config,
+        _directory: directory,
     }
 }
 

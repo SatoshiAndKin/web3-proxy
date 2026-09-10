@@ -1,5 +1,6 @@
 use super::{
     config::Mode,
+    journal::{Journal, Pending},
     payload::RelayPayload,
     stats::{self, Sample, Shared},
     transport::Rpc,
@@ -25,8 +26,8 @@ pub struct Target {
     pub engine: Rpc,
     pub rpc: Rpc,
     /// A lost Engine response does not cancel execution on the node. Keep the
-    /// target suspended until its RPC confirms this block, including across reloads.
-    pub uncertain: Arc<parking_lot::Mutex<Option<(B256, u64)>>>,
+    /// target suspended until RPC confirms the block, including after a restart.
+    pub journal: Arc<Journal>,
     pub probes: tokio::sync::Semaphore,
 }
 #[derive(Clone)]
@@ -136,18 +137,37 @@ impl Target {
             if *stop.borrow() {
                 return;
             }
-            let uncertain = *self.uncertain.lock();
-            if let Some((hash, number)) = uncertain {
-                if self.has_block(hash, number).await.unwrap_or(false) {
-                    *self.uncertain.lock() = None;
+            let (uncertain, failed) = self.journal.status();
+            if let Some(pending_import) = uncertain {
+                if self
+                    .has_block(pending_import.hash, pending_import.number)
+                    .await
+                    .unwrap_or(false)
+                    && self.journal.complete(pending_import).await.is_ok()
+                {
+                    handled
+                        .insert(
+                            pending_import.hash,
+                            Delivery::Status(PayloadStatusEnum::Valid),
+                        )
+                        .await;
+                    self.wake_children(pending_import.hash, &mut waiting, &mut pending, &stats);
                     let mut s = stats.lock();
                     let t = s.execution_targets.entry(self.name.clone()).or_default();
                     t.health.connected = true;
                     t.health.detail = "Engine response lost; RPC has confirmed the block".into();
                 } else {
+                    self.suspended(&stats, "Engine result unknown; awaiting RPC confirmation and durable journal recovery");
                     tokio::select! { _ = stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
                     continue;
                 }
+            } else if failed {
+                self.suspended(
+                    &stats,
+                    "Engine journal write failed; repair storage before restarting",
+                );
+                tokio::select! { _ = stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+                continue;
             }
             // Drain to a bounded local queue, then prefer the newest slot. Preserve competitors.
             loop {
@@ -328,6 +348,14 @@ impl Target {
         }
     }
     async fn deliver(&self, payload: &RelayPayload, stats: &Shared) -> Result<PayloadStatus> {
+        let pending = Pending {
+            hash: payload.hash,
+            number: payload.number,
+        };
+        if let Err(error) = self.journal.begin(pending).await {
+            self.suspended(stats, &error.to_string());
+            return Err(error);
+        }
         stats
             .lock()
             .execution_targets
@@ -335,15 +363,17 @@ impl Target {
             .or_default()
             .sent += 1;
         let start = Instant::now();
-        let result = self.engine.new_payload(payload).await.and_then(|status| {
+        let mut result = self.engine.new_payload(payload).await.and_then(|status| {
             ensure!(
                 !status.is_valid() || status.latest_valid_hash == Some(payload.hash),
                 "VALID response hash mismatch"
             );
             Ok(status)
         });
-        if result.is_err() {
-            *self.uncertain.lock() = Some((payload.hash, payload.number));
+        if result.is_ok() {
+            if let Err(error) = self.journal.complete(pending).await {
+                result = Err(error);
+            }
         }
         let mut s = stats.lock();
         let t = s.execution_targets.entry(self.name.clone()).or_default();
@@ -366,6 +396,15 @@ impl Target {
             tracing::error!(target_name = %self.name, block_hash = %payload.hash, "Engine rejected relay payload");
         }
         result
+    }
+    fn suspended(&self, stats: &Shared, detail: &str) {
+        let mut stats = stats.lock();
+        let target = stats
+            .execution_targets
+            .entry(self.name.clone())
+            .or_default();
+        target.health.connected = false;
+        target.health.detail = detail.into();
     }
     async fn repair(
         &self,

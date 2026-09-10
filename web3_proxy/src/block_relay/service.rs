@@ -1,6 +1,7 @@
 use super::{
     config::{Config, Mode, SLOTS_PER_EPOCH},
     consensus::{ConsensusTarget, ConsensusWork},
+    journal::StateStore,
     payload::{ConsensusPayload, RelayPayload},
     source::{race_sources, Announcement, BeaconSource},
     stats::{self, Shared, Stats},
@@ -39,6 +40,7 @@ pub(super) struct Work {
 
 struct Prepared {
     config: Config,
+    store: Arc<StateStore>,
     sources: Vec<Arc<BeaconSource>>,
     execution_targets: Vec<Arc<Target>>,
     consensus_targets: Vec<Arc<ConsensusTarget>>,
@@ -54,10 +56,18 @@ impl Prepared {
         }
         if let Some(previous) = &previous {
             anyhow::ensure!(
+                previous.config.state_dir == config.state_dir,
+                "changing the relay state directory requires a process restart"
+            );
+            anyhow::ensure!(
                 previous.config.proof_workers == config.proof_workers,
                 "changing proof workers requires a process restart"
             );
         }
+        let store = match &previous {
+            Some(previous) => previous.store.clone(),
+            None => StateStore::open(&config.state_dir)?,
+        };
         let sources = config
             .sources
             .iter()
@@ -67,29 +77,13 @@ impl Prepared {
             .execution_targets
             .iter()
             .map(|(name, config)| {
-                let engine_url = super::config::url(&config.engine_url)?;
                 let jwt = JwtSecret::from_file(&config.jwt_secret_path)
                     .map_err(|_| anyhow::anyhow!("cannot read a target JWT secret"))?;
-                let uncertain = previous
-                    .as_ref()
-                    .and_then(|p| {
-                        p.config
-                            .execution_targets
-                            .iter()
-                            .find(|(_, t)| {
-                                super::config::url(&t.engine_url).as_ref().ok() == Some(&engine_url)
-                            })
-                            .and_then(|(name, _)| {
-                                p.execution_targets.iter().find(|t| &t.name == name)
-                            })
-                    })
-                    .map(|t| t.uncertain.clone())
-                    .unwrap_or_default();
                 Ok(Arc::new(Target {
                     name: name.clone(),
                     engine: Rpc::new(&config.engine_url, Some(jwt))?,
                     rpc: Rpc::new(&config.rpc_url, None)?,
-                    uncertain,
+                    journal: store.journal(&config.engine_url)?,
                     probes: tokio::sync::Semaphore::new(4),
                 }))
             })
@@ -110,6 +104,7 @@ impl Prepared {
             .collect::<Result<_>>()?;
         Ok(Self {
             config,
+            store,
             sources,
             execution_targets: targets,
             consensus_targets,

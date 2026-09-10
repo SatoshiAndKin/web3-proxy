@@ -203,6 +203,8 @@ async fn two_forwarders_send_to_all_three_execution_and_consensus_targets() {
         beacons.push(beacon);
     }
     let (a, stop_a, run_a) = start_relay(&config).await;
+    let second_directory = tempfile::tempdir().unwrap();
+    config.state_dir = second_directory.path().to_owned();
     let (b, stop_b, run_b) = start_relay(&config).await;
     until(|| source.events.receiver_count() == 2).await;
     source.announce("block", root, block.data.message.slot);
