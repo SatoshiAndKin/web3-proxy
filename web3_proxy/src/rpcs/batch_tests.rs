@@ -595,85 +595,300 @@ async fn batch_configuration_accepts_independent_positive_limits() {
 
 async fn websocket_backend(
     upgrade: WebSocketUpgrade,
-    State(sender): State<mpsc::UnboundedSender<Value>>,
+    State(sender): State<mpsc::UnboundedSender<Incoming>>,
 ) -> impl IntoResponse {
+    use futures::{stream::FuturesUnordered, StreamExt};
+
     upgrade.on_upgrade(async move |mut socket| {
-        while let Some(Ok(message)) = socket.recv().await {
-            let Ok(text) = message.to_text() else {
-                continue;
-            };
-            let call: Value = serde_json::from_str(text).unwrap();
-            sender.send(call.clone()).unwrap();
-            socket
-                .send(Message::Text(answer(&call).to_string().into()))
-                .await
-                .unwrap();
+        let mut replies = FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                message = socket.recv() => {
+                    let Some(Ok(Message::Text(text))) = message else { break };
+                    let (reply, response) = oneshot::channel();
+                    if sender.send(Incoming {
+                        body: serde_json::from_str(&text).unwrap(),
+                        reply,
+                    }).is_err() { break; }
+                    replies.push(async move {
+                        let response = response.await.ok()?;
+                        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.ok()?;
+                        String::from_utf8(bytes.to_vec()).ok()
+                    });
+                }
+                response = replies.next(), if !replies.is_empty() => {
+                    if let Some(Some(text)) = response {
+                        if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                    }
+                }
+            }
         }
     })
+}
+
+struct WebSocketHarness {
+    rpc: Arc<Web3Rpc>,
+    incoming: mpsc::UnboundedReceiver<Incoming>,
+    server: JoinHandle<()>,
+}
+
+impl Drop for WebSocketHarness {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl WebSocketHarness {
+    async fn new(concurrency: usize) -> Self {
+        let (sender, incoming) = mpsc::unbounded_channel();
+        let router = Router::new()
+            .route("/", get(websocket_backend))
+            .with_state(sender);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let provider = super::provider::connect_ws(format!("ws://{address}").parse().unwrap())
+            .await
+            .unwrap();
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "ws-only".into(),
+            healthy: AtomicBool::new(true),
+            ws_provider: ArcSwapOption::from(Some(Arc::new(provider))),
+            hard_limit_until: Some(hard_limit_until),
+            request_permits: RequestPermits::new(concurrency, 64),
+            peak_latency: Some(PeakEwmaLatency::spawn(
+                Duration::from_secs(15),
+                100,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(RollingQuantileLatency::spawn_median(100).await),
+            ..Default::default()
+        });
+        Self {
+            rpc,
+            incoming,
+            server,
+        }
+    }
+
+    async fn next(&mut self) -> Incoming {
+        let call = timeout(Duration::from_secs(2), self.incoming.recv())
+            .await
+            .expect("WebSocket fallback must start")
+            .unwrap();
+        assert!(
+            call.body.is_object(),
+            "WebSocket forwarding must be individual"
+        );
+        assert_eq!(call.body["method"], "eth_call");
+        assert_eq!(call.body["params"][1], "0x2a");
+        call
+    }
+
+    async fn quiet(&mut self) {
+        assert!(
+            timeout(Duration::from_millis(50), self.incoming.recv())
+                .await
+                .is_err(),
+            "unexpected WebSocket request"
+        );
+    }
+
+    fn completed(&self, calls: usize) {
+        assert_eq!(self.rpc.total_requests.load(Ordering::Relaxed), calls);
+        assert_eq!(self.rpc.backend_batch_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(self.rpc.active_requests.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
 async fn batch_ws_only_backend_uses_individual_forwarding() {
     let mut h = Harness::new(4, 64).await;
-    let (sender, mut incoming) = mpsc::unbounded_channel();
-    let router = Router::new()
-        .route("/", get(websocket_backend))
-        .with_state(sender);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let provider = super::provider::connect_ws(format!("ws://{address}").parse().unwrap())
-        .await
-        .unwrap();
-    let (hard_limit_until, _) = watch::channel(Instant::now());
-    let rpc = Arc::new(Web3Rpc {
-        name: "ws-only".into(),
-        healthy: AtomicBool::new(true),
-        ws_provider: ArcSwapOption::from(Some(Arc::new(provider))),
-        hard_limit_until: Some(hard_limit_until),
-        request_permits: RequestPermits::new(2, 64),
-        peak_latency: Some(PeakEwmaLatency::spawn(
-            Duration::from_secs(15),
-            100,
-            Duration::from_secs(1),
-        )),
-        median_latency: Some(RollingQuantileLatency::spawn_median(100).await),
-        ..Default::default()
-    });
-    let head = h.app.balanced_rpcs.head_block();
+    let mut ws = WebSocketHarness::new(2).await;
     h.app.balanced_rpcs.by_name.write().clear();
-    h.app
-        .balanced_rpcs
-        .by_name
-        .write()
-        .insert(rpc.name.clone(), rpc.clone());
-    h.app
-        .balanced_rpcs
-        .watch_ranked_rpcs
-        .send_replace(Some(Arc::new(RankedRpcs::from_rpcs(
-            vec![rpc.clone()],
-            head,
-            false,
-        ))));
-    h.rpc = rpc;
-    assert_answers(
-        timeout(Duration::from_secs(2), h.start(4))
-            .await
-            .unwrap()
-            .unwrap(),
-        4,
-    );
+    add_backend(&h.app, vec![ws.rpc.clone()]);
+    let task = h.start(4);
     for _ in 0..4 {
-        let call = incoming.try_recv().unwrap();
-        assert!(call.is_object());
-        assert_eq!(call["method"], "eth_call");
+        ws.next().await.succeed();
     }
-    assert!(incoming.try_recv().is_err());
-    assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 0);
-    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 4);
+    assert_answers(task.await.unwrap(), 4);
+    ws.quiet().await;
+    ws.completed(4);
     h.quiet().await;
     h.idle();
-    server.abort();
+}
+
+#[tokio::test]
+async fn batch_mixed_pool_uses_websocket_when_http_is_unavailable() {
+    for unavailable in ["unhealthy", "cooldown", "full"] {
+        let mut h = Harness::new(1, 64).await;
+        let mut ws = WebSocketHarness::new(2).await;
+        let held = match unavailable {
+            "unhealthy" => {
+                h.rpc.healthy.store(false, Ordering::SeqCst);
+                None
+            }
+            "cooldown" => {
+                h.rpc
+                    .hard_limit_until
+                    .as_ref()
+                    .unwrap()
+                    .send_replace(Instant::now() + Duration::from_secs(60));
+                None
+            }
+            "full" => {
+                let task = h.start(2);
+                Some((task, h.next().await))
+            }
+            _ => unreachable!(),
+        };
+        add_backend(&h.app, vec![h.rpc.clone(), ws.rpc.clone()]);
+        let task = h.start(4);
+        let first = ws.next().await;
+        let second = ws.next().await;
+        assert_eq!(ws.rpc.active_requests.load(Ordering::SeqCst), 2);
+        ws.quiet().await;
+        second.succeed();
+        first.succeed();
+        ws.next().await.succeed();
+        ws.next().await.succeed();
+        assert_answers(
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            4,
+        );
+        ws.completed(4);
+        ws.quiet().await;
+        h.quiet().await;
+        if let Some((task, packet)) = held {
+            packet.succeed();
+            assert_answers(task.await.unwrap(), 2);
+            assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 2);
+            assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
+        } else {
+            assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 0);
+            assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 0);
+        }
+        h.idle();
+    }
+}
+
+#[tokio::test]
+async fn batch_mixed_pool_retries_failed_http_on_websocket_without_repeating_successes() {
+    let mut h = Harness::new(3, 2).await;
+    let mut ws = WebSocketHarness::new(2).await;
+    add_backend(&h.app, vec![h.rpc.clone(), ws.rpc.clone()]);
+    let task = h.start(6);
+    let success = h.next().await;
+    let blocked = h.next().await;
+    let failed = h.next().await;
+    let expected = packet_params(&failed);
+    ws.quiet().await;
+    success.succeed();
+    advance_to(Instant::now() + Duration::from_secs(11)).await;
+    failed.reject();
+    let first = ws.next().await;
+    let second = ws.next().await;
+    let actual = vec![first.body["params"].clone(), second.body["params"].clone()];
+    assert_eq!(actual, expected);
+    second.succeed();
+    first.succeed();
+    ws.quiet().await;
+    assert!(
+        !task.is_finished(),
+        "the unrelated HTTP packet is still blocked"
+    );
+    blocked.succeed();
+    assert_answers(task.await.unwrap(), 6);
+    h.quiet().await;
+    ws.completed(2);
+    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 6);
+    assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 3);
+    h.idle();
+}
+
+#[tokio::test]
+async fn batch_mixed_pool_requeues_websocket_errors_as_http_packets() {
+    let mut h = Harness::new(1, 64).await;
+    let mut ws = WebSocketHarness::new(2).await;
+    h.rpc
+        .hard_limit_until
+        .as_ref()
+        .unwrap()
+        .send_replace(Instant::now() + Duration::from_secs(60));
+    add_backend(&h.app, vec![h.rpc.clone(), ws.rpc.clone()]);
+    let task = h.start(2);
+    let success = ws.next().await;
+    let limited = ws.next().await;
+    let expected = limited.body["params"].clone();
+    let id = limited.body["id"].clone();
+    h.rpc
+        .hard_limit_until
+        .as_ref()
+        .unwrap()
+        .send_replace(Instant::now());
+    success.succeed();
+    limited.respond(json!({"jsonrpc":"2.0", "id":id,
+        "error":{"code":-32005, "message":"rate limit exceeded"}}));
+    let retry = h.next().await;
+    assert_eq!(packet_params(&retry), vec![expected]);
+    retry.succeed();
+    assert_answers(task.await.unwrap(), 2);
+    assert!(ws.rpc.next_available(Instant::now()) > Instant::now());
+    ws.quiet().await;
+    ws.completed(2);
+    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
+    h.idle();
+}
+
+#[tokio::test]
+async fn batch_mixed_pool_websocket_timeout_and_cancellation_release_slots() {
+    for cancel in [false, true] {
+        let mut h = Harness::new(1, 64).await;
+        let mut ws = WebSocketHarness::new(1).await;
+        h.rpc
+            .hard_limit_until
+            .as_ref()
+            .unwrap()
+            .send_replace(Instant::now() + Duration::from_secs(120));
+        add_backend(&h.app, vec![h.rpc.clone(), ws.rpc.clone()]);
+        let task = h.start(3);
+        let stalled = ws.next().await;
+        ws.quiet().await;
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            advance_to(Instant::now() + Duration::from_secs(60)).await;
+            let response = timeout(Duration::from_millis(500), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_timeout_responses(
+                response,
+                json!([
+                    timeout_answer(json!(0)),
+                    timeout_answer(json!(1)),
+                    timeout_answer(json!(0))
+                ]),
+            );
+        }
+        ws.completed(1);
+        ws.quiet().await;
+        let next = h.start(2);
+        ws.next().await.succeed();
+        ws.next().await.succeed();
+        assert_answers(next.await.unwrap(), 2);
+        ws.completed(3);
+        h.quiet().await;
+        assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 0);
+        h.idle();
+        drop(stalled);
+    }
 }
 
 #[tokio::test]
