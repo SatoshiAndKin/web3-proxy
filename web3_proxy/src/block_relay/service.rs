@@ -1,7 +1,7 @@
 use super::{
     config::{Config, Mode, SLOTS_PER_EPOCH},
     payload::RelayPayload,
-    source::{Announcement, BeaconSource},
+    source::{race_sources, Announcement, BeaconSource},
     stats::{self, Shared, Stats},
     target::Target,
     transport::Rpc,
@@ -14,10 +14,7 @@ use moka::future::Cache;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 use tokio::{
@@ -57,6 +54,7 @@ impl Prepared {
             .targets
             .iter()
             .map(|(name, config)| {
+                let engine_url = super::config::url(&config.engine_url)?;
                 let jwt = JwtSecret::from_file(&config.jwt_secret_path)
                     .map_err(|_| anyhow::anyhow!("cannot read a target JWT secret"))?;
                 let uncertain = previous
@@ -65,7 +63,9 @@ impl Prepared {
                         p.config
                             .targets
                             .iter()
-                            .find(|(_, t)| t.engine_url == config.engine_url)
+                            .find(|(_, t)| {
+                                super::config::url(&t.engine_url).as_ref().ok() == Some(&engine_url)
+                            })
                             .and_then(|(name, _)| p.targets.iter().find(|t| &t.name == name))
                     })
                     .map(|t| t.uncertain.clone())
@@ -216,49 +216,25 @@ async fn acquire(
     decoders: Arc<tokio::sync::Semaphore>,
 ) -> Result<(Arc<RelayPayload>, String)> {
     let deadline = announcement.at + Duration::from_secs(network.seconds_per_slot);
-    let mut delay = Duration::from_millis(20);
-    loop {
-        let mut race = FuturesUnordered::new();
-        for source in &sources {
-            if !source.verified.load(Ordering::Acquire) {
-                continue;
-            }
-            let source = source.clone();
-            let network = network.clone();
-            let decoders = decoders.clone();
-            let root = announcement.root;
-            race.push(async move {
-                let bytes = source
-                    .get_bytes(&format!("/eth/v2/beacon/blocks/{root}"))
-                    .await?;
-                let permit = decoders.acquire_owned().await?;
-                let payload = tokio::task::spawn_blocking(move || {
-                    // Hold the permit in the blocking task. Canceling its caller cannot
-                    // release CPU capacity while this decode still runs.
-                    let _permit = permit;
-                    RelayPayload::decode(&bytes, root, &network)
-                })
-                .await??;
-                Ok::<_, anyhow::Error>((Arc::new(payload), source.name.clone()))
-            });
+    race_sources(&sources, deadline, &notify, |source| {
+        let network = network.clone();
+        let decoders = decoders.clone();
+        let root = announcement.root;
+        async move {
+            let bytes = source
+                .get_bytes(&format!("/eth/v2/beacon/blocks/{root}"))
+                .await?;
+            let permit = decoders.acquire_owned().await?;
+            let payload = tokio::task::spawn_blocking(move || {
+                // A canceled request must not release capacity while its decoder still runs.
+                let _permit = permit;
+                RelayPayload::decode(&bytes, root, &network)
+            })
+            .await??;
+            Ok(Arc::new(payload))
         }
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => anyhow::bail!("block acquisition deadline"),
-                result = race.next() => match result {
-                    Some(Ok(value)) => return Ok(value),
-                    Some(Err(_)) => continue,
-                    None => break,
-                }
-            }
-        }
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("block acquisition deadline"),
-            _ = notify.notified() => {},
-            _ = tokio::time::sleep(delay) => {},
-        }
-        delay = (delay * 2).min(Duration::from_millis(200));
-    }
+    })
+    .await
 }
 
 async fn run_generation(

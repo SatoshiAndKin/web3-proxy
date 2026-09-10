@@ -14,6 +14,7 @@ use tokio::{
 };
 
 mod mocks;
+mod review;
 use mocks::{MockBeacon, MockRpc, Server};
 
 fn network() -> config::Network {

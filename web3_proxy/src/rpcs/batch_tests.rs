@@ -145,6 +145,7 @@ impl Harness {
         background.abort();
         head_sender.send_replace(Some(head));
         let app = Arc::new(App {
+            block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
             config: AppConfig::default(),

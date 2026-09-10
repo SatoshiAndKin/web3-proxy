@@ -35,6 +35,11 @@ enum Delivery {
     Unknown,
 }
 impl Delivery {
+    fn invalid_ancestor() -> Self {
+        Self::Status(PayloadStatusEnum::Invalid {
+            validation_error: "invalid ancestor".into(),
+        })
+    }
     fn is_invalid(&self) -> bool {
         matches!(self, Self::Status(s) if s.is_invalid())
     }
@@ -196,6 +201,19 @@ impl Target {
                 continue;
             }
             let p = &work.payload;
+            if work.known[&self.name].load(Ordering::Acquire) {
+                handled
+                    .insert(p.hash, Delivery::Status(PayloadStatusEnum::Valid))
+                    .await;
+                self.wake_children(p.hash, &mut waiting, &mut pending, &stats);
+                stats
+                    .lock()
+                    .targets
+                    .entry(self.name.clone())
+                    .or_default()
+                    .skipped_known += 1;
+                continue;
+            }
             let previous = handled.get(&p.hash).await;
             let parent_became_valid =
                 matches!(previous, Some(Delivery::Status(PayloadStatusEnum::Syncing)))
@@ -203,9 +221,7 @@ impl Target {
                         .get(&p.parent_hash)
                         .await
                         .is_some_and(|s| s.is_valid());
-            if (previous.is_some() && !parent_became_valid)
-                || work.known[&self.name].load(Ordering::Acquire)
-            {
+            if previous.is_some() && !parent_became_valid {
                 stats
                     .lock()
                     .targets
@@ -219,14 +235,7 @@ impl Target {
                 .await
                 .is_some_and(|s| s.is_invalid())
             {
-                handled
-                    .insert(
-                        p.hash,
-                        Delivery::Status(PayloadStatusEnum::Invalid {
-                            validation_error: "invalid ancestor".into(),
-                        }),
-                    )
-                    .await;
+                handled.insert(p.hash, Delivery::invalid_ancestor()).await;
                 stats
                     .lock()
                     .targets
@@ -263,29 +272,59 @@ impl Target {
                     }
                 } else if handled.get(&p.hash).await.is_some_and(|s| s.is_valid()) {
                     // SYNCING is retryable only after new ancestry evidence, never on a timer.
-                    let children: Vec<_> = waiting
-                        .iter()
-                        .filter(|(_, child)| child.payload.parent_hash == p.hash)
-                        .map(|(hash, _)| *hash)
-                        .collect();
-                    for child in children {
-                        if pending.len() == 128 {
-                            pending.pop_front();
-                            stats
-                                .lock()
-                                .targets
-                                .entry(self.name.clone())
-                                .or_default()
-                                .queue_dropped += 1;
-                        }
-                        pending.push_back(waiting.remove(&child).expect("existing child"));
+                    self.wake_children(p.hash, &mut waiting, &mut pending, &stats);
+                }
+                // Rejection can happen during repair, not only on this work item's first send.
+                let mut rejected = Vec::new();
+                for (hash, child) in &waiting {
+                    if handled
+                        .get(&child.payload.parent_hash)
+                        .await
+                        .is_some_and(|s| s.is_invalid())
+                    {
+                        rejected.push(*hash);
                     }
+                }
+                while let Some(hash) = rejected.pop() {
+                    handled.insert(hash, Delivery::invalid_ancestor()).await;
+                    waiting.remove(&hash);
+                    rejected.extend(
+                        waiting
+                            .iter()
+                            .filter(|(_, child)| child.payload.parent_hash == hash)
+                            .map(|(hash, _)| *hash),
+                    );
                 }
             } else {
                 // A timeout can leave execution in progress. Do not issue another request
                 // for this hash merely because the response was lost.
                 handled.insert(p.hash, Delivery::Unknown).await;
             }
+        }
+    }
+    fn wake_children(
+        &self,
+        parent: B256,
+        waiting: &mut BTreeMap<B256, Arc<Work>>,
+        pending: &mut VecDeque<Arc<Work>>,
+        stats: &Shared,
+    ) {
+        let children: Vec<_> = waiting
+            .iter()
+            .filter(|(_, child)| child.payload.parent_hash == parent)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for child in children {
+            if pending.len() == 128 {
+                pending.pop_front();
+                stats
+                    .lock()
+                    .targets
+                    .entry(self.name.clone())
+                    .or_default()
+                    .queue_dropped += 1;
+            }
+            pending.push_back(waiting.remove(&child).expect("existing child"));
         }
     }
     async fn deliver(&self, payload: &RelayPayload, stats: &Shared) -> Result<PayloadStatus> {
@@ -337,7 +376,7 @@ impl Target {
         stop: &watch::Receiver<bool>,
         mode: &watch::Receiver<Mode>,
     ) {
-        let mut chain = Vec::new();
+        let mut chain: Vec<Arc<RelayPayload>> = Vec::new();
         let mut hash = work.payload.parent_hash;
         let mut number = work.payload.number.saturating_sub(1);
         let mut anchored = false;
@@ -346,11 +385,16 @@ impl Target {
             {
                 return;
             }
-            if handled
-                .get(&hash)
-                .await
-                .is_some_and(|s| s.is_invalid() || matches!(s, Delivery::Unknown))
-            {
+            let previous = handled.get(&hash).await;
+            if previous.as_ref().is_some_and(|s| s.is_invalid()) {
+                for descendant in chain.iter().chain(std::iter::once(&work.payload)) {
+                    handled
+                        .insert(descendant.hash, Delivery::invalid_ancestor())
+                        .await;
+                }
+                return;
+            }
+            if matches!(previous, Some(Delivery::Unknown)) {
                 return;
             }
             if handled.get(&hash).await.is_some_and(|s| s.is_valid())
@@ -387,11 +431,11 @@ impl Target {
             .entry(self.name.clone())
             .or_default()
             .repairs += 1;
-        for payload in chain
+        let mut repair = chain
             .into_iter()
             .rev()
-            .chain(std::iter::once(work.payload.clone()))
-        {
+            .chain(std::iter::once(work.payload.clone()));
+        while let Some(payload) = repair.next() {
             if *stop.borrow() || *mode.borrow() == Mode::Observe || Instant::now() >= work.deadline
             {
                 return;
@@ -400,10 +444,18 @@ impl Target {
                 return;
             };
             let valid = status.is_valid();
+            let invalid = status.is_invalid();
             handled
                 .insert(payload.hash, Delivery::Status(status.status))
                 .await;
             if !valid {
+                if invalid {
+                    for descendant in repair {
+                        handled
+                            .insert(descendant.hash, Delivery::invalid_ancestor())
+                            .await;
+                    }
+                }
                 return;
             }
         }

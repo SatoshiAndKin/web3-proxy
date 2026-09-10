@@ -37,6 +37,7 @@ pub struct BeaconState {
     pub blocks: BTreeMap<B256, Vec<u8>>,
     pub hidden: std::collections::BTreeSet<B256>,
     pub block_reads: Vec<B256>,
+    pub block_gates: BTreeMap<B256, Arc<tokio::sync::Notify>>,
     pub gossip_supported: bool,
     pub queries: Vec<String>,
 }
@@ -53,6 +54,7 @@ impl MockBeacon {
                 blocks: BTreeMap::new(),
                 hidden: Default::default(),
                 block_reads: Vec::new(),
+                block_gates: Default::default(),
                 gossip_supported: true,
                 queries: Vec::new(),
             })),
@@ -79,6 +81,19 @@ impl MockBeacon {
 }
 async fn handle_beacon(State(beacon): State<MockBeacon>, uri: axum::http::Uri) -> Response {
     use axum::response::sse::{Event, Sse};
+    let gate = {
+        let mut state = beacon.state.lock();
+        if uri.path().starts_with("/eth/v2/beacon/blocks/") {
+            let root = uri.path().rsplit('/').next().unwrap().parse().unwrap();
+            state.block_reads.push(root);
+            state.block_gates.get(&root).cloned()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        gate.notified().await;
+    }
     let mut state = beacon.state.lock();
     let network = &state.network;
     match uri.path() {
@@ -109,7 +124,6 @@ async fn handle_beacon(State(beacon): State<MockBeacon>, uri: axum::http::Uri) -
         }
         path if path.starts_with("/eth/v2/beacon/blocks/") => {
             let root: B256 = path.rsplit('/').next().unwrap().parse().unwrap();
-            state.block_reads.push(root);
             if state.hidden.contains(&root) {
                 return StatusCode::NOT_FOUND.into_response();
             }

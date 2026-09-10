@@ -23,6 +23,50 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 use url::Url;
 
+/// Retry failed sources without canceling or waiting for unrelated pending reads.
+pub(super) async fn race_sources<T, F, Fut>(
+    sources: &[Arc<BeaconSource>],
+    deadline: Instant,
+    notify: &tokio::sync::Notify,
+    read: F,
+) -> Result<(T, String)>
+where
+    F: Fn(Arc<BeaconSource>) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut race = futures_util::stream::FuturesUnordered::new();
+    let mut in_flight = vec![false; sources.len()];
+    let mut retry = true;
+    let mut delay = Duration::from_millis(20);
+    let mut next_retry = Instant::now() + delay;
+    loop {
+        if retry {
+            for (index, source) in sources.iter().enumerate() {
+                if in_flight[index] || !source.verified.load(Ordering::Acquire) {
+                    continue;
+                }
+                in_flight[index] = true;
+                let future = read(source.clone());
+                race.push(async move { (index, future.await) });
+            }
+            retry = false;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => anyhow::bail!("acquisition deadline"),
+            Some((index, result)) = race.next(), if !race.is_empty() => {
+                in_flight[index] = false;
+                if let Ok(value) = result { return Ok((value, sources[index].name.clone())); }
+            }
+            _ = notify.notified() => retry = true,
+            _ = tokio::time::sleep_until(next_retry) => {
+                retry = true;
+                delay = (delay * 2).min(Duration::from_millis(200));
+                next_retry = Instant::now() + delay;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Announcement {
     pub root: B256,
