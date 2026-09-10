@@ -12,6 +12,7 @@ use crate::rpcs::blockchain::BlockHeader;
 use crate::rpcs::consensus::RankedRpcs;
 use crate::rpcs::many::{Web3Rpcs, Web3RpcsSpawnConfig};
 use crate::rpcs::one::Web3Rpc;
+use crate::rpcs::request::OpenRequestHandle;
 use alloy::consensus::{Transaction as _, TxEnvelope};
 use alloy::eips::Decodable2718;
 use alloy::primitives::{keccak256, Address, Bytes, TxHash, B256, U256, U64};
@@ -19,6 +20,7 @@ use axum::http::StatusCode;
 use deduped_broadcast::DedupedBroadcaster;
 use futures::future::join_all;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use hashbrown::HashSet;
 use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, OwnedLazyValue};
 use std::fmt;
@@ -87,6 +89,41 @@ pub struct Web3ProxyAppSpawn {
     pub new_top_config: Arc<watch::Sender<TopConfig>>,
     /// watch this to know when the app is ready to serve requests
     pub ranked_rpcs: watch::Receiver<Option<Arc<RankedRpcs>>>,
+}
+
+fn weighted_batch_lengths(
+    request_count: usize,
+    capacities: impl IntoIterator<Item = usize>,
+) -> Vec<usize> {
+    let capacities = capacities
+        .into_iter()
+        .map(|capacity| capacity.max(1))
+        .collect::<Vec<_>>();
+    let total_capacity = capacities
+        .iter()
+        .map(|capacity| *capacity as u128)
+        .sum::<u128>();
+    let request_count = request_count as u128;
+    let mut remainders = Vec::with_capacity(capacities.len());
+    let mut lengths = capacities
+        .into_iter()
+        .enumerate()
+        .map(|(index, capacity)| {
+            let weighted = request_count * capacity as u128;
+            remainders.push((index, weighted % total_capacity));
+            usize::try_from(weighted / total_capacity)
+                .expect("weighted backend batch length fits usize")
+        })
+        .collect::<Vec<_>>();
+    let assigned = lengths.iter().sum::<usize>();
+    remainders.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (index, _) in remainders
+        .into_iter()
+        .take(request_count as usize - assigned)
+    {
+        lengths[index] += 1;
+    }
+    lengths
 }
 
 impl App {
@@ -371,6 +408,18 @@ impl App {
             .head_block()
             .ok_or(Web3ProxyError::NoServersSynced)?;
 
+        if matches!(proxy_mode, ProxyMode::Best)
+            && requests.len() > 1
+            && requests.iter().all(|request| request.method == "eth_call")
+        {
+            if let Some(result) = self
+                .proxy_eth_call_batch(&requests, &head_block, request_id.clone())
+                .await
+            {
+                return result;
+            }
+        }
+
         // TODO: use streams and buffers so we don't overwhelm our server
         let responses = join_all(
             requests
@@ -409,6 +458,150 @@ impl App {
         }
 
         Ok((collected, collected_rpcs))
+    }
+
+    async fn proxy_eth_call_batch(
+        self: &Arc<Self>,
+        requests: &[SingleRequest],
+        head_block: &BlockHeader,
+        request_id: Option<String>,
+    ) -> Option<Web3ProxyResult<(Vec<jsonrpc::ParsedResponse>, Vec<Arc<Web3Rpc>>)>> {
+        let mut validated_requests = Vec::with_capacity(requests.len());
+        for request in requests.iter().cloned() {
+            let validated = match ValidatedRequest::new_with_app(
+                self,
+                ProxyMode::Best,
+                None,
+                request.into(),
+                Some(head_block.clone()),
+                request_id.clone(),
+            )
+            .await
+            {
+                Ok(validated) => validated,
+                Err(_) => return None,
+            };
+            validated_requests.push(validated);
+        }
+
+        if validated_requests
+            .windows(2)
+            .any(|pair| pair[0].request_blocks != pair[1].request_blocks)
+        {
+            return None;
+        }
+
+        let handles = match self
+            .balanced_rpcs
+            .try_rpcs_for_request(&validated_requests[0])
+            .await
+        {
+            Ok(rpcs) => rpcs.open_batch_handles().await,
+            Err(_) => Vec::new(),
+        };
+        let mut packets = FuturesUnordered::new();
+        if handles.is_empty() {
+            packets.push(self.proxy_batch_packet(None, &validated_requests, 0));
+        } else {
+            let batch_lengths = weighted_batch_lengths(
+                validated_requests.len(),
+                handles.iter().map(OpenRequestHandle::batch_capacity),
+            );
+            let mut offset = 0;
+            for (handle, count) in handles.into_iter().zip(batch_lengths) {
+                for chunk in validated_requests[offset..offset + count].chunks(handle.batch_size())
+                {
+                    packets.push(self.proxy_batch_packet(
+                        Some(handle.clone_connection()),
+                        chunk,
+                        offset,
+                    ));
+                    offset += chunk.len();
+                }
+            }
+        }
+        let mut completed = Vec::with_capacity(validated_requests.len());
+        while let Some(packet) = packets.next().await {
+            completed.extend(packet);
+        }
+        completed.sort_by_key(|(index, _, _)| *index);
+        let mut responses = Vec::with_capacity(completed.len());
+        let mut used_rpcs = Vec::new();
+        let mut names = HashSet::new();
+        for (_, response, rpcs) in completed {
+            responses.push(response);
+            used_rpcs.extend(
+                rpcs.into_iter()
+                    .filter(|rpc| names.insert(rpc.name.clone())),
+            );
+        }
+        Some(Ok((responses, used_rpcs)))
+    }
+
+    /// Finish one packet and immediately recover only its incomplete calls.
+    async fn proxy_batch_packet(
+        self: &Arc<Self>,
+        rpc: Option<Arc<Web3Rpc>>,
+        requests: &[Arc<ValidatedRequest>],
+        offset: usize,
+    ) -> Vec<(usize, jsonrpc::ParsedResponse, Vec<Arc<Web3Rpc>>)> {
+        let outcomes = if let Some(rpc) = rpc {
+            let handle = OpenRequestHandle::new(requests[0].clone(), rpc, None).await;
+            if handle.supports_batch() {
+                handle.request_batch(requests).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let outcomes = outcomes
+            .map(|outcomes| outcomes.into_iter().map(Result::ok).collect())
+            .unwrap_or_else(|| (0..requests.len()).map(|_| None).collect::<Vec<_>>());
+        join_all(requests.iter().zip(outcomes).enumerate().map(
+            |(index, (request, response))| async move {
+                let response = match response {
+                    Some(response) => response,
+                    None => {
+                        match self
+                            .balanced_rpcs
+                            .continue_request::<Arc<OwnedLazyValue>>(request)
+                            .await
+                        {
+                            Ok(SingleResponse::Parsed(mut response)) => {
+                                response.id = request.id();
+                                response
+                            }
+                            Ok(SingleResponse::Stream(_)) => {
+                                unreachable!("continued calls complete their bodies")
+                            }
+                            Err(error) => {
+                                request.set_error_response(&error);
+                                let (_, response) = error
+                                    .as_json_response_parts(request.id(), Some(request.as_ref()));
+                                match response {
+                                    SingleResponse::Parsed(response) => response,
+                                    SingleResponse::Stream(_) => {
+                                        unreachable!("local errors are parsed")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                {
+                    let mut state = request.response.lock();
+                    state.user_error_response = !state.error_response
+                        && matches!(response.payload, jsonrpc::ResponsePayload::Error { .. });
+                }
+                let response_bytes = sonic_rs::to_string(&response)
+                    .expect("JSON-RPC response serializes")
+                    .len() as u64;
+                request.set_response(response_bytes);
+                (offset + index, response, request.backend_rpcs_used())
+            },
+        ))
+        .await
     }
 
     /// try to send transactions to the best available rpcs with protected/private mempools

@@ -1,12 +1,12 @@
 use super::JsonRpcErrorData;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
 use crate::jsonrpc::ValidatedRequest;
+use crate::rpcs::request::ActiveRequestGuard;
 use axum::body::Body;
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use bytes::{Bytes, BytesMut};
-use futures_util::stream::{self, StreamExt};
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 use serde::{de, Deserialize, Serialize};
 use sonic_rs::{JsonValueTrait, OwnedLazyValue, Value};
 use std::borrow::Cow;
@@ -294,6 +294,7 @@ pub enum ResponsePayload<T> {
 
 #[derive(Debug)]
 pub struct StreamResponse<T> {
+    pub(crate) request_permit: Option<ActiveRequestGuard>,
     _t: PhantomData<T>,
     buffer: Bytes,
     num_bytes: Option<u64>,
@@ -320,18 +321,32 @@ impl<T> IntoResponse for StreamResponse<T> {
             buffer,
             response,
             web3_request,
+            request_permit,
             ..
         } = self;
-        let mut total_bytes = 0u64;
-        let stream = stream::once(async { Ok::<_, reqwest::Error>(buffer) })
-            .chain(response.bytes_stream())
-            .map_ok(move |chunk| {
-                total_bytes = total_bytes.saturating_add(chunk.len() as u64);
-
-                web3_request.set_response(total_bytes);
-
-                chunk
-            });
+        let stream = async_stream::stream! {
+            let mut request_permit = request_permit;
+            let mut total_bytes = buffer.len() as u64;
+            web3_request.set_response(total_bytes);
+            yield Ok::<_, reqwest::Error>(buffer);
+            let upstream = response.bytes_stream();
+            tokio::pin!(upstream);
+            while let Some(chunk) = upstream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+                        web3_request.set_response(total_bytes);
+                        yield Ok(chunk);
+                    }
+                    Err(error) => {
+                        drop(request_permit.take());
+                        yield Err(error);
+                        break;
+                    }
+                }
+            }
+            drop(request_permit);
+        };
         let body = Body::from_stream(stream);
         body.into_response()
     }
@@ -370,6 +385,7 @@ where
             Some(len) if len <= nbytes => Ok(Self::from_bytes(response.bytes().await?)?),
             // long
             Some(len) => Ok(Self::Stream(StreamResponse {
+                request_permit: None,
                 _t: PhantomData::<T>,
                 buffer: Bytes::new(),
                 num_bytes: Some(len),
@@ -395,6 +411,7 @@ where
                 // we've read nbytes of the response, but there is more to come
                 let buffer = buffer.freeze();
                 Ok(Self::Stream(StreamResponse {
+                    request_permit: None,
                     _t: PhantomData::<T>,
                     buffer,
                     num_bytes: None,
@@ -523,6 +540,7 @@ mod tests {
             .unwrap()
             .into();
         let response = StreamResponse::<Arc<OwnedLazyValue>> {
+            request_permit: None,
             _t: PhantomData,
             buffer: Bytes::from_static(b"abc"),
             num_bytes: None,

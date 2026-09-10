@@ -240,13 +240,13 @@ impl RankedRpcs {
 
             if self.check_block_data {
                 if let Some(block_needed) = min_block_needed {
-                    if !rpc.has_block_data(block_needed) {
+                    if !rpc.has_data_for_request(web3_request, block_needed) {
                         outer_for_request.push(rpc);
                         continue;
                     }
                 }
                 if let Some(block_needed) = max_block_needed {
-                    if !rpc.has_block_data(block_needed) {
+                    if !rpc.has_data_for_request(web3_request, block_needed) {
                         outer_for_request.push(rpc);
                         continue;
                     }
@@ -999,14 +999,35 @@ fn best_rpc<'a>(rpc_a: &'a Arc<Web3Rpc>, rpc_b: &'a Arc<Web3Rpc>) -> &'a Arc<Web
 */
 
 impl RpcsForRequest {
+    pub async fn open_batch_handles(&self) -> Vec<OpenRequestHandle> {
+        let mut handles = Vec::with_capacity(self.inner.len());
+        for rpc in &self.inner {
+            match rpc.try_request_handle(&self.request, None, false).await {
+                Ok(OpenRequestResult::Handle(handle)) => handles.push(handle),
+                Ok(
+                    OpenRequestResult::RetryAt(_)
+                    | OpenRequestResult::Lagged(_)
+                    | OpenRequestResult::Failed,
+                )
+                | Err(_) => {}
+            }
+        }
+        handles
+    }
+
     pub fn to_stream(self) -> impl Stream<Item = OpenRequestHandle> {
         stream! {
             trace!("entered stream");
             let error_handler = None;
+            let mut opened_any = !self.request.backend_rpcs_used().is_empty();
 
             // todo!("be sure to set server_error if we exit without any rpcs!");
-            while !self.request.connect_timeout() {
-                let mut earliest_retry_at = None;
+            while if opened_any {
+                !self.request.expired()
+            } else {
+                !self.request.connect_timeout()
+            } {
+                let mut earliest_retry_at: Option<Instant> = None;
                 let mut opened = 0;
                 let mut tried = 0;
                 let mut wait_for_sync = Vec::new();
@@ -1023,7 +1044,17 @@ impl RpcsForRequest {
                             Ok(OpenRequestResult::Handle(handle)) => {
                                 trace!("opened handle: {}", best_rpc);
                                 opened += 1;
+                                opened_any = true;
                                 yield handle;
+                                // Sending can put this backend into cooldown. Include that
+                                // retry time even when it was ready before we yielded it.
+                                let now = Instant::now();
+                                let retry_at = best_rpc.next_available(now);
+                                if retry_at > now {
+                                    earliest_retry_at = Some(earliest_retry_at.map_or(
+                                        retry_at, |earliest| earliest.min(retry_at),
+                                    ));
+                                }
                             }
                             Ok(OpenRequestResult::RetryAt(retry_at)) => {
                                 trace!(
@@ -1031,7 +1062,10 @@ impl RpcsForRequest {
                                     best_rpc,
                                     retry_at.duration_since(Instant::now()).as_secs_f32()
                                 );
-                                earliest_retry_at = earliest_retry_at.min(Some(retry_at, ));
+                                earliest_retry_at = Some(
+                                    earliest_retry_at
+                                        .map_or(retry_at, |earliest| earliest.min(retry_at)),
+                                );
                             }
                             Ok(OpenRequestResult::Lagged(x)) => {
                                 // this will probably always be the same block, right?
@@ -1054,17 +1088,22 @@ impl RpcsForRequest {
                 warn!(?earliest_retry_at, num_waits=%wait_for_sync.len(), %tried, %opened, "no rpcs ready");
 
                 let min_wait_until = Instant::now() + Duration::from_millis(10);
+                let retry_deadline = if opened_any {
+                    self.request.expire_at()
+                } else {
+                    self.request.connect_timeout_at()
+                };
 
                 // clear earliest_retry_at if it is too far in the future to help us
                 if let Some(retry_at) = earliest_retry_at {
-                    let corrected = retry_at.max(min_wait_until).min(self.request.connect_timeout_at());
+                    let corrected = retry_at.max(min_wait_until).min(retry_deadline);
 
                     // set a minimum of 100ms. this is probably actually a bug we should figure out.
                     earliest_retry_at = Some(corrected);
                 } else if wait_for_sync.is_empty() {
                     break;
                 } else {
-                    earliest_retry_at = Some(self.request.connect_timeout_at());
+                    earliest_retry_at = Some(retry_deadline);
                 }
 
                 let retry_until = sleep_until(earliest_retry_at.expect("retry_at should always be set by now"));
@@ -1150,7 +1189,9 @@ impl std::fmt::Display for MaybeBlockNum<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusFinder, ConsensusUpdateSource, RankedRpcs};
+    use super::{ConsensusFinder, ConsensusUpdateSource, RankedRpcs, RpcsForRequest};
+    use crate::block_number::{BlockNumOrHash, RequestBlocks};
+    use crate::jsonrpc::{RequestOrMethod, ValidatedRequest};
     use crate::rpcs::blockchain::{
         BlockHeader, BlockHydrationCoordinator, BlocksByHashCache, HeadObservationPublisher,
     };
@@ -1158,6 +1199,7 @@ mod tests {
     use crate::rpcs::one::Web3Rpc;
     use alloy::primitives::{B256, U64};
     use alloy::rpc::types::Header;
+    use futures::StreamExt;
     use hashbrown::HashMap;
     use latency::EwmaLatency;
     use moka::future::Cache;
@@ -1166,7 +1208,7 @@ mod tests {
     use std::sync::{atomic::AtomicBool, Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
-    use tokio::time::Instant;
+    use tokio::time::{timeout, Instant};
     use tracing::Level;
 
     #[derive(Clone)]
@@ -1196,6 +1238,164 @@ mod tests {
         header.inner.number = number;
         header.inner.parent_hash = parent_hash;
         BlockHeader::new(Arc::new(header))
+    }
+
+    fn rpc_with_history_limits(
+        name: &str,
+        head: &BlockHeader,
+        block_data_limit: u64,
+        log_data_limit: u64,
+    ) -> Arc<Web3Rpc> {
+        let (head_block_sender, _) = watch::channel(Some(head.clone()));
+
+        Arc::new(Web3Rpc {
+            name: name.into(),
+            block_data_limit: block_data_limit.into(),
+            log_data_limit: log_data_limit.into(),
+            head_block_sender: Some(head_block_sender),
+            healthy: AtomicBool::new(true),
+            ..Default::default()
+        })
+    }
+
+    fn request(method: &'static str, request_blocks: RequestBlocks) -> Arc<ValidatedRequest> {
+        Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Method(method.into(), 0),
+            request_blocks,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn historical_logs_use_log_history_without_changing_archive_state_routing() {
+        let head = block(1_000, B256::repeat_byte(0x11), B256::ZERO);
+        let state_archive = rpc_with_history_limits("state-archive", &head, u64::MAX, 128);
+        let log_archive = rpc_with_history_limits("log-archive", &head, 128, u64::MAX);
+        let ranked = RankedRpcs::from_rpcs(
+            vec![state_archive.clone(), log_archive.clone()],
+            Some(head),
+            true,
+        );
+        let log_request = request(
+            "eth_getLogs",
+            RequestBlocks::Range {
+                from_block: BlockNumOrHash::Num(U64::from(100)),
+                to_block: BlockNumOrHash::Num(U64::from(100)),
+            },
+        );
+        let log_rpcs = ranked
+            .for_request(&log_request)
+            .expect("a log-history backend should serve historical logs");
+        assert_eq!(log_rpcs.inner.len(), 1);
+        assert_eq!(log_rpcs.inner[0].name, "log-archive");
+
+        let recent_log_request = request(
+            "eth_getLogs",
+            RequestBlocks::Range {
+                from_block: BlockNumOrHash::Num(U64::from(900)),
+                to_block: BlockNumOrHash::Num(U64::from(900)),
+            },
+        );
+        let recent_log_rpcs = ranked
+            .for_request(&recent_log_request)
+            .expect("recent logs should use all backends that retain them");
+        let mut recent_log_rpc_names = recent_log_rpcs
+            .inner
+            .iter()
+            .map(|rpc| rpc.name.as_str())
+            .collect::<Vec<_>>();
+        recent_log_rpc_names.sort_unstable();
+        assert_eq!(recent_log_rpc_names, ["log-archive", "state-archive"]);
+
+        let state_request = request(
+            "eth_getCode",
+            RequestBlocks::Point {
+                block_needed: BlockNumOrHash::Num(U64::from(100)),
+            },
+        );
+        let state_rpcs = ranked
+            .for_request(&state_request)
+            .expect("a state-history backend should serve historical state");
+        assert_eq!(state_rpcs.inner.len(), 1);
+        assert_eq!(state_rpcs.inner[0].name, "state-archive");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn request_stream_waits_for_the_earliest_backend_retry() {
+        let retry_at = Instant::now() + Duration::from_millis(20);
+        let (hard_limit_until, _) = watch::channel(retry_at);
+        let rpc = Arc::new(Web3Rpc {
+            name: "rate-limited".to_owned(),
+            healthy: AtomicBool::new(true),
+            hard_limit_until: Some(hard_limit_until),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal(
+            "eth_blockNumber".into(),
+            &[(); 0],
+            None,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        let rpcs = RpcsForRequest {
+            inner: vec![rpc],
+            outer: Vec::new(),
+            request,
+        };
+        let mut stream = Box::pin(rpcs.to_stream());
+
+        assert!(timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect("request stream should honor the backend retry time")
+            .is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_stream_retries_after_a_backend_outlives_the_connect_deadline() {
+        let (first_limit, _) = watch::channel(Instant::now());
+        let first_limit_control = first_limit.clone();
+        let first = Arc::new(Web3Rpc {
+            name: "slow-failure".to_owned(),
+            healthy: AtomicBool::new(true),
+            hard_limit_until: Some(first_limit),
+            ..Default::default()
+        });
+        let (retry_limit, _) = watch::channel(Instant::now() + Duration::from_millis(30));
+        let retry = Arc::new(Web3Rpc {
+            name: "recovering".to_owned(),
+            healthy: AtomicBool::new(true),
+            hard_limit_until: Some(retry_limit),
+            ..Default::default()
+        });
+        let request = Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Method("eth_call".into(), 0),
+            connect_timeout: Duration::from_millis(10),
+            expire_timeout: Duration::from_millis(100),
+            ..Default::default()
+        });
+        let rpcs = RpcsForRequest {
+            inner: vec![first, retry],
+            outer: Vec::new(),
+            request,
+        };
+        let mut stream = Box::pin(rpcs.to_stream());
+
+        let first_handle = stream
+            .next()
+            .await
+            .expect("the first backend should open immediately");
+        assert_eq!(first_handle.connection_name(), "slow-failure");
+
+        tokio::time::advance(Duration::from_millis(20)).await;
+        first_limit_control.send_replace(Instant::now() + Duration::from_millis(40));
+        drop(first_handle);
+
+        let retry_handle = timeout(Duration::from_millis(50), stream.next())
+            .await
+            .expect("the stream should wait within the request expiry")
+            .expect("the stream should retry after the connect deadline");
+        assert_eq!(retry_handle.connection_name(), "recovering");
     }
 
     #[test]

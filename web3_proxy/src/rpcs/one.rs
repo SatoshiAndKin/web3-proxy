@@ -6,7 +6,9 @@ use super::blockchain::{
 use super::provider::{connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
-use crate::config::Web3RpcConfig;
+use crate::config::{
+    Web3RpcConfig, DEFAULT_MAX_BACKEND_BATCH_ITEMS, DEFAULT_MAX_CONCURRENT_REQUESTS,
+};
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::globals;
 use crate::jsonrpc::ValidatedRequest;
@@ -35,10 +37,47 @@ use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::{cmp::Ordering, sync::Arc};
 use tokio::select;
-use tokio::sync::watch;
+use tokio::sync::{watch, AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
+
+pub(super) struct RequestPermits {
+    semaphore: Arc<Semaphore>,
+    max_concurrent_requests: usize,
+    max_backend_batch_items: usize,
+}
+
+impl RequestPermits {
+    pub(super) fn new(max_concurrent_requests: usize, max_backend_batch_items: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            max_concurrent_requests,
+            max_backend_batch_items,
+        }
+    }
+
+    pub(super) async fn acquire(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        self.semaphore.clone().acquire_owned().await
+    }
+
+    pub(super) fn max_backend_batch_items(&self) -> usize {
+        self.max_backend_batch_items
+    }
+
+    pub(super) fn max_concurrent_requests(&self) -> usize {
+        self.max_concurrent_requests
+    }
+}
+
+impl Default for RequestPermits {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
+            DEFAULT_MAX_BACKEND_BATCH_ITEMS,
+        )
+    }
+}
 
 /// An active connection to a Web3 RPC server like geth or erigon.
 /// TODO: smarter Default derive or move the channels around so they aren't part of this at all
@@ -52,6 +91,8 @@ pub struct Web3Rpc {
 
     /// Track in-flight requests
     pub(super) active_requests: AtomicUsize,
+    /// Bound concurrent work sent to this backend.
+    pub(super) request_permits: RequestPermits,
     /// mapping of block numbers and hashes
     pub(super) block_map: Option<BlocksByHashCache>,
     /// canonical mapping of block numbers to hashes
@@ -77,6 +118,8 @@ pub struct Web3Rpc {
     pub(super) soft_limit: u32,
     /// use web3 queries to find the block data limit for archive/pruned nodes
     pub(super) automatic_block_limit: bool,
+    /// Use web3 queries to find the separate retained log history.
+    pub(super) automatic_log_limit: bool,
     /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
     pub backup: bool,
     /// if subscribed to new heads, blocks are sent through this channel to update a parent Web3Rpcs
@@ -84,6 +127,8 @@ pub struct Web3Rpc {
     pub(super) block_hydration: Option<Arc<BlockHydrationCoordinator>>,
     /// TODO: have an enum for this so that "no limit" prints pretty?
     pub(super) block_data_limit: AtomicU64,
+    /// Oldest log-query range relative to the current head.
+    pub(super) log_data_limit: AtomicU64,
     /// head_block is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) head_block_sender: Option<watch::Sender<Option<BlockHeader>>>,
     /// Track head block latency.
@@ -98,6 +143,8 @@ pub struct Web3Rpc {
     pub(super) tier: AtomicU32,
     /// Track total requests served.
     pub(super) total_requests: AtomicUsize,
+    /// Track JSON-RPC batch packets forwarded to this backend.
+    pub(super) backend_batch_requests: AtomicUsize,
     /// If the head block is too old, it is ignored.
     pub(super) max_head_block_age: Duration,
     /// Track request latency.
@@ -136,6 +183,9 @@ impl Web3Rpc {
         let block_data_limit: AtomicU64 = config.block_data_limit.into();
         let automatic_block_limit = (block_data_limit.load(atomic::Ordering::SeqCst) == 0)
             && head_observation_publisher.is_some();
+        let log_data_limit: AtomicU64 = config.log_data_limit.into();
+        let automatic_log_limit = (log_data_limit.load(atomic::Ordering::SeqCst) == 0)
+            && head_observation_publisher.is_some();
 
         // have a sender for tracking hard limit anywhere. we use this in case we
         // and track on servers that have a configured hard limit
@@ -147,6 +197,12 @@ impl Web3Rpc {
             ));
         }
 
+        if config.max_concurrent_requests == 0 {
+            return Err(anyhow!("max_concurrent_requests must be greater than zero"));
+        }
+        if config.max_backend_batch_items == 0 {
+            return Err(anyhow!("max_backend_batch_items must be greater than zero"));
+        }
         let (head_block, _) = watch::channel(None);
 
         // Spawn the task for calculting average peak latency
@@ -194,8 +250,10 @@ impl Web3Rpc {
 
         let new_rpc = Self {
             automatic_block_limit,
+            automatic_log_limit,
             backup,
             block_data_limit,
+            log_data_limit,
             block_interval,
             block_map: Some(block_map),
             block_number_map: Some(block_number_map),
@@ -211,6 +269,10 @@ impl Web3Rpc {
             max_head_block_age,
             name,
             peak_latency: Some(peak_latency),
+            request_permits: RequestPermits::new(
+                config.max_concurrent_requests,
+                config.max_backend_batch_items,
+            ),
             median_latency: Some(median_request_latency),
             soft_limit: config.soft_limit,
             pending_txid_firehose,
@@ -432,9 +494,79 @@ impl Web3Rpc {
         Ok(limit)
     }
 
+    async fn check_log_data_limit(self: &Arc<Self>) -> anyhow::Result<Option<u64>> {
+        if !self.automatic_log_limit {
+            return Ok(None);
+        }
+
+        let head_block_num = self
+            .internal_request::<_, U256>(
+                "eth_blockNumber".into(),
+                &[(); 0],
+                Some(Level::DEBUG.into()),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .context("head_block_num error during check_log_data_limit")?;
+        let mut limit = None;
+        let mut last = U256::MAX;
+
+        for log_data_limit in [0, 32, 64, 128, 256, 512, 1024, 90_000, u64::MAX] {
+            let maybe_historical_block =
+                head_block_num.saturating_sub(U256::from_limbs([log_data_limit, 0, 0, 0]));
+
+            if last == maybe_historical_block {
+                break;
+            }
+            last = maybe_historical_block;
+
+            let log_result: Result<Vec<OwnedLazyValue>, _> = self
+                .internal_request(
+                    "eth_getLogs".into(),
+                    &json!([{
+                        "fromBlock": maybe_historical_block,
+                        "toBlock": maybe_historical_block,
+                    }]),
+                    Some(Level::TRACE.into()),
+                    Some(Duration::from_secs(5)),
+                )
+                .await;
+
+            trace!(
+                rpc = %self,
+                log_data_limit,
+                block = %maybe_historical_block,
+                ?log_result,
+                "checked log data limit"
+            );
+
+            if log_result.is_err() {
+                break;
+            }
+
+            limit = Some(log_data_limit);
+        }
+
+        if let Some(limit) = limit {
+            self.log_data_limit.store(limit, atomic::Ordering::SeqCst);
+        }
+
+        if limit == Some(u64::MAX) {
+            info!(rpc = %self, "log data limit is archive");
+        } else {
+            info!(rpc = %self, ?limit, "detected log data limit");
+        }
+
+        Ok(limit)
+    }
+
     /// TODO: this might be too simple. different nodes can prune differently. its possible we will have a block range
     pub fn block_data_limit(&self) -> U64 {
         U64::from_limbs([self.block_data_limit.load(atomic::Ordering::SeqCst)])
+    }
+
+    pub fn log_data_limit(&self) -> U64 {
+        U64::from_limbs([self.log_data_limit.load(atomic::Ordering::SeqCst)])
     }
 
     fn health_status(&self, provider_health_check_passed: bool) -> bool {
@@ -443,6 +575,22 @@ impl Web3Rpc {
 
     /// TODO: get rid of this now that consensus rpcs does it
     pub fn has_block_data(&self, needed_block_num: U64) -> bool {
+        self.has_data_with_limit(needed_block_num, self.block_data_limit())
+    }
+
+    pub fn has_log_data(&self, needed_block_num: U64) -> bool {
+        self.has_data_with_limit(needed_block_num, self.log_data_limit())
+    }
+
+    pub fn has_data_for_request(&self, request: &ValidatedRequest, needed_block_num: U64) -> bool {
+        if request.requires_log_history() {
+            self.has_log_data(needed_block_num)
+        } else {
+            self.has_block_data(needed_block_num)
+        }
+    }
+
+    fn has_data_with_limit(&self, needed_block_num: U64, data_limit: U64) -> bool {
         if let Some(head_block_sender) = self.head_block_sender.as_ref() {
             // TODO: this needs a max of our overall head block number
             let head_block_num = match head_block_sender.borrow().as_ref() {
@@ -462,9 +610,7 @@ impl Web3Rpc {
             }
 
             // if this is a pruning node, we might not actually have the block
-            let block_data_limit: U64 = self.block_data_limit();
-
-            let oldest_block_num = head_block_num.saturating_sub(block_data_limit);
+            let oldest_block_num = head_block_num.saturating_sub(data_limit);
 
             if needed_block_num < oldest_block_num {
                 trace!(
@@ -543,6 +689,9 @@ impl Web3Rpc {
         self.check_block_data_limit()
             .await
             .context(format!("unable to check_block_data_limit of {}", self))?;
+        self.check_log_data_limit()
+            .await
+            .context(format!("unable to check_log_data_limit of {}", self))?;
 
         info!("successfully connected to {}", self);
 
@@ -842,6 +991,7 @@ impl Web3Rpc {
                 // let mut new_total_requests;
                 let mut block_data_limit_refresh_at =
                     Instant::now() + block_data_limit_refresh_interval;
+                let mut log_data_limit_refresh_at = block_data_limit_refresh_at;
 
                 // errors here should not cause the loop to exit! only mark unhealthy
                 loop {
@@ -882,6 +1032,18 @@ impl Web3Rpc {
                         }
 
                         block_data_limit_refresh_at =
+                            Instant::now() + block_data_limit_refresh_interval;
+                    }
+
+                    if rpc.automatic_log_limit
+                        && rpc.log_data_limit.load(atomic::Ordering::SeqCst) == 0
+                        && Instant::now() >= log_data_limit_refresh_at
+                    {
+                        if let Err(err) = rpc.check_log_data_limit().await {
+                            warn!(?err, "unable to refresh log data limit on {}", rpc);
+                        }
+
+                        log_data_limit_refresh_at =
                             Instant::now() + block_data_limit_refresh_interval;
                     }
 
@@ -1179,13 +1341,15 @@ impl Web3Rpc {
 
         if !allow_unhealthy {
             if !(self.healthy.load(atomic::Ordering::SeqCst)) {
-                return Ok(OpenRequestResult::Failed);
+                return Ok(OpenRequestResult::RetryAt(
+                    self.next_available(Instant::now() + Duration::from_secs(1)),
+                ));
             }
 
             if self.head_observation_publisher.is_some() {
                 // make sure this rpc has the oldest block that this request needs
                 if let Some(block_needed) = web3_request.min_block_needed() {
-                    if !self.has_block_data(block_needed) {
+                    if !self.has_data_for_request(web3_request, block_needed) {
                         trace!(%web3_request, %block_needed, "{} cannot serve this request. Missing min block", self);
                         return Ok(OpenRequestResult::Failed);
                     }
@@ -1193,11 +1357,15 @@ impl Web3Rpc {
 
                 // make sure this rpc has the newest block that this request needs
                 if let Some(block_needed) = web3_request.max_block_needed() {
-                    if !self.has_block_data(block_needed) {
+                    if !self.has_data_for_request(web3_request, block_needed) {
                         trace!(%web3_request, %block_needed, "{} cannot serve this request. Missing max block", self);
 
                         let rpc = self.clone();
-                        let connect_timeout_at = web3_request.connect_timeout_at();
+                        let connect_timeout_at = if web3_request.backend_rpcs_used().is_empty() {
+                            web3_request.connect_timeout_at()
+                        } else {
+                            web3_request.expire_at()
+                        };
 
                         let mut head_block_receiver =
                             self.head_block_sender.as_ref().unwrap().subscribe();
@@ -1206,6 +1374,10 @@ impl Web3Rpc {
                         // TODO: future block limit from the config
                         if let Some(head_block) = head_block_receiver.borrow_and_update().as_ref() {
                             let head_block_number = head_block.number();
+
+                            if head_block_number >= block_needed {
+                                return Ok(OpenRequestResult::Failed);
+                            }
 
                             if head_block_number + U64::from(5) < block_needed {
                                 return Err(Web3ProxyError::FarFutureBlock {
@@ -1371,7 +1543,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 15)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 17)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
@@ -1391,6 +1563,15 @@ impl Serialize for Web3Rpc {
             }
         }
 
+        match self.log_data_limit.load(atomic::Ordering::SeqCst) {
+            u64::MAX => {
+                state.serialize_field("log_data_limit", &None::<()>)?;
+            }
+            log_data_limit => {
+                state.serialize_field("log_data_limit", &log_data_limit)?;
+            }
+        }
+
         state.serialize_field("tier", &self.tier)?;
 
         state.serialize_field("soft_limit", &self.soft_limit)?;
@@ -1406,6 +1587,11 @@ impl Serialize for Web3Rpc {
         state.serialize_field(
             "total_requests",
             &self.total_requests.load(atomic::Ordering::Relaxed),
+        )?;
+
+        state.serialize_field(
+            "backend_batch_requests",
+            &self.backend_batch_requests.load(atomic::Ordering::Relaxed),
         )?;
 
         state.serialize_field(
@@ -1458,6 +1644,13 @@ impl fmt::Debug for Web3Rpc {
             f.field("blocks", &"all");
         } else {
             f.field("blocks", &block_data_limit);
+        }
+
+        let log_data_limit = self.log_data_limit.load(atomic::Ordering::SeqCst);
+        if log_data_limit == u64::MAX {
+            f.field("logs", &"all");
+        } else {
+            f.field("logs", &log_data_limit);
         }
 
         f.field("backup", &self.backup);
@@ -2247,6 +2440,59 @@ mod tests {
         assert!(x.has_block_data(head_block.number()));
         assert!(!x.has_block_data(head_block.number() + U64::from(1)));
         assert!(!x.has_block_data(head_block.number() + U64::from(1000)));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn pruned_node_does_not_wait_for_an_old_max_block() {
+        let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap();
+        let head_block = BlockHeader::new(Arc::new(header(1_000, now)));
+        let (head_block_sender, _) = watch::channel(Some(head_block.clone()));
+        let (head_observation_sender, head_observation_receiver) = mpsc::unbounded_channel();
+        let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
+        drop(head_observation_receiver);
+        let rpc = Arc::new(Web3Rpc {
+            name: "pruned".to_owned(),
+            healthy: AtomicBool::new(true),
+            block_data_limit: 128.into(),
+            head_observation_publisher: Some(head_observation_publisher),
+            head_block_sender: Some(head_block_sender),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal(
+            "eth_getBlockByNumber".into(),
+            &("0x320", false),
+            Some(head_block),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.max_block_needed(), Some(U64::from(800)));
+        assert!(matches!(
+            rpc.try_request_handle(&request, None, false).await.unwrap(),
+            OpenRequestResult::Failed
+        ));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn temporarily_unhealthy_node_requests_a_retry() {
+        let rpc = Arc::new(Web3Rpc {
+            name: "temporarily-unhealthy".to_owned(),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal(
+            "eth_blockNumber".into(),
+            &[(); 0],
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            rpc.try_request_handle(&request, None, false).await.unwrap(),
+            OpenRequestResult::RetryAt(_)
+        ));
     }
 
     /*

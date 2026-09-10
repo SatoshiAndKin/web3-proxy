@@ -8,13 +8,101 @@ use anyhow::Context;
 use derive_more::From;
 use futures::Future;
 use reqwest::StatusCode;
+use sonic_rs::JsonValueTrait;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::time::{Duration, Instant};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::{timeout_at, Duration, Instant};
 use tracing::{debug, error, info, trace, warn, Level};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendTransportFailure {
+    HttpTimeout,
+    HttpConnect,
+    HttpStatus(StatusCode),
+    HttpBody,
+    HttpDecode,
+    HttpRequest,
+    HttpOther,
+    Io {
+        kind: std::io::ErrorKind,
+        os_code: Option<i32>,
+    },
+    Alloy,
+}
+
+impl fmt::Display for BackendTransportFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpTimeout => formatter.write_str("http_timeout"),
+            Self::HttpConnect => formatter.write_str("http_connect"),
+            Self::HttpStatus(status) => write!(formatter, "http_status_{}", status.as_u16()),
+            Self::HttpBody => formatter.write_str("http_body"),
+            Self::HttpDecode => formatter.write_str("http_decode"),
+            Self::HttpRequest => formatter.write_str("http_request"),
+            Self::HttpOther => formatter.write_str("http_other"),
+            Self::Io { kind, os_code } => {
+                write!(formatter, "io_{kind:?}")?;
+                if let Some(os_code) = os_code {
+                    write!(formatter, "_{os_code}")?;
+                }
+                Ok(())
+            }
+            Self::Alloy => formatter.write_str("alloy_transport"),
+        }
+    }
+}
+
+fn backend_transport_failure(error: &Web3ProxyError) -> Option<BackendTransportFailure> {
+    match error {
+        Web3ProxyError::Reqwest(error) if error.is_timeout() => {
+            Some(BackendTransportFailure::HttpTimeout)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_connect() => {
+            Some(BackendTransportFailure::HttpConnect)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_status() => Some(
+            BackendTransportFailure::HttpStatus(error.status().expect("status error has a status")),
+        ),
+        Web3ProxyError::Reqwest(error) if error.is_body() => {
+            Some(BackendTransportFailure::HttpBody)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_decode() => {
+            Some(BackendTransportFailure::HttpDecode)
+        }
+        Web3ProxyError::Reqwest(error) if error.is_request() => {
+            Some(BackendTransportFailure::HttpRequest)
+        }
+        Web3ProxyError::Reqwest(_) => Some(BackendTransportFailure::HttpOther),
+        Web3ProxyError::Io(error) => Some(BackendTransportFailure::Io {
+            kind: error.kind(),
+            os_code: error.raw_os_error(),
+        }),
+        Web3ProxyError::AlloyTransport(_) => Some(BackendTransportFailure::Alloy),
+        _ => None,
+    }
+}
+
+fn history_error_for_request(
+    request: &ValidatedRequest,
+    error: &JsonRpcErrorData,
+) -> Option<Web3ProxyError> {
+    if request.requires_log_history()
+        && error.code == 4444
+        && error.message == "pruned history unavailable"
+    {
+        Some(Web3ProxyError::LogHistoryRequired {
+            min: request.min_block_needed(),
+            max: request.max_block_needed(),
+        })
+    } else {
+        None
+    }
+}
 
 #[derive(From)]
 pub enum OpenRequestResult {
@@ -35,6 +123,32 @@ pub struct OpenRequestHandle {
     web3_request: Arc<ValidatedRequest>,
     error_handler: RequestErrorHandler,
     rpc: Arc<Web3Rpc>,
+}
+
+/// Holds one physical backend request slot through the complete response body.
+#[derive(Debug)]
+pub(crate) struct ActiveRequestGuard {
+    rpc: Arc<Web3Rpc>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ActiveRequestGuard {
+    async fn acquire(rpc: &Arc<Web3Rpc>) -> Web3ProxyResult<Self> {
+        let permit = rpc.request_permits.acquire().await?;
+        rpc.active_requests.fetch_add(1, atomic::Ordering::SeqCst);
+        Ok(Self {
+            rpc: rpc.clone(),
+            _permit: permit,
+        })
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.rpc
+            .active_requests
+            .fetch_sub(1, atomic::Ordering::SeqCst);
+    }
 }
 
 /// Depending on the context, RPC errors require different handling.
@@ -74,15 +188,23 @@ impl From<Level> for RequestErrorHandler {
     }
 }
 
-impl Drop for OpenRequestHandle {
-    fn drop(&mut self) {
-        self.rpc
-            .active_requests
-            .fetch_sub(1, atomic::Ordering::SeqCst);
-    }
-}
-
 impl OpenRequestHandle {
+    fn delay_reuse_for(&self, duration: Duration) {
+        let retry_at = Instant::now() + duration;
+        self.rpc
+            .hard_limit_until
+            .as_ref()
+            .unwrap()
+            .send_if_modified(|current| {
+                if *current >= retry_at {
+                    false
+                } else {
+                    *current = retry_at;
+                    true
+                }
+            });
+    }
+
     pub async fn new(
         web3_request: Arc<ValidatedRequest>,
         rpc: Arc<Web3Rpc>,
@@ -90,10 +212,6 @@ impl OpenRequestHandle {
     ) -> Self {
         // TODO: take request_id as an argument?
         // TODO: attach a unique id to this? customer requests have one, but not internal queries
-        // TODO: what ordering?!
-        rpc.active_requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
         let error_handler = error_handler.unwrap_or_default();
 
         Self {
@@ -112,6 +230,10 @@ impl OpenRequestHandle {
         self.rpc.clone()
     }
 
+    pub fn batch_capacity(&self) -> usize {
+        self.rpc.request_permits.max_concurrent_requests()
+    }
+
     pub fn rate_limit_for(&self, duration: Duration) {
         if self.rpc.backup {
             debug!(?duration, "rate limited on {}!", self.rpc);
@@ -119,12 +241,128 @@ impl OpenRequestHandle {
             warn!(?duration, "rate limited on {}!", self.rpc);
         }
 
-        // TODO: use send_if_modified to be sure we only send if our value is greater
-        self.rpc
-            .hard_limit_until
-            .as_ref()
-            .unwrap()
-            .send_replace(Instant::now() + duration);
+        self.delay_reuse_for(duration);
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.rpc.request_permits.max_backend_batch_items()
+    }
+
+    pub fn supports_batch(&self) -> bool {
+        self.rpc.http_client.is_some() && self.rpc.http_url.is_some()
+    }
+
+    /// Send exactly one packet. Packet failures leave all its calls for recovery.
+    pub async fn request_batch(
+        self,
+        requests: &[Arc<ValidatedRequest>],
+    ) -> Web3ProxyResult<Vec<Web3ProxyResult<ParsedResponse>>> {
+        let deadline = requests
+            .iter()
+            .map(|request| request.expire_at())
+            .min()
+            .context("backend packet must contain requests")?;
+        let started_at = Instant::now();
+        let result = timeout_at(deadline, async {
+            let client = self
+                .rpc
+                .http_client
+                .as_ref()
+                .context("backend batch requires HTTP")?;
+            let url = self
+                .rpc
+                .http_url
+                .clone()
+                .context("backend batch requires HTTP URL")?;
+            let _active = ActiveRequestGuard::acquire(&self.rpc).await?;
+            // A packet can wait behind another request until its deadline.
+            if Instant::now() >= deadline {
+                return Err(Web3ProxyError::Timeout(None));
+            }
+            let packet = requests
+                .iter()
+                .enumerate()
+                .map(|(index, request)| {
+                    let mut call = request
+                        .inner
+                        .jsonrpc_request()
+                        .expect("batch request contains JSON-RPC data")
+                        .clone();
+                    call.id =
+                        sonic_rs::to_lazyvalue(&(index as u64 + 1)).expect("numeric IDs serialize");
+                    call
+                })
+                .collect::<Vec<_>>();
+            let body = sonic_rs::to_vec(&packet)?;
+            for request in requests {
+                request.response.lock().backend_rpcs.push(self.rpc.clone());
+            }
+            self.rpc
+                .total_requests
+                .fetch_add(requests.len(), atomic::Ordering::Relaxed);
+            self.rpc
+                .backend_batch_requests
+                .fetch_add(1, atomic::Ordering::Relaxed);
+            let response = client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await?;
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                self.rate_limit_for(Duration::from_secs(1));
+            }
+            let bytes = response.error_for_status()?.bytes().await?;
+            let responses: Vec<ParsedResponse> = sonic_rs::from_slice(&bytes)?;
+            let mut matched: Vec<Option<ParsedResponse>> =
+                (0..requests.len()).map(|_| None).collect();
+            for response in responses {
+                let id = response
+                    .id
+                    .as_u64()
+                    .context("invalid backend batch response ID")?;
+                let slot = id
+                    .checked_sub(1)
+                    .and_then(|id| usize::try_from(id).ok())
+                    .and_then(|index| matched.get_mut(index))
+                    .context("unknown backend batch response ID")?;
+                if slot.replace(response).is_some() {
+                    return Err(anyhow::anyhow!("duplicate backend batch response ID").into());
+                }
+            }
+            if matched.iter().any(Option::is_none) {
+                return Err(anyhow::anyhow!("missing backend batch response ID").into());
+            }
+            Ok(matched
+                .into_iter()
+                .zip(requests)
+                .map(|(response, request)| {
+                    let mut response = response.expect("all IDs were matched");
+                    response.id = request.id();
+                    let handle = Self {
+                        web3_request: request.clone(),
+                        error_handler: self.error_handler,
+                        rpc: self.rpc.clone(),
+                    };
+                    match handle.check_response(Ok(response.into()), started_at) {
+                        Ok(jsonrpc::SingleResponse::Parsed(response)) => Ok(response),
+                        Ok(jsonrpc::SingleResponse::Stream(_)) => {
+                            unreachable!("packet responses are parsed")
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
+                .collect())
+        })
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = &result {
+            self.check_transport_error(error, started_at);
+        }
+        result
     }
 
     /// Just get the response from the provider without any extra handling.
@@ -132,7 +370,16 @@ impl OpenRequestHandle {
     async fn _request<R: JsonRpcResultData + serde::Serialize>(
         &self,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
-        if let Some(ipc_path) = self.rpc.ipc_path.as_ref() {
+        let request_permit = ActiveRequestGuard::acquire(&self.rpc).await?;
+        // A slot may become available in the same poll that expires the call.
+        // Check before counting or submitting a new backend attempt.
+        if self.web3_request.expired() {
+            return Err(Web3ProxyError::Timeout(None));
+        }
+        self.rpc
+            .total_requests
+            .fetch_add(1, atomic::Ordering::Relaxed);
+        let response = if let Some(ipc_path) = self.rpc.ipc_path.as_ref() {
             // first, prefer the unix stream
             let request = self
                 .web3_request
@@ -222,7 +469,13 @@ impl OpenRequestHandle {
         } else {
             // this must be a test
             Err(anyhow::anyhow!("no provider configured!").into())
-        }
+        };
+        response.map(|mut response| {
+            if let jsonrpc::SingleResponse::Stream(stream) = &mut response {
+                stream.request_permit = Some(request_permit);
+            }
+            response
+        })
     }
 
     pub fn error_handler(&self) -> RequestErrorHandler {
@@ -237,27 +490,43 @@ impl OpenRequestHandle {
     pub async fn request<R: JsonRpcResultData + serde::Serialize>(
         self,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
-        // TODO: use tracing spans
-        // TODO: including params in this log is way too verbose
-        // trace!(rpc=%self.rpc, %method, "request");
-        trace!("requesting from {}", self.rpc);
-
-        self.rpc
-            .total_requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        // we used to fetch_add the active_request count here, but sometimes a request is made without going through this function (like with subscriptions)
-
-        // we generally don't want to use the try operator. we might need to log errors
         let start = Instant::now();
+        let response = self._request().await;
+        self.check_response(response, start)
+    }
 
-        let mut response = self._request().await;
+    /// Complete and check the body inside the individual retry operation.
+    pub async fn request_parsed<R: JsonRpcResultData>(
+        self,
+    ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
+        let start = Instant::now();
+        let response = match self._request().await {
+            Ok(response) => response.parsed().await.map(Into::into),
+            Err(error) => Err(error),
+        };
+        self.check_response(response, start)
+    }
 
+    fn check_transport_error(&self, error: &Web3ProxyError, start: Instant) {
+        if let Some(transport_failure) = backend_transport_failure(error) {
+            warn!(rpc = %self.rpc, method = %self.web3_request.inner.method(),
+                transport_failure = %transport_failure, elapsed_ms = start.elapsed().as_millis(),
+                "backend transport failed; delaying reuse");
+            self.delay_reuse_for(Duration::from_secs(1));
+        }
+    }
+
+    fn check_response<R: JsonRpcResultData>(
+        &self,
+        mut response: Web3ProxyResult<jsonrpc::SingleResponse<R>>,
+        start: Instant,
+    ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
+        if let Err(error) = &response {
+            self.check_transport_error(error, start);
+        }
         // measure successes and errors
         // originally i thought we wouldn't want errors, but I think it's a more accurate number including all requests
         let latency = start.elapsed();
-
-        // we used to fetch_sub the active_request count here, but sometimes the handle is dropped without request being called!
 
         trace!(
             "response from {} for {}: {:?}",
@@ -279,9 +548,10 @@ impl OpenRequestHandle {
 
         if response_is_success {
             // only track latency for successful requests
+            let rpc = self.rpc.clone();
             tokio::spawn(async move {
-                self.rpc.peak_latency.as_ref().unwrap().report(latency);
-                self.rpc.median_latency.as_ref().unwrap().record(latency);
+                rpc.peak_latency.as_ref().unwrap().report(latency);
+                rpc.median_latency.as_ref().unwrap().record(latency);
 
                 // TODO: app-wide median and peak latency?
             });
@@ -303,9 +573,15 @@ impl OpenRequestHandle {
                     ResponsePayload::Error { error } => {
                         trace!(?error, "jsonrpc error data");
 
-                        if error.message.starts_with("execution reverted") {
+                        if let Some(history_error) =
+                            history_error_for_request(&self.web3_request, error)
+                        {
+                            response = Err(history_error);
+                            ResponseType::Error
+                        } else if error.message.starts_with("execution reverted") {
                             ResponseType::Revert
                         } else if error.code == StatusCode::TOO_MANY_REQUESTS.as_u16() as i64 {
+                            response = Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
                             ResponseType::RateLimited
                         } else {
                             // TODO! THIS HAS TOO MANY FALSE POSITIVES! Theres another spot in the code that checks for things.
@@ -343,6 +619,8 @@ impl OpenRequestHandle {
                                 }
                                 -32001 => {
                                     if error.message == "Exceeded the quota usage" {
+                                        response =
+                                            Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
                                         ResponseType::RateLimited
                                     } else {
                                         ResponseType::Error
@@ -350,6 +628,8 @@ impl OpenRequestHandle {
                                 }
                                 -32005 => {
                                     if error.message == "rate limit exceeded" {
+                                        response =
+                                            Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
                                         ResponseType::RateLimited
                                     } else {
                                         ResponseType::Error
@@ -447,5 +727,304 @@ impl OpenRequestHandle {
         }
 
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backend_transport_failure, history_error_for_request, OpenRequestHandle};
+    use crate::errors::Web3ProxyError;
+    use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, SingleRequest, ValidatedRequest};
+    use crate::rpcs::one::{RequestPermits, Web3Rpc};
+    use axum::extract::State;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::{routing::post, Router};
+    use sonic_rs::{json, OwnedLazyValue};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, watch, Semaphore};
+    use tokio::time::{timeout, Duration, Instant};
+
+    #[derive(Clone)]
+    struct HeldRequestState {
+        started: mpsc::UnboundedSender<()>,
+        release: Arc<Semaphore>,
+    }
+
+    async fn held_json_rpc_request(
+        State(state): State<HeldRequestState>,
+    ) -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+        state.started.send(()).unwrap();
+        state.release.acquire().await.unwrap().forget();
+
+        (
+            [(CONTENT_TYPE, "application/json")],
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#,
+        )
+    }
+
+    async fn held_json_rpc_batch(
+        State(state): State<HeldRequestState>,
+    ) -> ([(axum::http::HeaderName, &'static str); 1], &'static str) {
+        state.started.send(()).unwrap();
+        state.release.acquire().await.unwrap().forget();
+
+        (
+            [(CONTENT_TYPE, "application/json")],
+            r#"[{"jsonrpc":"2.0","id":1,"result":"0x1"},{"jsonrpc":"2.0","id":2,"result":"0x1"}]"#,
+        )
+    }
+
+    fn request(method: &'static str) -> Arc<ValidatedRequest> {
+        Arc::new(ValidatedRequest {
+            inner: RequestOrMethod::Method(method.into(), 0),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn geth_pruned_log_history_error_retries_only_log_requests() {
+        let error = JsonRpcErrorData {
+            code: 4444,
+            message: "pruned history unavailable".into(),
+            data: None,
+        };
+
+        assert!(matches!(
+            history_error_for_request(&request("eth_getLogs"), &error),
+            Some(Web3ProxyError::LogHistoryRequired { .. })
+        ));
+        assert!(history_error_for_request(&request("eth_getCode"), &error).is_none());
+
+        let different_error = JsonRpcErrorData {
+            code: 4444,
+            message: "different backend error".into(),
+            data: None,
+        };
+        assert!(history_error_for_request(&request("eth_getLogs"), &different_error).is_none());
+    }
+
+    #[tokio::test]
+    async fn backend_rate_limit_is_returned_as_a_retryable_request_error() {
+        let router = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"rate limit exceeded"}}"#,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "rate-limited".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some(format!("http://{address}").parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal("eth_getLogs".into(), &json!([]), None, None)
+            .await
+            .unwrap();
+
+        let response = OpenRequestHandle::new(request, rpc, None)
+            .await
+            .request::<Arc<OwnedLazyValue>>()
+            .await;
+
+        assert!(matches!(
+            response,
+            Err(Web3ProxyError::JsonRpcErrorData(error))
+                if error.code == -32005 && error.message == "rate limit exceeded"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_transport_failure_temporarily_limits_the_backend() {
+        let (hard_limit_until, hard_limit_receiver) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "unreachable".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some("http://127.0.0.1:1".parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+            .await
+            .unwrap();
+
+        let response = OpenRequestHandle::new(request, rpc, None)
+            .await
+            .request::<Arc<OwnedLazyValue>>()
+            .await;
+
+        assert!(response.is_err());
+        assert!(
+            *hard_limit_receiver.borrow() > Instant::now(),
+            "a transport failure should delay reuse of the failing backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_transport_diagnostic_classifies_connect_without_exposing_the_url() {
+        let secret_url = "http://127.0.0.1:1/private-backend-token";
+        let error = reqwest::Client::new()
+            .get(secret_url)
+            .send()
+            .await
+            .expect_err("the closed local port must refuse the connection");
+
+        let diagnostic = backend_transport_failure(&Web3ProxyError::Reqwest(error))
+            .expect("reqwest failures must have transport diagnostics")
+            .to_string();
+
+        assert_eq!(diagnostic, "http_connect");
+        assert!(!diagnostic.contains("private-backend-token"));
+    }
+
+    #[tokio::test]
+    async fn backend_request_concurrency_never_exceeds_its_permit_limit() {
+        let (started_sender, mut started_receiver) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let router = Router::new()
+            .route("/", post(held_json_rpc_request))
+            .with_state(HeldRequestState {
+                started: started_sender,
+                release: release.clone(),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "concurrency-limited".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some(format!("http://{address}").parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            request_permits: RequestPermits::new(2, 2),
+            ..Default::default()
+        });
+
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let rpc = rpc.clone();
+            let request = ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+                .await
+                .unwrap();
+            requests.push(tokio::spawn(async move {
+                OpenRequestHandle::new(request, rpc, None)
+                    .await
+                    .request::<Arc<OwnedLazyValue>>()
+                    .await
+            }));
+        }
+
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("first backend request should start");
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("second backend request should start");
+        assert!(
+            timeout(Duration::from_millis(100), started_receiver.recv())
+                .await
+                .is_err(),
+            "a third backend request started without a permit"
+        );
+
+        release.add_permits(2);
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("third backend request should start after a permit is released");
+        release.add_permits(1);
+
+        for request in requests {
+            request.await.unwrap().unwrap();
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_batch_packets_fill_available_concurrency() {
+        let (started_sender, mut started_receiver) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let router = Router::new()
+            .route("/", post(held_json_rpc_batch))
+            .with_state(HeldRequestState {
+                started: started_sender,
+                release: release.clone(),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (hard_limit_until, _) = watch::channel(Instant::now());
+        let rpc = Arc::new(Web3Rpc {
+            name: "batch-concurrency-limited".into(),
+            http_client: Some(reqwest::Client::new()),
+            http_url: Some(format!("http://{address}").parse().unwrap()),
+            hard_limit_until: Some(hard_limit_until),
+            request_permits: RequestPermits::new(2, 2),
+            peak_latency: Some(latency::PeakEwmaLatency::spawn(
+                Duration::from_secs(15),
+                100,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(latency::RollingQuantileLatency::spawn_median(100).await),
+            ..Default::default()
+        });
+        let requests = (1..=4)
+            .map(|id| {
+                Arc::new(ValidatedRequest {
+                    inner: RequestOrMethod::Request(
+                        SingleRequest::new(id.into(), "eth_call".into(), json!([])).unwrap(),
+                    ),
+                    expire_timeout: Duration::from_secs(5),
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let batch = tokio::spawn(async move {
+            futures::future::join_all(requests.chunks(2).map(|chunk| {
+                let rpc = rpc.clone();
+                async move {
+                    OpenRequestHandle::new(chunk[0].clone(), rpc, None)
+                        .await
+                        .request_batch(chunk)
+                        .await
+                }
+            }))
+            .await
+        });
+
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("first backend batch packet should start");
+        timeout(Duration::from_secs(1), started_receiver.recv())
+            .await
+            .expect("second backend batch packet should use the remaining permits");
+        release.add_permits(2);
+
+        let responses = batch
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 4);
+        for response in responses {
+            let response = response.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&sonic_rs::to_string(&response).unwrap())
+                    .unwrap()["result"]
+                    .as_str(),
+                Some("0x1")
+            );
+        }
+        server.abort();
     }
 }
