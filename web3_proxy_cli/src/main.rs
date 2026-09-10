@@ -49,6 +49,7 @@ pub struct Web3ProxyCli {
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand)]
 enum SubCommand {
+    BlockRelay(sub_commands::BlockRelaySubCommand),
     CheckConfig(sub_commands::CheckConfigSubCommand),
     PopularityContest(sub_commands::PopularityContestSubCommand),
     Proxyd(sub_commands::ProxydSubCommand),
@@ -243,6 +244,14 @@ fn main() -> anyhow::Result<()> {
 
     rt.block_on(async {
         match cli_config.sub_command {
+            SubCommand::BlockRelay(command) => {
+                command
+                    .main(
+                        top_config.context("--config is required to run block_relay")?,
+                        top_config_path.context("config path is required")?,
+                    )
+                    .await
+            }
             SubCommand::CheckConfig(command) => command.main().await,
             SubCommand::PopularityContest(command) => command.main().await,
             SubCommand::Proxyd(command) => {

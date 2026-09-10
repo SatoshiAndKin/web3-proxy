@@ -1,0 +1,53 @@
+# Standalone monitor for existing nodes on the same host. Starts no clients.
+# Run this process where it can read the existing JWT files. Never copy their
+# contents into this file or expose the Engine ports to the public Internet.
+[app]
+chain_id = 1
+
+[balanced_rpcs]
+
+[block_relay]
+# Default: no engine_newPayload calls. Enable injection only for a measured trial.
+mode = "observe"
+cache_max_bytes = 134217728
+
+[block_relay.network]
+genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+genesis_time = 1606824023
+seconds_per_slot = 12
+
+[[block_relay.network.forks]]
+name = "electra"
+version = "0x05000000"
+epoch = 364032
+
+[[block_relay.network.forks]]
+name = "fulu"
+version = "0x06000000"
+epoch = 411392
+
+[block_relay.sources.lighthouse_geth]
+beacon_url = "http://127.0.0.1:5062"
+
+[block_relay.sources.lighthouse_reth]
+beacon_url = "http://127.0.0.1:5067"
+
+# Optional external source. Use the Beacon API, not the execution JSON-RPC URL.
+# [block_relay.sources.alchemy]
+# beacon_url = "https://eth-mainnetbeacon.g.alchemy.com/v2/YOUR_BEACON_API_KEY"
+
+# Optional provider authentication without URL credentials:
+# [block_relay.sources.provider]
+# beacon_url = "https://beacon.example.invalid"
+# [block_relay.sources.provider.headers]
+# Authorization = "Bearer YOUR_PROVIDER_TOKEN"
+
+[block_relay.targets.geth]
+engine_url = "http://127.0.0.1:9051"
+rpc_url = "http://127.0.0.1:8545"
+jwt_secret_path = "${GETH_JWT_PATH}"
+
+[block_relay.targets.reth]
+engine_url = "http://127.0.0.1:8557"
+rpc_url = "http://127.0.0.1:8547"
+jwt_secret_path = "${RETH_JWT_PATH}"

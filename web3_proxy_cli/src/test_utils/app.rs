@@ -55,6 +55,7 @@ impl TestApp {
                 },
             )]),
             bundler_4337_rpcs: Default::default(),
+            block_relay: None,
             extra: Default::default(),
         };
 

@@ -27,6 +27,10 @@ alloy = { version = "2.4.1", default-features = false, features = [
     "signer-local",
     "std",
 ] }
+alloy-rpc-types-beacon = { version = "=2.4.1", features = ["ssz"] }
+alloy-rpc-types-engine = { version = "=2.4.1", features = ["jwt-aws-lc-rs"] }
+eventsource-stream = "0.2.3"
+tree_hash = "0.12"
 arc-swap = { version = "1.9.2" }
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
 async-stream = "0.3.6"

@@ -25,6 +25,8 @@ pub struct TopConfig {
     pub private_rpcs: HashMap<String, Web3RpcConfig>,
     #[serde(default = "Default::default")]
     pub bundler_4337_rpcs: HashMap<String, Web3RpcConfig>,
+    /// Independent Beacon monitors and private Engine targets, never RPC routing candidates.
+    pub block_relay: Option<crate::block_relay::config::Config>,
     /// unknown config options get put here
     #[serde(flatten, default = "HashMap::default")]
     pub extra: HashMap<String, toml::Value>,
@@ -40,7 +42,11 @@ impl TopConfig {
         F: FnMut(&str) -> Result<Option<String>, std::env::VarError>,
     {
         let expanded = shellexpand::env_with_context(input, env)?;
-        Ok(toml::from_str(&expanded)?)
+        let config: Self = toml::from_str(&expanded)?;
+        if let Some(relay) = &config.block_relay {
+            relay.validate()?;
+        }
+        Ok(config)
     }
 
     /// TODO: this should probably be part of Deserialize

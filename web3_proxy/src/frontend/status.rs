@@ -157,6 +157,7 @@ async fn _status(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
     // TODO: the hostname is probably not going to change. only get once at the start?
     let body = json!({
         "balanced_rpcs": app.balanced_rpcs,
+        "block_relay": app.block_relay.snapshot(),
         "bundler_4337_rpcs": app.bundler_4337_rpcs,
         "chain_id": app.config.chain_id,
         "head_block_hash": head_block.as_ref().map(|x| x.hash()),

@@ -47,6 +47,7 @@ pub type Web3ProxyJoinHandle<T> = JoinHandle<Web3ProxyResult<T>>;
 /// The application
 // TODO: i'm sure this is more arcs than necessary, but spawning futures makes references hard
 pub struct App {
+    pub block_relay: Arc<crate::block_relay::BlockRelay>,
     /// Send requests to the best server available
     pub balanced_rpcs: Arc<Web3Rpcs>,
     /// Send 4337 Abstraction Bundler requests to one of these servers
@@ -196,6 +197,7 @@ impl App {
         let tx_subscriptions = Semaphore::new(1);
 
         let app = Self {
+            block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs,
             bundler_4337_rpcs,
             config: top_config.app.clone(),
@@ -210,6 +212,13 @@ impl App {
         };
 
         let app = Arc::new(app);
+
+        let relay = app.block_relay.clone();
+        let relay_shutdown = shutdown_sender.subscribe();
+        important_background_handles.push(tokio::spawn(async move {
+            relay.run(chain_id, relay_shutdown).await;
+            Ok(())
+        }));
 
         if let Err(app) = APP.set(app.clone()) {
             error!(?app, "global APP can only be set once!");
@@ -290,6 +299,12 @@ impl App {
     async fn apply_top_config_rpcs(&self, new_top_config: &TopConfig) -> Web3ProxyResult<()> {
         info!("applying new config");
 
+        let relay = self
+            .block_relay
+            .apply(new_top_config.block_relay.as_ref())
+            .await
+            .web3_context("updating block relay");
+
         let balanced = self
             .balanced_rpcs
             .apply_server_configs(self, &new_top_config.balanced_rpcs)
@@ -312,6 +327,7 @@ impl App {
         balanced?;
         protected?;
         bundler_4337?;
+        relay?;
 
         Ok(())
     }
@@ -1012,6 +1028,7 @@ mod tests {
         let (_, watch_consensus_head_receiver) = watch::channel(None);
 
         Arc::new(App {
+            block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
             config: AppConfig::default(),
