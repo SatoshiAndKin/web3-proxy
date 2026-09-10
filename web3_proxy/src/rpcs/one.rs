@@ -2542,3 +2542,7 @@ mod tests {
     }
     */
 }
+
+#[cfg(test)]
+#[path = "log_probe_tests.rs"]
+mod log_probe_tests;

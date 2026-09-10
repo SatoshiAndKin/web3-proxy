@@ -27,13 +27,13 @@ use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration, Instant};
 
-struct Incoming {
-    body: Value,
-    reply: oneshot::Sender<Response<Body>>,
+pub(super) struct Incoming {
+    pub(super) body: Value,
+    pub(super) reply: oneshot::Sender<Response<Body>>,
 }
 
 impl Incoming {
-    fn respond(self, body: Value) {
+    pub(super) fn respond(self, body: Value) {
         self.reply
             .send(
                 Response::builder()
@@ -80,9 +80,9 @@ async fn receive(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-struct Harness {
+pub(super) struct Harness {
     app: Arc<App>,
-    rpc: Arc<Web3Rpc>,
+    pub(super) rpc: Arc<Web3Rpc>,
     incoming: mpsc::UnboundedReceiver<Incoming>,
     server: JoinHandle<()>,
 }
@@ -94,7 +94,7 @@ impl Drop for Harness {
 }
 
 impl Harness {
-    async fn new(concurrency: usize, packet_size: usize) -> Self {
+    pub(super) async fn new(concurrency: usize, packet_size: usize) -> Self {
         Self::named("controlled-backend", concurrency, packet_size).await
     }
 
@@ -167,9 +167,12 @@ impl Harness {
     }
 
     fn start(&self, count: usize) -> JoinHandle<Value> {
+        self.start_requests((0..count).map(client_call).collect())
+    }
+
+    fn start_requests(&self, requests: Vec<SingleRequest>) -> JoinHandle<Value> {
         let app = self.app.clone();
         tokio::spawn(async move {
-            let requests = (0..count).map(client_call).collect();
             let (_, response, _) = app
                 .proxy_web3_rpc(ProxyMode::Best, JsonRpcRequestEnum::Batch(requests), None)
                 .await
@@ -178,14 +181,14 @@ impl Harness {
         })
     }
 
-    async fn next(&mut self) -> Incoming {
+    pub(super) async fn next(&mut self) -> Incoming {
         timeout(Duration::from_secs(2), self.incoming.recv())
             .await
             .expect("backend traffic must start")
             .unwrap()
     }
 
-    async fn quiet(&mut self) {
+    pub(super) async fn quiet(&mut self) {
         assert!(
             timeout(Duration::from_millis(50), self.incoming.recv())
                 .await
@@ -297,13 +300,9 @@ async fn batch_failure_recovers_while_other_packet_is_blocked() {
         .map(|c| c["params"].clone())
         .collect::<Vec<_>>();
     first.reject();
-    let mut retried = Vec::new();
-    for _ in 0..2 {
-        let call = h.next().await;
-        assert!(call.body.is_object());
-        retried.push(call.body["params"].clone());
-        call.succeed();
-    }
+    let packet = h.next().await;
+    let mut retried = packet_params(&packet);
+    packet.succeed();
     retried.sort_by_key(Value::to_string);
     assert_eq!(retried, failed);
     second.succeed();
@@ -338,8 +337,7 @@ async fn batch_mixed_errors_retry_only_rate_limit() {
         Instant::now() >= rejected_at + Duration::from_secs(1),
         "retry must wait for the full backend cooldown"
     );
-    assert_eq!(retry.body["params"], expected_retry);
-    assert_eq!(retry.body["id"], 0);
+    assert_eq!(packet_params(&retry), vec![expected_retry]);
     retry.succeed();
     assert_eq!(
         task.await.unwrap(),
@@ -374,7 +372,7 @@ async fn batch_reversed_responses_restore_duplicate_client_ids() {
 }
 
 #[tokio::test]
-async fn batch_invalid_response_ids_fall_back_individually() {
+async fn batch_invalid_response_ids_retry_as_a_packet() {
     for invalid in ["missing", "duplicate", "unknown"] {
         let mut h = Harness::new(4, 64).await;
         let task = h.start(2);
@@ -390,11 +388,9 @@ async fn batch_invalid_response_ids_fall_back_individually() {
             _ => unreachable!(),
         }
         packet.respond(Value::Array(responses));
-        for _ in 0..2 {
-            let call = h.next().await;
-            assert!(call.body.is_object());
-            call.succeed();
-        }
+        let retry = h.next().await;
+        assert_eq!(retry.body.as_array().expect("retry stays batched").len(), 2);
+        retry.succeed();
         assert_answers(task.await.unwrap(), 2);
     }
 }
@@ -430,12 +426,9 @@ async fn batch_recovery_after_connection_window_keeps_request_data() {
     tokio::time::advance(Duration::from_secs(11)).await;
     tokio::time::resume();
     packet.reject();
-    let mut retried = Vec::new();
-    for _ in 0..2 {
-        let call = h.next().await;
-        retried.push(call.body["params"].clone());
-        call.succeed();
-    }
+    let packet = h.next().await;
+    let mut retried = packet_params(&packet);
+    packet.succeed();
     retried.sort_by_key(Value::to_string);
     assert_eq!(retried, expected);
     assert_answers(task.await.unwrap(), 2);
@@ -507,66 +500,52 @@ async fn batch_final_failure_preserves_other_packet_answers() {
 }
 
 #[tokio::test]
-async fn batch_large_fallback_error_is_checked_before_success() {
+async fn batch_large_retry_error_is_checked_before_success() {
     let mut h = Harness::new(4, 64).await;
     let task = h.start(2);
     h.next().await.reject();
     let first = h.next().await;
-    let retry_params = first.body["params"].clone();
-    let error = json!({"jsonrpc":"2.0","id":first.body["id"],"error":{"code":-32005,"message":"rate limit exceeded","data":"x".repeat(140_000)}});
-    first.respond(error);
-    h.next().await.succeed();
+    let calls = first.body.as_array().expect("retry stays batched");
+    let retry_params = calls[0]["params"].clone();
+    let response = json!([
+        {"jsonrpc":"2.0","id":calls[0]["id"],"error":{"code":-32005,"message":"rate limit exceeded","data":"x".repeat(140_000)}},
+        answer(&calls[1])
+    ]);
+    first.respond(response);
     let retry = h.next().await;
-    assert_eq!(retry.body["params"], retry_params);
+    assert_eq!(packet_params(&retry), vec![retry_params]);
     retry.succeed();
     assert_answers(task.await.unwrap(), 2);
     h.idle();
 }
 
 #[tokio::test]
-async fn batch_large_fallback_body_obeys_original_deadline() {
-    let mut h = Harness::new(1, 64).await;
-    let task = h.start(2);
+async fn batch_large_retry_body_obeys_original_deadline() {
+    let mut h = Harness::new(1, 2).await;
+    let task = h.start(4);
+    h.next().await.succeed();
     h.next().await.reject();
-    let completed = h.next().await;
-    let success = answer(&completed.body);
-    completed.succeed();
-    let first = h.next().await;
-    let first_id = first.body["id"].clone();
+    let retry = h.next().await;
+    let calls = retry.body.as_array().expect("retry stays batched");
     let prefix = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":{first_id},\"result\":\"{}",
+        "[{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"{}",
+        calls[0]["id"],
         "x".repeat(140_000)
     );
-    let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
-    sender.send(Ok(Bytes::from(prefix))).await.unwrap();
-    first
-        .reply
-        .send(
-            Response::builder()
-                .header("content-type", "application/json")
-                .body(Body::from_stream(
-                    tokio_stream::wrappers::ReceiverStream::new(receiver),
-                ))
-                .unwrap(),
-        )
-        .unwrap();
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(60)).await;
-    tokio::time::resume();
+    let sender = send_stalled_body(retry, prefix).await;
+    advance_to(Instant::now() + Duration::from_secs(60)).await;
     let response = timeout(Duration::from_millis(500), task)
         .await
-        .expect("reading a large fallback must end at the original deadline")
+        .expect("large retry body must end at the original deadline")
         .unwrap();
-    let expected = (0..2)
-        .map(|i| {
-            if success["id"] == i {
-                success.clone()
-            } else {
-                timeout_answer(json!(i))
-            }
-        })
-        .collect();
-    assert_timeout_responses(response, Value::Array(expected));
+    assert_timeout_responses(
+        response,
+        json!([
+            {"jsonrpc":"2.0","id":0,"result":"0x0000"},
+            {"jsonrpc":"2.0","id":1,"result":"0x0001"},
+            timeout_answer(json!(0)), timeout_answer(json!(1))
+        ]),
+    );
     drop(sender);
     h.idle();
 }
@@ -785,29 +764,29 @@ async fn batch_disconnect_after_connection_window_keeps_request_data() {
             )),
         ]))))
         .unwrap();
-    let mut retried = Vec::new();
-    for _ in 0..2 {
-        let call = h.next().await;
-        retried.push(call.body["params"].clone());
-        call.succeed();
-    }
+    let packet = h.next().await;
+    let mut retried = packet_params(&packet);
+    packet.succeed();
     retried.sort_by_key(Value::to_string);
     assert_eq!(retried, expected);
     assert_answers(task.await.unwrap(), 2);
 }
 
 #[tokio::test]
-async fn batch_failure_at_fifty_seconds_leaves_ten_seconds_for_active_and_queued_fallback() {
-    let mut h = Harness::new(1, 64).await;
+async fn batch_failure_at_fifty_seconds_leaves_ten_seconds_for_active_and_queued_packets() {
+    let mut h = Harness::new(1, 2).await;
     let started = Instant::now();
-    let mut task = h.start(2);
+    let mut task = h.start(4);
     let packet = h.next().await;
     // Validation starts between task creation and the first backend packet.
     let deadline_upper_bound = Instant::now() + Duration::from_secs(60);
     advance_to(started + Duration::from_secs(50)).await;
     packet.reject();
     let active = h.next().await;
-    assert!(active.body.is_object());
+    assert_eq!(
+        active.body.as_array().expect("retry stays batched").len(),
+        2
+    );
     h.quiet().await;
     advance_to(started + Duration::from_secs(59)).await;
     assert!(
@@ -821,13 +800,18 @@ async fn batch_failure_at_fifty_seconds_leaves_ten_seconds_for_active_and_queued
         .unwrap();
     assert_timeout_responses(
         response,
-        json!([timeout_answer(json!(0)), timeout_answer(json!(1))]),
+        json!([
+            timeout_answer(json!(0)),
+            timeout_answer(json!(1)),
+            timeout_answer(json!(0)),
+            timeout_answer(json!(1))
+        ]),
     );
     drop(active);
     h.quiet().await;
     assert_eq!(
         h.rpc.total_requests.load(Ordering::Relaxed),
-        3,
+        4,
         "the queued fallback must not reach the backend after expiry"
     );
     h.idle();
@@ -841,19 +825,8 @@ async fn batch_failure_uses_another_backend_without_changing_the_selected_block(
     let completed = first.next().await;
     completed.succeed();
     let failed = first.next().await;
-    let mut expected_calls = failed.body.as_array().unwrap().clone();
-    for call in &mut expected_calls {
-        let index = u64::from_str_radix(
-            call["params"][0]["data"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-            16,
-        )
-        .unwrap();
-        call["id"] = json!(index % 2);
-        assert_eq!(call["params"][1], "0x2a");
-    }
+    let expected_calls = packet_params(&failed);
+    assert!(expected_calls.iter().all(|params| params[1] == "0x2a"));
     // Keep A present but unavailable. B becomes ready at a newer head.
     first.rpc.healthy.store(false, Ordering::SeqCst);
     let mut header: Header = Header::default();
@@ -882,23 +855,16 @@ async fn batch_failure_uses_another_backend_without_changing_the_selected_block(
             false,
         ))));
     failed.reject();
-    let mut retried = Vec::new();
-    for _ in 0..expected_calls.len() {
-        let call = second.next().await;
-        assert!(call.body.is_object());
-        retried.push(call.body.clone());
-        call.succeed();
-    }
-    retried.sort_by_key(Value::to_string);
-    expected_calls.sort_by_key(Value::to_string);
-    assert_eq!(retried, expected_calls);
+    let retry = second.next().await;
+    assert_eq!(packet_params(&retry), expected_calls);
+    retry.succeed();
     assert_answers(task.await.unwrap(), 4);
     first.quiet().await;
     second.quiet().await;
     assert_eq!(first.rpc.total_requests.load(Ordering::Relaxed), 4);
     assert_eq!(first.rpc.backend_batch_requests.load(Ordering::Relaxed), 2);
     assert_eq!(second.rpc.total_requests.load(Ordering::Relaxed), 2);
-    assert_eq!(second.rpc.backend_batch_requests.load(Ordering::Relaxed), 0);
+    assert_eq!(second.rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
     first.idle();
     second.idle();
 }
@@ -972,5 +938,360 @@ async fn batch_earliest_deadline_expires_only_the_call_without_remaining_time() 
     assert_eq!(h.rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
     drop(packet);
     h.quiet().await;
+    h.idle();
+}
+
+fn packet_params(packet: &Incoming) -> Vec<Value> {
+    packet
+        .body
+        .as_array()
+        .expect("HTTP retries must stay batched")
+        .iter()
+        .map(|call| call["params"].clone())
+        .collect()
+}
+
+async fn send_stalled_body(
+    incoming: Incoming,
+    prefix: String,
+) -> mpsc::Sender<Result<Bytes, std::io::Error>> {
+    let (sender, receiver) = mpsc::channel(2);
+    sender.send(Ok(Bytes::from(prefix))).await.unwrap();
+    incoming
+        .reply
+        .send(
+            Response::builder()
+                .body(Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(receiver),
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+    sender
+}
+
+fn code_call(index: usize) -> SingleRequest {
+    SingleRequest::new(
+        (index as u64).into(),
+        "eth_getCode".into(),
+        sonic_rs::json!(["0x0000000000000000000000000000000000000000", "latest"]),
+    )
+    .unwrap()
+}
+
+fn add_backend(app: &Arc<App>, rpcs: Vec<Arc<Web3Rpc>>) {
+    let head = app.balanced_rpcs.head_block().unwrap();
+    for rpc in &rpcs {
+        app.balanced_rpcs
+            .by_name
+            .write()
+            .insert(rpc.name.clone(), rpc.clone());
+    }
+    let votes = hashbrown::HashMap::from([(head.clone(), (rpcs.iter().collect(), 2))]);
+    let heads = rpcs.iter().map(|rpc| (rpc.clone(), head.clone())).collect();
+    let ranked = RankedRpcs::from_votes(1, 1, alloy::primitives::U64::ZERO, votes, heads).unwrap();
+    app.balanced_rpcs
+        .watch_ranked_rpcs
+        .send_replace(Some(Arc::new(ranked)));
+}
+
+#[tokio::test]
+async fn ordinary_batch_drains_each_large_body_before_waiting_for_queued_calls() {
+    let mut h = Harness::new(1, 64).await;
+    let task = h.start_requests(vec![code_call(0), code_call(1)]);
+    let data = format!("0x{}", "ab".repeat(70_000));
+    for id in 0..2 {
+        let call = h.next().await;
+        assert_eq!(call.body["id"], id);
+        call.respond(json!({"jsonrpc":"2.0","id":id,"result":data}));
+    }
+    assert_eq!(
+        task.await.unwrap(),
+        json!([
+            {"jsonrpc":"2.0","id":0,"result":data},
+            {"jsonrpc":"2.0","id":1,"result":data}
+        ])
+    );
+    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 2);
+    h.idle();
+}
+
+#[tokio::test]
+async fn ordinary_batch_stalled_body_keeps_its_original_deadline_and_other_answers() {
+    let mut h = Harness::new(1, 64).await;
+    let task = h.start_requests(vec![code_call(0), code_call(1)]);
+    let first = h.next().await;
+    first.respond(json!({"jsonrpc":"2.0","id":0,"result":"0xbeef"}));
+    let second = h.next().await;
+    let sender = send_stalled_body(
+        second,
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{}",
+            "x".repeat(140_000)
+        ),
+    )
+    .await;
+    advance_to(Instant::now() + Duration::from_secs(60)).await;
+    let response = timeout(Duration::from_millis(500), task)
+        .await
+        .expect("the body must obey the call deadline")
+        .unwrap();
+    assert_timeout_responses(
+        response,
+        json!([
+            {"jsonrpc":"2.0","id":0,"result":"0xbeef"}, timeout_answer(json!(1))
+        ]),
+    );
+    drop(sender);
+    h.idle();
+}
+
+#[tokio::test]
+async fn routing_skips_a_full_preferred_backend_for_individual_calls_and_packets() {
+    for batched in [false, true] {
+        let mut first = Harness::named("preferred", 1, 64).await;
+        let mut second = Harness::named("available", 1, 64).await;
+        second.rpc.tier.store(10, Ordering::SeqCst);
+        let held = first.start(2);
+        let occupied = first.next().await;
+        add_backend(&first.app, vec![first.rpc.clone(), second.rpc.clone()]);
+        let task = if batched {
+            first.start(64)
+        } else {
+            first.start_requests(vec![code_call(0), code_call(1)])
+        };
+        if batched {
+            let packet = second.next().await;
+            assert_eq!(packet.body.as_array().unwrap().len(), 64);
+            packet.succeed();
+            assert_answers(
+                timeout(Duration::from_millis(500), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                64,
+            );
+        } else {
+            for id in 0..2 {
+                let call = second.next().await;
+                assert_eq!(call.body["method"], "eth_getCode");
+                call.respond(json!({"jsonrpc":"2.0","id":id,"result":"0xbeef"}));
+            }
+            assert_eq!(
+                timeout(Duration::from_millis(500), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                json!([
+                    {"jsonrpc":"2.0","id":0,"result":"0xbeef"},
+                    {"jsonrpc":"2.0","id":1,"result":"0xbeef"}
+                ])
+            );
+        }
+        first.quiet().await;
+        occupied.succeed();
+        assert_answers(held.await.unwrap(), 2);
+        first.idle();
+        second.idle();
+    }
+}
+
+#[tokio::test]
+async fn queued_calls_and_packets_recheck_cooldown_before_submission() {
+    for batched in [false, true] {
+        for http_status in [false, true] {
+            let mut h = Harness::new(1, 2).await;
+            let task = if batched {
+                h.start(4)
+            } else {
+                h.start_requests(vec![code_call(0), code_call(1)])
+            };
+            let first = h.next().await;
+            h.quiet().await;
+            let error = |id: &Value| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32005,"message":"rate limit exceeded"}});
+            if http_status {
+                first
+                    .reply
+                    .send(Response::builder().status(429).body(Body::empty()).unwrap())
+                    .unwrap();
+            } else {
+                let response = if batched {
+                    Value::Array(
+                        first
+                            .body
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|c| error(&c["id"]))
+                            .collect(),
+                    )
+                } else {
+                    error(&first.body["id"])
+                };
+                first.respond(response);
+            }
+            assert!(
+                timeout(Duration::from_millis(850), h.incoming.recv())
+                    .await
+                    .is_err(),
+                "queued work bypassed a newly applied cooldown"
+            );
+            for _ in 0..2 {
+                let incoming = h.next().await;
+                if batched {
+                    assert_eq!(packet_params(&incoming).len(), 2);
+                    incoming.succeed();
+                } else {
+                    let id = incoming.body["id"].clone();
+                    incoming.respond(json!({"jsonrpc":"2.0","id":id,"result":"0xbeef"}));
+                }
+            }
+            let response = task.await.unwrap();
+            if batched {
+                assert_answers(response, 4);
+            } else {
+                assert_eq!(
+                    response,
+                    json!([
+                        {"jsonrpc":"2.0","id":0,"result":"0xbeef"}, {"jsonrpc":"2.0","id":1,"result":"0xbeef"}
+                    ])
+                );
+            }
+            h.idle();
+        }
+    }
+}
+
+#[tokio::test]
+async fn batch_retry_moves_to_ready_backend_and_uses_its_packet_limit() {
+    for packet_size in [64, 16] {
+        let mut first = Harness::named("failed-node", 2, 64).await;
+        let mut second = Harness::named("ready-node", 2, packet_size).await;
+        let task = first.start(128);
+        let failed = first.next().await;
+        let blocked = first.next().await;
+        let mut expected = packet_params(&failed);
+        add_backend(&first.app, vec![first.rpc.clone(), second.rpc.clone()]);
+        first
+            .rpc
+            .hard_limit_until
+            .as_ref()
+            .unwrap()
+            .send_replace(Instant::now() + Duration::from_secs(30));
+        failed.reject();
+        let mut actual = Vec::new();
+        for _ in 0..64 / packet_size {
+            let packet = second.next().await;
+            assert_eq!(packet_params(&packet).len(), packet_size);
+            actual.extend(packet_params(&packet));
+            packet.succeed();
+        }
+        actual.sort_by_key(Value::to_string);
+        expected.sort_by_key(Value::to_string);
+        assert_eq!(actual, expected);
+        first.quiet().await;
+        blocked.succeed();
+        assert_answers(task.await.unwrap(), 128);
+        assert_eq!(first.rpc.total_requests.load(Ordering::Relaxed), 128);
+        assert_eq!(second.rpc.total_requests.load(Ordering::Relaxed), 64);
+        assert_eq!(
+            second.rpc.backend_batch_requests.load(Ordering::Relaxed),
+            64 / packet_size
+        );
+        first.idle();
+        second.idle();
+    }
+}
+
+#[tokio::test]
+async fn batch_thousands_of_calls_keep_packet_throughput_after_failure() {
+    let mut first = Harness::named("failed-node", 2, 64).await;
+    let mut second = Harness::named("ready-node", 2, 64).await;
+    let task = first.start(4096);
+    let failed = first.next().await;
+    let blocked = first.next().await;
+    add_backend(&first.app, vec![first.rpc.clone(), second.rpc.clone()]);
+    first
+        .rpc
+        .hard_limit_until
+        .as_ref()
+        .unwrap()
+        .send_replace(Instant::now() + Duration::from_secs(30));
+    failed.reject();
+    for pair in 0..32 {
+        let a = second.next().await;
+        assert_eq!(packet_params(&a).len(), 64);
+        if pair < 31 {
+            let b = second.next().await;
+            assert_eq!(packet_params(&b).len(), 64);
+            assert_eq!(second.rpc.active_requests.load(Ordering::SeqCst), 2);
+            second.quiet().await;
+            a.succeed();
+            b.succeed();
+        } else {
+            a.succeed();
+        }
+    }
+    first.quiet().await;
+    blocked.succeed();
+    assert_answers(task.await.unwrap(), 4096);
+    assert_eq!(first.rpc.backend_batch_requests.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        second.rpc.backend_batch_requests.load(Ordering::Relaxed),
+        63
+    );
+    assert_eq!(second.rpc.total_requests.load(Ordering::Relaxed), 4032);
+    first.idle();
+    second.idle();
+}
+
+#[tokio::test]
+async fn batch_block_hash_validation_is_bounded_concurrent_and_reused() {
+    let mut h = Harness::new(128, 64).await;
+    let requests = (0..65)
+        .map(|index| {
+            let mut request = client_call(index);
+            request.params[1] = sonic_rs::json!({"blockHash": format!("0x{:064x}", index + 1)});
+            request
+        })
+        .collect();
+    let task = h.start_requests(requests);
+    let mut lookups = Vec::new();
+    for _ in 0..64 {
+        let lookup = h.next().await;
+        assert_eq!(lookup.body["method"], "eth_getBlockByHash");
+        lookups.push(lookup);
+    }
+    h.quiet().await;
+    let respond_header = |lookup: Incoming| {
+        let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+        let hash = lookup.body["params"][0].as_str().unwrap();
+        block.header.hash = hash.parse().unwrap();
+        block.header.inner.number = (u64::from_str_radix(&hash[2..], 16).unwrap() % 30) + 1;
+        let id = lookup.body["id"].clone();
+        lookup.respond(json!({"jsonrpc":"2.0","id":id,"result":block}));
+    };
+    for lookup in lookups {
+        respond_header(lookup);
+    }
+    let last = h.next().await;
+    assert_eq!(last.body["method"], "eth_getBlockByHash");
+    // Removing cached headers makes a second validation pass observable on the wire.
+    h.app.balanced_rpcs.blocks_by_hash.invalidate_all();
+    respond_header(last);
+    for _ in 0..65 {
+        let call = h.next().await;
+        assert!(
+            call.body.is_object(),
+            "differing blocks retain individual forwarding"
+        );
+        assert_eq!(
+            call.body["method"], "eth_call",
+            "validated calls must not repeat block lookups"
+        );
+        call.succeed();
+    }
+    assert_answers(task.await.unwrap(), 65);
+    assert_eq!(h.rpc.total_requests.load(Ordering::Relaxed), 130);
     h.idle();
 }
