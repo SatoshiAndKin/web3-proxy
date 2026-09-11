@@ -103,9 +103,30 @@ impl ConsensusTarget {
                 .entry(self.name.clone())
                 .or_default()
                 .skipped_known += 1;
+            stats.lock().disposition(
+                stats::Layer::Consensus,
+                &payload.block,
+                &self.name,
+                "already_known",
+            );
             return;
         }
         let started = Instant::now();
+        let (attempt_id, started_mode, started_mode_epoch) = {
+            let mut s = stats.lock();
+            let attempt_id = s.telemetry.attempt();
+            s.record(super::recording::Record::SubmissionStarted {
+                attempt_id,
+                layer: stats::Layer::Consensus,
+                root: payload.block.beacon_root,
+                hash: payload.block.hash,
+                slot: payload.block.slot,
+                target: self.name.clone(),
+                serialized_request_bytes: payload.body.len(),
+                canonical_before_call: None,
+            });
+            (attempt_id, s.mode, s.telemetry.mode_epoch)
+        };
         stats
             .lock()
             .consensus_targets
@@ -145,6 +166,9 @@ impl ConsensusTarget {
             }
         }
         stats.lock().record(super::recording::Record::Submission {
+            attempt_id,
+            started_mode,
+            started_mode_epoch,
             layer: stats::Layer::Consensus,
             root: payload.block.beacon_root,
             hash: payload.block.hash,
@@ -326,6 +350,20 @@ impl ConsensusTarget {
                 }
             };
             if !Self::active(&work.work, &context) {
+                let reason =
+                    if work.work.mode == Mode::Observe || *context.mode.borrow() == Mode::Observe {
+                        "observe"
+                    } else if *context.stop.borrow() {
+                        "shutdown"
+                    } else {
+                        "deadline"
+                    };
+                context.stats.lock().disposition(
+                    stats::Layer::Consensus,
+                    &work.payload.block,
+                    &self.name,
+                    reason,
+                );
                 continue;
             }
             let root = work.payload.block.beacon_root;
@@ -337,6 +375,12 @@ impl ConsensusTarget {
                     .entry(self.name.clone())
                     .or_default()
                     .skipped_known += 1;
+                context.stats.lock().disposition(
+                    stats::Layer::Consensus,
+                    &work.payload.block,
+                    &self.name,
+                    "already_known",
+                );
                 continue;
             }
             let previous = attempts.get(&root).await;
@@ -344,6 +388,12 @@ impl ConsensusTarget {
                 .confirmed
                 .contains_key(&work.payload.block.parent_beacon_root);
             if previous.is_some_and(|a| a.count >= 2 || a.parent_confirmed || !parent_confirmed) {
+                context.stats.lock().disposition(
+                    stats::Layer::Consensus,
+                    &work.payload.block,
+                    &self.name,
+                    "duplicate",
+                );
                 continue;
             }
             let count = previous.map_or(1, |a| a.count + 1);
@@ -423,10 +473,14 @@ impl ConsensusTarget {
         let mut optimistic = false;
         while permit.is_some() && Instant::now() < work.deadline {
             let query_start = Instant::now();
+            let query_us = stats::micros(query_start.duration_since(work.first_seen));
+            sample.first_probe_us.get_or_insert(query_us);
+            sample.probes += 1;
             match self.header(work.payload.beacon_root).await {
                 Ok(Some(header)) if header.data.header.message.slot == work.payload.slot => {
                     optimistic |= header.execution_optimistic;
                     if !header.execution_optimistic {
+                        sample.first_ready_probe_started_us.get_or_insert(query_us);
                         sample
                             .first_ready_us
                             .get_or_insert_with(|| stats::micros(work.first_seen.elapsed()));
@@ -440,13 +494,16 @@ impl ConsensusTarget {
                     sample.last_missing_us =
                         Some(stats::micros(query_start.duration_since(work.first_seen)))
                 }
-                Err(error) => stats
-                    .lock()
-                    .consensus_targets
-                    .entry(self.name.clone())
-                    .or_default()
-                    .observation
-                    .failure(&error.to_string()),
+                Err(error) => {
+                    sample.probe_errors += 1;
+                    stats
+                        .lock()
+                        .consensus_targets
+                        .entry(self.name.clone())
+                        .or_default()
+                        .observation
+                        .failure(&error.to_string());
+                }
                 _ => {} // Optimistic responses are not proof of absence or completed import.
             }
             tokio::time::sleep(if work.first_seen.elapsed() < Duration::from_secs(1) {

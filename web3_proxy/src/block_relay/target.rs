@@ -72,6 +72,88 @@ pub(super) struct WorkerContext {
 }
 
 impl Target {
+    /// Independent canonical-head notifications. Never mutate delivery caches or
+    /// gate a payload on telemetry. Reconnect only this observation stream.
+    pub async fn observe_heads(
+        self: Arc<Self>,
+        ws_url: String,
+        stats: Shared,
+        mut stop: watch::Receiver<bool>,
+    ) {
+        use alloy::providers::Provider;
+        use futures_util::StreamExt;
+        let mut stream_id = 0u64;
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+            let subscribe = async {
+                let url = url::Url::parse(&ws_url)?;
+                ensure!(
+                    matches!(url.scheme(), "ws" | "wss")
+                        && url.host_str().is_some()
+                        && url.fragment().is_none(),
+                    "invalid head telemetry URL"
+                );
+                let provider = crate::rpcs::provider::connect_ws(url).await?;
+                let subscription = provider.subscribe_blocks().await?;
+                Ok::<_, anyhow::Error>((provider, subscription))
+            };
+            let connection = tokio::select! {
+                _ = stop.changed() => return,
+                result = tokio::time::timeout(Duration::from_secs(8), subscribe) => result,
+            };
+            if let Ok(Ok((_provider, subscription))) = connection {
+                stream_id += 1;
+                let mut headers = subscription.into_stream();
+                {
+                    let mut s = stats.lock();
+                    s.telemetry
+                        .head_streams
+                        .entry(self.name.clone())
+                        .or_default()
+                        .success(0, "newHeads subscribed");
+                }
+                loop {
+                    let header = tokio::select! {
+                        _ = stop.changed() => return,
+                        header = tokio::time::timeout(Duration::from_secs(60), headers.next()) => header.ok().flatten(),
+                    };
+                    let Some(header) = header else {
+                        break;
+                    };
+                    let mut s = stats.lock();
+                    let head = super::telemetry::Head {
+                        hash: header.hash,
+                        number: header.number,
+                        block_timestamp: header.timestamp,
+                        observed_us: s.telemetry.at(Instant::now()),
+                        stream_id,
+                    };
+                    let endpoint = s
+                        .telemetry
+                        .head_streams
+                        .entry(self.name.clone())
+                        .or_default();
+                    endpoint.events += 1;
+                    endpoint.success(0, "newHeads received");
+                    s.telemetry.heads.insert(self.name.clone(), head.clone());
+                    s.record(super::recording::Record::Head {
+                        target: self.name.clone(),
+                        head,
+                    });
+                }
+            }
+            stats
+                .lock()
+                .telemetry
+                .head_streams
+                .entry(self.name.clone())
+                .or_default()
+                .failure("newHeads connection failed; retry pending");
+            tokio::select! { _ = stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+        }
+    }
     pub async fn validate(&self, chain_id: u64) -> Result<()> {
         let (engine_chain, methods): (U64, Vec<String>) = tokio::try_join!(
             self.engine.call("eth_chainId", [] as [u8; 0]),
@@ -225,10 +307,22 @@ impl Target {
                     }
                 }
             };
-            if work.mode == Mode::Observe
-                || *mode.borrow() == Mode::Observe
-                || Instant::now() >= work.deadline
-            {
+            if work.mode == Mode::Observe || *mode.borrow() == Mode::Observe {
+                stats.lock().disposition(
+                    stats::Layer::Execution,
+                    &work.payload,
+                    &self.name,
+                    "observe",
+                );
+                continue;
+            }
+            if Instant::now() >= work.deadline {
+                stats.lock().disposition(
+                    stats::Layer::Execution,
+                    &work.payload,
+                    &self.name,
+                    "deadline",
+                );
                 continue;
             }
             let p = &work.payload;
@@ -244,6 +338,9 @@ impl Target {
                     .entry(self.name.clone())
                     .or_default()
                     .skipped_known += 1;
+                stats
+                    .lock()
+                    .disposition(stats::Layer::Execution, p, &self.name, "already_known");
                 continue;
             }
             let parent_became_valid = matches!(
@@ -262,6 +359,9 @@ impl Target {
                     .entry(self.name.clone())
                     .or_default()
                     .suppressed_duplicate += 1;
+                stats
+                    .lock()
+                    .disposition(stats::Layer::Execution, p, &self.name, "duplicate");
                 continue;
             }
             if handled
@@ -276,6 +376,12 @@ impl Target {
                     .entry(self.name.clone())
                     .or_default()
                     .skipped_invalid_ancestor += 1;
+                stats.lock().disposition(
+                    stats::Layer::Execution,
+                    p,
+                    &self.name,
+                    "invalid_ancestor",
+                );
                 continue;
             }
             let parent_was_valid = self.confirmed.contains_key(&p.parent_hash)
@@ -378,6 +484,27 @@ impl Target {
             .or_default()
             .sent += 1;
         let start = Instant::now();
+        let (attempt_id, started_mode, started_mode_epoch) = {
+            let mut s = stats.lock();
+            let attempt_id = s.telemetry.attempt();
+            let canonical_before_call = s
+                .telemetry
+                .heads
+                .get(&self.name)
+                .filter(|head| head.hash == payload.hash)
+                .cloned();
+            s.record(super::recording::Record::SubmissionStarted {
+                attempt_id,
+                layer: stats::Layer::Execution,
+                root: payload.beacon_root,
+                hash: payload.hash,
+                slot: payload.slot,
+                target: self.name.clone(),
+                serialized_request_bytes: payload.body.len(),
+                canonical_before_call,
+            });
+            (attempt_id, s.mode, s.telemetry.mode_epoch)
+        };
         let result = self.engine.new_payload(payload).await.and_then(|status| {
             ensure!(
                 !status.is_valid() || status.latest_valid_hash == Some(payload.hash),
@@ -411,6 +538,9 @@ impl Target {
             }
         }
         s.record(super::recording::Record::Submission {
+            attempt_id,
+            started_mode,
+            started_mode_epoch,
             layer: stats::Layer::Execution,
             root: payload.beacon_root,
             hash: payload.hash,
@@ -551,22 +681,29 @@ impl Target {
             .and_then(Result::ok);
         while permit.is_some() && Instant::now() < work.deadline {
             let query_start = Instant::now();
+            let query_us = stats::micros(query_start.duration_since(work.first_seen));
+            sample.first_probe_us.get_or_insert(query_us);
             if sample.first_ready_us.is_none() {
+                sample.probes += 1;
                 match self.has_block(work.payload.hash, work.payload.number).await {
                     Ok(true) => {
+                        sample.first_ready_probe_started_us = Some(query_us);
                         sample.first_ready_us = Some(stats::micros(work.first_seen.elapsed()));
                     }
                     Ok(false) => {
                         sample.last_missing_us =
                             Some(stats::micros(query_start.duration_since(work.first_seen)))
                     }
-                    Err(error) => stats
-                        .lock()
-                        .execution_targets
-                        .entry(self.name.clone())
-                        .or_default()
-                        .observation
-                        .failure(&error.to_string()),
+                    Err(error) => {
+                        sample.probe_errors += 1;
+                        stats
+                            .lock()
+                            .execution_targets
+                            .entry(self.name.clone())
+                            .or_default()
+                            .observation
+                            .failure(&error.to_string());
+                    }
                 }
             }
             if sample.first_ready_us.is_some() {
@@ -577,6 +714,10 @@ impl Target {
                         (U64::from(work.payload.number), false),
                     )
                     .await;
+                if canonical.is_err() {
+                    sample.probe_errors += 1;
+                }
+                sample.probes += 1;
                 if canonical.is_ok_and(|b| {
                     b.is_some_and(|b| {
                         b.hash == work.payload.hash && b.number.to::<u64>() == work.payload.number

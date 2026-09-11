@@ -14,6 +14,7 @@ mod isolation;
 mod mocks;
 mod network;
 mod review;
+mod telemetry;
 use mocks::{MockBeacon, MockRpc, Server};
 
 fn network() -> config::Network {
@@ -256,6 +257,8 @@ fn work(hash: u8, parent: u8, number: u64, mode: config::Mode) -> Arc<Work> {
     let now = Instant::now();
     Arc::new(Work {
         first_seen_unix_us: stats::unix_micros(),
+        first_seen_us: 0,
+        mode_epoch: 0,
         payload: Arc::new(payload::RelayPayload {
             hash,
             parent_hash,
@@ -305,7 +308,10 @@ impl Worker {
         let (tx, rx) = broadcast::channel(128);
         let (stop, stop_rx) = watch::channel(false);
         let (mode, mode_rx) = watch::channel(mode);
-        let stats = Arc::new(parking_lot::Mutex::new(stats::Stats::default()));
+        let stats = Arc::new(parking_lot::Mutex::new(stats::Stats {
+            mode: *mode.borrow(),
+            ..Default::default()
+        }));
         let cache = moka::future::Cache::new(128);
         let task = tokio::spawn(target.clone().run(
             rx,
@@ -530,6 +536,7 @@ fn relay_config(
                 (
                     name.to_string(),
                     config::ExecutionTarget {
+                        ws_url: "ws://127.0.0.1:1".into(),
                         engine_url: url.to_string(),
                         rpc_url: url.to_string(),
                         jwt_secret_path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -624,7 +631,8 @@ async fn complete_pipeline_races_valid_sources_deduplicates_and_reloads_mode_wit
     let status = relay.snapshot().to_string();
     assert!(!status.contains(&local_server.url));
     assert!(!status.contains("test-jwt"));
-    assert!(!status.contains("samples"));
+    assert!(relay.snapshot().get("samples").is_none());
+    assert!(!status.contains(&root.to_string()));
     shutdown.send(()).unwrap();
     run.await.unwrap();
 }
@@ -799,6 +807,13 @@ async fn unknown_timeout_allows_new_work_without_claiming_the_lost_import() {
     worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
     until(|| worker.stats.lock().execution_targets["a"].valid == 1).await;
     assert_eq!(worker.stats.lock().execution_targets["a"].unknown, 1);
+    {
+        let s = worker.stats.lock();
+        let measured = &s.telemetry.modes[&config::Mode::Inject].targets["execution:a"];
+        assert_eq!(measured.calls, 2);
+        assert_eq!(measured.outcomes.get("unknown"), Some(&1));
+        assert_eq!(measured.outcomes.get("valid"), Some(&1));
+    }
     assert!(!rpc
         .state
         .lock()

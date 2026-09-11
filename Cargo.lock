@@ -6250,6 +6250,7 @@ dependencies = [
  "listenfd",
  "moka",
  "nanorand",
+ "nix",
  "once_cell",
  "ordered-float 5.5.0",
  "parking_lot",

@@ -79,6 +79,20 @@ pub struct BeaconSource {
     pub verified: AtomicBool,
 }
 impl BeaconSource {
+    pub async fn read_measured(
+        &self,
+        path: &str,
+        kind: &str,
+        stats: super::stats::Shared,
+    ) -> Result<bytes::Bytes> {
+        let mut measurement = super::telemetry::Fetch::start(stats, &self.name, kind);
+        let result = self.get_bytes(path).await;
+        measurement.finish(
+            result.is_ok(),
+            result.as_ref().map_or(0, |bytes| bytes.len()),
+        );
+        result
+    }
     pub fn new(name: String, config: &Source) -> Result<Self> {
         Ok(Self {
             name,
