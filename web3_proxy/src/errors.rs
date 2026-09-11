@@ -105,6 +105,9 @@ pub enum Web3ProxyError {
     NoConsensusHeadBlock,
     NoHandleReady,
     NoServersSynced,
+    /// The race has failed and has no remaining attempts or retry opportunities.
+    #[from(ignore)]
+    ExhaustedBackends(Box<Web3ProxyError>),
     #[display("{}/{}", num_known, min_head_rpcs)]
     #[from(ignore)]
     NotEnoughRpcs {
@@ -280,6 +283,9 @@ impl Web3ProxyError {
                 )
             }
             Self::Arc(err) => {
+                return err.as_response_parts(Some(request_for_error));
+            }
+            Self::ExhaustedBackends(err) => {
                 return err.as_response_parts(Some(request_for_error));
             }
             Self::BadRequest(err) => {
@@ -959,8 +965,36 @@ impl Web3ProxyError {
 
 #[cfg(test)]
 mod tests {
-    use super::Web3ProxyError;
+    use super::{JsonRpcErrorData, RequestForError, StatusCode, Web3ProxyError};
     use std::mem::size_of;
+
+    #[tokio::test]
+    async fn exhausted_backends_preserves_underlying_error_rendering() {
+        for error in [
+            Web3ProxyError::JsonRpcErrorData(JsonRpcErrorData {
+                code: -32602,
+                message: "invalid params".into(),
+                data: Some(sonic_rs::json!({"field":"to","nested":[null,1]})),
+            }),
+            Web3ProxyError::StatusCode(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable".into(),
+                Some(sonic_rs::json!({"reason":"offline"})),
+            ),
+            Web3ProxyError::NoHandleReady,
+        ] {
+            let id = sonic_rs::to_lazyvalue(&"client-id").unwrap();
+            let (expected_status, expected) =
+                error.as_json_response_parts(id.clone(), None::<RequestForError>);
+            let (status, response) = Web3ProxyError::ExhaustedBackends(Box::new(error))
+                .as_json_response_parts(id, None::<RequestForError>);
+            assert_eq!(status, expected_status);
+            assert_eq!(
+                sonic_rs::to_string(&response.parsed().await.unwrap()).unwrap(),
+                sonic_rs::to_string(&expected.parsed().await.unwrap()).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn web3_proxy_error_fits_result_error_budget() {

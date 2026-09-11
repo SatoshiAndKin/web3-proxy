@@ -276,8 +276,11 @@ async fn fastest_accepts_null_and_reverts_and_returns_first_exhausted_error() {
     fail(fleet.nodes[0].next().await, -32602, "first failure");
     fail(fleet.nodes[1].next().await, -32602, "second failure");
     let error = task.await.unwrap().unwrap_err();
+    let Web3ProxyError::ExhaustedBackends(error) = error else {
+        panic!("expected exhausted backends, got {error:?}");
+    };
     assert!(
-        matches!(error, Web3ProxyError::JsonRpcErrorData(ref e) if e.code == -32602 && e.message == "first failure")
+        matches!(*error, Web3ProxyError::JsonRpcErrorData(ref e) if e.code == -32602 && e.message == "first failure")
     );
     assert_eq!(fleet.counts(), [1, 1]);
     fleet.idle();
@@ -338,17 +341,250 @@ fn fastest_config_defaults_and_boundaries() {
 fn http_request(port: u16, path: &str, body: Value) -> JoinHandle<Value> {
     let url = format!("http://127.0.0.1:{port}{path}");
     tokio::spawn(async move {
-        reqwest::Client::new()
+        let response = reqwest::Client::new()
             .post(url)
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
             .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        response.json().await.unwrap()
     })
+}
+
+/// Keep Tokio time fixed while allowing socket I/O and ready tasks to run.
+/// The wall-clock bound only detects a hung test; it cannot fire the App retry timer.
+async fn without_advancing_time<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::pause();
+    let frozen = Instant::now();
+    let wall_start = std::time::Instant::now();
+    tokio::pin!(future);
+    let result = loop {
+        tokio::select! {
+            biased;
+            value = &mut future => break value,
+            _ = tokio::task::yield_now() => {
+                assert!(wall_start.elapsed() < Duration::from_secs(2), "response waited for a retry after exhaustion");
+            }
+        }
+    };
+    assert_eq!(Instant::now(), frozen);
+    tokio::time::resume();
+    result
+}
+
+fn terminal_error(label: &str) -> Value {
+    json!({"code":-32602,"message":format!("invalid {label}"),"data":{"field":label,"details":[1,null,"exact"]}})
+}
+
+fn fail_with(call: Incoming, error: Value) {
+    let id = call.body["id"].clone();
+    call.respond(json!({"jsonrpc":"2.0","id":id,"error":error}));
+}
+
+async fn exhausted_http_method(method: &str, params: Value) {
+    for rankings in [false, true] {
+        let mut fleet = Fleet::new(2, 2).await;
+        fleet.reload(1).await;
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(
+            port,
+            "/fastest",
+            json!({"jsonrpc":"2.0","id":"client-id","method":method,"params":params}),
+        );
+        fail_with(fleet.nodes[0].next().await, terminal_error("first"));
+        let last = fleet.nodes[1].next().await;
+        if rankings {
+            fleet.sync(2);
+        }
+        fail_with(last, terminal_error("last"));
+        assert_eq!(
+            without_advancing_time(task).await.unwrap(),
+            json!({"jsonrpc":"2.0","id":"client-id","error":terminal_error("first")})
+        );
+        fleet.sync(2);
+        for node in &mut fleet.nodes {
+            node.quiet().await;
+        }
+        assert_eq!(fleet.counts(), [1, 1]);
+        fleet.idle();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn exhausted_fastest_http_returns_without_app_retry() {
+    exhausted_http_method("eth_gasPrice", json!([])).await;
+}
+
+#[tokio::test]
+async fn exhausted_fastest_gas_estimate_preserves_error() {
+    exhausted_http_method(
+        "eth_estimateGas",
+        json!([{"to":"0x0000000000000000000000000000000000000000"}]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exhausted_fastest_transaction_does_not_retry_archive() {
+    exhausted_http_method(
+        "eth_getTransactionByHash",
+        json!([format!("0x{}", "11".repeat(32))]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exhausted_fastest_receipt_does_not_retry_archive() {
+    exhausted_http_method(
+        "eth_getTransactionReceipt",
+        json!([format!("0x{}", "11".repeat(32))]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn exhausted_fastest_http_batch_preserves_errors_ids_and_order() {
+    let mut fleet = Fleet::new(2, 2).await;
+    fleet.reload(1).await;
+    let (port, server) = fleet.frontend().await;
+    let ids = [json!("duplicate"), json!("duplicate"), Value::Null];
+    let requests: Vec<_> = ids.iter().enumerate().map(|(i, id)| json!({"jsonrpc":"2.0","id":id,"method":"eth_call","params":[{"to":"0x0000000000000000000000000000000000000000","data":format!("0x{i:02x}")},"latest"]})).collect();
+    let task = http_request(port, "/fastest", json!(requests));
+    for index in 0..2 {
+        let mut calls = Vec::new();
+        for _ in &ids {
+            calls.push(fleet.nodes[index].next().await);
+        }
+        fleet.sync(2);
+        calls.sort_by_key(|call| call.body["params"][0]["data"].as_str().unwrap().to_owned());
+        for call in calls.into_iter().rev() {
+            assert_eq!(call.body["params"][1], "0x2a");
+            let label = format!(
+                "{index}-{}",
+                call.body["params"][0]["data"].as_str().unwrap()
+            );
+            fail_with(call, terminal_error(&label));
+        }
+    }
+    let expected: Vec<_> = ids.iter().enumerate().map(|(i, id)| json!({"jsonrpc":"2.0","id":id,"error":terminal_error(&format!("0-0x{i:02x}"))})).collect();
+    assert_eq!(without_advancing_time(task).await.unwrap(), json!(expected));
+    fleet.sync(2);
+    for node in &mut fleet.nodes {
+        node.quiet().await;
+    }
+    assert_eq!(fleet.counts(), [3, 3]);
+    fleet.idle();
+    server.abort();
+}
+
+#[tokio::test]
+async fn exhausted_fastest_websocket_preserves_wire_error_and_id() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut fleet = Fleet::new(2, 2).await;
+    fleet.reload(1).await;
+    let (port, server) = fleet.frontend().await;
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    client.write_all(b"GET /fastest HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(client.read_u8().await.unwrap());
+    }
+    assert!(headers.starts_with(b"HTTP/1.1 101"));
+    let body = br#"{"jsonrpc":"2.0","id":"ws\u002did","method":"eth_gasPrice","params":[]}"#;
+    assert!(body.len() < 126);
+    // Masked client text frame, with a deterministic all-zero mask.
+    client
+        .write_all(&[0x81, 0x80 | body.len() as u8, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+    fail_with(fleet.nodes[0].next().await, terminal_error("first"));
+    let last = fleet.nodes[1].next().await;
+    fleet.sync(2);
+    fail_with(last, terminal_error("last"));
+    let response = without_advancing_time(async {
+        assert_eq!(client.read_u8().await.unwrap(), 0x81);
+        let len = client.read_u8().await.unwrap();
+        let len = match len {
+            0..=125 => u64::from(len),
+            126 => u64::from(client.read_u16().await.unwrap()),
+            127 => client.read_u64().await.unwrap(),
+            _ => panic!("server frame must not be masked"),
+        };
+        assert!(len < 8192);
+        let mut body = vec![0; len as usize];
+        client.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()
+    })
+    .await;
+    assert_eq!(
+        response,
+        json!({"jsonrpc":"2.0","id":"ws-id","error":terminal_error("first")})
+    );
+    fleet.sync(2);
+    for node in &mut fleet.nodes {
+        node.quiet().await;
+    }
+    assert_eq!(fleet.counts(), [1, 1]);
+    fleet.idle();
+    drop(client);
+    server.abort();
+}
+
+#[tokio::test]
+async fn fastest_null_transaction_still_uses_archive_fallback() {
+    for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
+        let mut fleet = Fleet::new(1, 1).await;
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(
+            port,
+            "/fastest",
+            json!({"jsonrpc":"2.0","id":42,"method":method,"params":[format!("0x{}", "11".repeat(32))]}),
+        );
+        succeed(fleet.nodes[0].next().await, Value::Null);
+        succeed(fleet.nodes[0].next().await, json!({"found":"archive"}));
+        assert_eq!(
+            task.await.unwrap(),
+            json!({"jsonrpc":"2.0","id":42,"result":{"found":"archive"}})
+        );
+        assert_eq!(fleet.counts(), [2]);
+        fleet.idle();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn fastest_app_waits_for_initial_sync() {
+    let mut fleet = Fleet::new(0, 1).await;
+    let (port, server) = fleet.frontend().await;
+    let task = http_request(
+        port,
+        "/fastest",
+        json!({"jsonrpc":"2.0","id":42,"method":"eth_gasPrice","params":[]}),
+    );
+    timeout(Duration::from_secs(1), async {
+        while fleet.app.balanced_rpcs.watch_ranked_rpcs.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    assert_eq!(fleet.counts(), [0]);
+    fleet.sync(1);
+    succeed(fleet.nodes[0].next().await, json!("0x1"));
+    assert_eq!(
+        task.await.unwrap(),
+        json!({"jsonrpc":"2.0","id":42,"result":"0x1"})
+    );
+    assert_eq!(fleet.counts(), [1]);
+    fleet.idle();
+    server.abort();
 }
 
 #[tokio::test]

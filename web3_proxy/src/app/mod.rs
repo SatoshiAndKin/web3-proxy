@@ -740,6 +740,10 @@ impl App {
                     last_success = Some(response_data);
                     break;
                 }
+                Err(err @ Web3ProxyError::ExhaustedBackends(_)) => {
+                    last_error = Some(err);
+                    break;
+                }
                 Err(err) => {
                     last_error = Some(err);
                 }
@@ -998,6 +1002,7 @@ impl App {
                         }
                     },
                     Ok(SingleResponse::Stream(..)) => unimplemented!(),
+                    Err(Web3ProxyError::ExhaustedBackends(_)) => false,
                     Err(..) => true,
                 };
 

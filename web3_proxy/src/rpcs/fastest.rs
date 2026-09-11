@@ -100,7 +100,7 @@ impl Web3Rpcs {
                         }
                     }
                 } else if pending.is_empty() {
-                    return Err(first_error.unwrap_or(Web3ProxyError::NoServersSynced));
+                    break;
                 }
             }
             if pending.is_empty() && capacity.is_empty() && sync.is_empty() && retry_at.is_none() {
@@ -151,6 +151,9 @@ impl Web3Rpcs {
                 }
             }
         }
-        Err(first_error.unwrap_or(Web3ProxyError::NoServersSynced))
+        Err(match first_error {
+            Some(error) => Web3ProxyError::ExhaustedBackends(Box::new(error)),
+            None => Web3ProxyError::NoServersSynced,
+        })
     }
 }
