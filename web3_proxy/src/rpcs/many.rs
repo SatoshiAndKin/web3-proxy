@@ -618,7 +618,7 @@ impl Web3Rpcs {
 
         match proxy_mode {
             ProxyMode::Best => self.request_with(web3_request, send).await,
-            ProxyMode::Fastest(_x) => todo!("Fastest"),
+            ProxyMode::Fastest(count) => self.fastest_with(web3_request, count, send).await,
             ProxyMode::Versus => todo!("Versus"),
         }
     }

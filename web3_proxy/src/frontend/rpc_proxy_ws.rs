@@ -32,7 +32,8 @@ pub enum ProxyMode {
     /// send to the "best" synced server. on error, try the next
     #[default]
     Best,
-    /// send to all synced servers and return the fastest non-error response (reverts do not count as errors here)
+    /// Race up to N synced eligible servers, using latency tiers. Zero means all.
+    /// Return the first complete success or execution revert.
     Fastest(usize),
     /// send to all servers for benchmarking. return the fastest non-error response
     Versus,
@@ -67,16 +68,14 @@ pub async fn websocket_handler(
     _websocket_handler(ProxyMode::Best, app, ws_upgrade).await
 }
 
-/// Public entrypoint for WebSocket JSON-RPC requests that uses all synced servers.
-/// Queries all synced backends with every request! This might get expensive!
-// #[debug_handler]
+/// Race the configured number of synced eligible servers. This can increase RPC costs.
+#[debug_handler]
 pub async fn fastest_websocket_handler(
     State(app): State<Arc<App>>,
     ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Web3ProxyResponse {
-    // TODO: get the fastest number from the url params (default to 0/all)
-    // TODO: config to disable this
-    _websocket_handler(ProxyMode::Fastest(0), app, ws_upgrade).await
+    let mode = ProxyMode::Fastest(*app.fastest_rpcs.borrow());
+    _websocket_handler(mode, app, ws_upgrade).await
 }
 
 /// Public entrypoint for WebSocket JSON-RPC requests that uses all synced servers.
@@ -267,6 +266,11 @@ async fn handle_socket_payload(
     subscription_count: &AtomicU64,
     subscriptions: Arc<AsyncRwLock<HashMap<U64, AbortHandle>>>,
 ) -> Web3ProxyResult<SocketResponse> {
+    // Snapshot the current policy per message, including on existing sockets.
+    let proxy_mode = match proxy_mode {
+        ProxyMode::Fastest(_) => ProxyMode::Fastest(*app.fastest_rpcs.borrow()),
+        mode => mode,
+    };
     // TODO: handle batched requests
     let (response_id, response) = match sonic_rs::from_str::<SingleRequest>(payload) {
         Ok(json_request) => {

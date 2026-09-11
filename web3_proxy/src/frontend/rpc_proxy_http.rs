@@ -35,7 +35,8 @@ pub async fn fastest_proxy_web3_rpc(
     payload: Result<Bytes, BytesRejection>,
 ) -> Response {
     let payload = parse_payload(&headers, payload);
-    proxy(app, payload, ProxyMode::Fastest(0), request_id)
+    let mode = ProxyMode::Fastest(*app.fastest_rpcs.borrow());
+    proxy(app, payload, mode, request_id)
         .await
         .unwrap_or_else(|response| *response)
 }

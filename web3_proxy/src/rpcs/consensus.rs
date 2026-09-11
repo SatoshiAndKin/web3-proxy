@@ -3,6 +3,7 @@ use super::many::Web3Rpcs;
 use super::one::Web3Rpc;
 use super::request::OpenRequestHandle;
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
+use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::jsonrpc::ValidatedRequest;
 use crate::rpcs::request::OpenRequestResult;
 use alloy::primitives::{B256, U64};
@@ -92,6 +93,8 @@ pub struct RankedRpcs {
     pub check_block_data: bool,
 
     pub(crate) inner: HashSet<Arc<Web3Rpc>>,
+    /// Consensus voters, before adding extra archive and lagging candidates.
+    synced: HashSet<Arc<Web3Rpc>>,
 
     sort_mode: SortMethod,
 }
@@ -125,6 +128,7 @@ impl RankedRpcs {
             backups_needed,
             check_block_data,
             head_block,
+            synced: rpcs.clone(),
             inner: rpcs,
             num_synced,
             sort_mode,
@@ -169,6 +173,7 @@ impl RankedRpcs {
 
             let backups_needed = best_rpcs.iter().any(|x| x.backup);
             let num_synced = best_rpcs.len();
+            let synced = best_rpcs.clone();
 
             // add all the rpcs that are behind the ranked rpcs. these might be needed for serving archive requests
             for (x, x_head) in heads.iter() {
@@ -204,6 +209,7 @@ impl RankedRpcs {
                 head_block: Some(best_block),
                 sort_mode,
                 inner: best_rpcs,
+                synced,
                 num_synced,
             };
 
@@ -233,6 +239,11 @@ impl RankedRpcs {
 
         // max lag was already handled
         for rpc in self.inner.iter().cloned() {
+            if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_))
+                && !self.synced.contains(&rpc)
+            {
+                continue;
+            }
             if rpc.backup && !self.backups_needed {
                 // this backup check was already done, but
                 // TODO: push these into `backup_for_request` Vec?
@@ -260,7 +271,12 @@ impl RankedRpcs {
         // TODO: use web3_request.start_instant? I think we want it to be as recent as possible
         let now = Instant::now();
 
-        match self.sort_mode {
+        let sort_mode = if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_)) {
+            SortMethod::Sort
+        } else {
+            self.sort_mode.clone()
+        };
+        match sort_mode {
             SortMethod::Shuffle => {
                 // if we are shuffling, it is because we don't watch the head_blocks of the rpcs
                 // clone all of the rpcs

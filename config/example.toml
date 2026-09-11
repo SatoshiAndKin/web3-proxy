@@ -1,6 +1,10 @@
 [app]
 chain_id = 1
 
+# /fastest races this many synced eligible backends. 0 selects all of them.
+# The normal / route stays in Best mode. Reload applies to new requests.
+fastest_rpcs = 2
+
 # combined byte limit for full and hash-only block responses (256 MiB)
 block_cache_max_bytes = 268435456
 

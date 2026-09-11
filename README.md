@@ -6,7 +6,15 @@ Web3_proxy is a fast load-balancing proxy for web3 (Ethereum or similar) JSON-RP
 
 Signed transactions `(eth_sendRawTransaction)` are sent in parallel to the configured private RPCs (Flashbots, etc.).
 
-All other requests are sent to an RPC server that is currently on the latest block (Alchemy, your own node, or one of many other providers). If multiple servers are in sync, we prioritize servers based on their `active_requests` and request latency. Please keep in mind that this means that the fastest server is most likely to serve requests, while slower servers are unlikely to ever receive any requests.
+The normal `/` route uses Best mode. It selects eligible RPC servers with the existing latency tiers and load-aware ranking.
+
+Use `/fastest` for HTTP or WebSocket tests that should race multiple fast nodes. Set `app.fastest_rpcs` in the TOML config (default `2`). Fastest uses the same latency tiers, then load-weighted latency within each tier. It starts requests on the best available synced nodes. With one synced node, it sends one request. With three synced nodes and a count of two, it selects the top two. Set the count to `1` for one node, or `0` for all synced eligible nodes.
+
+Fastest returns the first complete valid result, including `null` or an execution revert. A transport failure, malformed response, or other RPC error does not beat a valid response. Fastest fills failed attempt slots from the remaining eligible nodes, within the original deadline. The count limits concurrent attempts, not the total number of retries. It cancels losing attempts and releases their request slots. Requests that already entered transport still count as backend attempts.
+
+Config reloads apply the new count to new HTTP requests and new messages on existing WebSocket connections. Active requests keep their original count. Fastest preserves local and cached responses, transaction broadcast rules, subscriptions, client IDs, and batch response order. It does not change `/` or implement `/versus`.
+
+Use `http://127.0.0.1:8544/fastest` or `ws://127.0.0.1:8544/fastest` as the default RPC URL in selected tests. Expect more RPC traffic and possible provider charges. The race can reduce latency, but it cannot guarantee the fastest answer across all nodes and network conditions.
 
 Each server has different limits that can be configured. The `soft_limit` is the number of parallel active requests where a server starts to slow down, while the `hard_limit` is where a server starts giving rate limits or other errors.
 

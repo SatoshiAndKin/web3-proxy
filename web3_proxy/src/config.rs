@@ -19,6 +19,7 @@ use tracing::warn;
 
 pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 448;
 pub(crate) const DEFAULT_MAX_BACKEND_BATCH_ITEMS: usize = 64;
+pub(crate) const DEFAULT_FASTEST_RPCS: usize = 2;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TopConfig {
@@ -70,6 +71,10 @@ impl TopConfig {
 #[serde_inline_default]
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct AppConfig {
+    /// Concurrent backends used by /fastest. Zero selects all synced eligible nodes.
+    #[serde_inline_default(DEFAULT_FASTEST_RPCS)]
+    pub fastest_rpcs: usize,
+
     /// erigon defaults to pruning beyond 90,000 blocks
     #[serde_inline_default(90_000u64)]
     pub archive_depth: u64,
