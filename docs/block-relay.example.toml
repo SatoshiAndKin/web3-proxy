@@ -13,6 +13,9 @@ state_dir = "/var/lib/web3-proxy/block-relay"
 cache_max_bytes = 134217728
 proof_workers = 2
 
+[block_relay.rpc]
+metered_fallback_delay_ms = 500
+
 [block_relay.network]
 genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
 genesis_time = 1606824023
@@ -30,13 +33,19 @@ epoch = 411392
 
 [block_relay.sources.lighthouse_geth]
 beacon_url = "http://127.0.0.1:5062"
+cost_class = "free"
+resources = ["block"]
 
 [block_relay.sources.lighthouse_reth]
 beacon_url = "http://127.0.0.1:5067"
+cost_class = "free"
+resources = ["block"]
 
 # Optional external source. Use the Beacon API, not the execution JSON-RPC URL.
 # [block_relay.sources.alchemy]
 # beacon_url = "https://eth-mainnetbeacon.g.alchemy.com/v2/YOUR_BEACON_API_KEY"
+# cost_class = "metered"
+# resources = ["block", "blob"]
 
 # Optional provider authentication without URL credentials:
 # [block_relay.sources.provider]

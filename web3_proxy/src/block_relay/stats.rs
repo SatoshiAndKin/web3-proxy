@@ -176,6 +176,7 @@ pub struct Stats {
     pub observation_dropped: u64,
     pub consensus_acquired: u64,
     pub consensus_acquisition_failed: u64,
+    pub consensus_blob_skipped: u64,
     pub consensus_acquisition_dropped: u64,
     pub consensus_acquisition_latency: Distribution,
     pub fleet_canonical_latency: Distribution,

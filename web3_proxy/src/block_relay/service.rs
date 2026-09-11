@@ -1,5 +1,6 @@
 use super::stats::WorkerLayer as Layer;
 use super::{
+    config::Resource,
     config::{Config, Mode, SLOTS_PER_EPOCH},
     consensus::{ConsensusTarget, ConsensusWork},
     payload::{ConsensusPayload, RelayPayload},
@@ -343,12 +344,17 @@ impl BlockRelay {
     }
 }
 
+enum ConsensusAcquisition {
+    Complete(Arc<ConsensusPayload>, String),
+    SkippedAllTargetsKnown,
+}
+
 async fn acquire_consensus(
     prepared: Arc<Prepared>,
     work: Arc<Work>,
     notify: Arc<Notify>,
     stats: Shared,
-) -> Result<(Arc<ConsensusPayload>, String)> {
+) -> Result<ConsensusAcquisition> {
     if work.payload.blob_commitments.is_empty() {
         let block = work.payload.clone();
         let permit = prepared.proof_workers.clone().acquire_owned().await?;
@@ -357,36 +363,99 @@ async fn acquire_consensus(
             ConsensusPayload::from_blobs(block, Vec::new())
         })
         .await??;
-        return Ok((Arc::new(payload), work.source.clone()));
+        return Ok(ConsensusAcquisition::Complete(
+            Arc::new(payload),
+            work.source.clone(),
+        ));
     }
-    race_sources(&prepared.sources, work.deadline, &notify, |source| {
-        let block = work.payload.clone();
-        let workers = prepared.proof_workers.clone();
-        let stats = stats.clone();
-        async move {
-            let bytes = source
-                .read_measured(
-                    &format!("/eth/v1/beacon/blobs/{}", block.beacon_root),
-                    "blobs",
-                    stats,
-                )
-                .await?;
-            let permit = workers.acquire_owned().await?;
-            let payload = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                #[derive(serde::Deserialize)]
-                struct Blobs {
-                    data: Vec<alloy::primitives::Bytes>,
-                }
-                let blobs: Blobs = sonic_rs::from_slice(&bytes)
-                    .map_err(|_| anyhow::anyhow!("invalid blob response"))?;
-                ConsensusPayload::from_blobs(block, blobs.data)
-            })
-            .await??;
-            Ok(Arc::new(payload))
+    // Execution clients can serve complete blobs locally. Try each eligible
+    // endpoint once before paying for a Beacon blob request.
+    let local = futures_util::stream::iter(prepared.execution_targets.iter().cloned())
+        .map(|target| {
+            let hashes = work.payload.versioned_hashes();
+            async move {
+                target
+                    .engine
+                    .get_blobs_v2(&hashes)
+                    .await
+                    .map(|v| (target, v))
+            }
+        })
+        .buffer_unordered(prepared.execution_targets.len().max(1));
+    tokio::pin!(local);
+    while let Some(result) = local.next().await {
+        if let Ok((target, Some(blobs))) = result {
+            if let Ok(payload) =
+                build_consensus_payload(work.payload.clone(), blobs, prepared.proof_workers.clone())
+                    .await
+            {
+                return Ok(ConsensusAcquisition::Complete(
+                    Arc::new(payload),
+                    format!("engine:{}", target.name),
+                ));
+            }
         }
-    })
+    }
+    if !prepared.consensus_targets.is_empty()
+        && prepared
+            .consensus_targets
+            .iter()
+            .all(|target| target.confirmed(work.payload.beacon_root))
+    {
+        return Ok(ConsensusAcquisition::SkippedAllTargetsKnown);
+    }
+    race_sources(
+        &prepared.sources,
+        work.deadline,
+        &notify,
+        Resource::Blob,
+        Duration::from_millis(prepared.config.rpc.metered_fallback_delay_ms),
+        |source| {
+            let block = work.payload.clone();
+            let workers = prepared.proof_workers.clone();
+            let stats = stats.clone();
+            async move {
+                let bytes = source
+                    .read_measured(
+                        &format!("/eth/v1/beacon/blobs/{}", block.beacon_root),
+                        "blobs",
+                        stats,
+                    )
+                    .await?;
+                let permit = workers.acquire_owned().await?;
+                let payload = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    #[derive(serde::Deserialize)]
+                    struct Blobs {
+                        data: Vec<alloy::primitives::Bytes>,
+                    }
+                    let blobs: Blobs = sonic_rs::from_slice(&bytes)
+                        .map_err(|_| anyhow::anyhow!("invalid blob response"))?;
+                    ConsensusPayload::from_blobs(block, blobs.data)
+                })
+                .await??;
+                Ok(Arc::new(payload))
+            }
+        },
+    )
     .await
+    .map(|(payload, source)| ConsensusAcquisition::Complete(payload, source))
+}
+
+async fn build_consensus_payload(
+    block: Arc<RelayPayload>,
+    blobs: Vec<alloy::primitives::Bytes>,
+    workers: Arc<tokio::sync::Semaphore>,
+) -> Result<ConsensusPayload> {
+    // Keep KZG work on the bounded proof pool. The transport response proof is
+    // intentionally ignored; ConsensusPayload recomputes and checks proofs.
+    let permit = workers.acquire_owned().await?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        ConsensusPayload::from_blobs(block, blobs)
+    })
+    .await??;
+    Ok(result)
 }
 
 async fn acquire(
@@ -398,25 +467,32 @@ async fn acquire(
     stats: Shared,
 ) -> Result<(Arc<RelayPayload>, String)> {
     let deadline = announcement.at + Duration::from_secs(network.seconds_per_slot);
-    race_sources(&sources, deadline, &notify, |source| {
-        let network = network.clone();
-        let decoders = decoders.clone();
-        let root = announcement.root;
-        let stats = stats.clone();
-        async move {
-            let bytes = source
-                .read_measured(&format!("/eth/v2/beacon/blocks/{root}"), "block", stats)
-                .await?;
-            let permit = decoders.acquire_owned().await?;
-            let payload = tokio::task::spawn_blocking(move || {
-                // A canceled request must not release capacity while its decoder still runs.
-                let _permit = permit;
-                RelayPayload::decode(&bytes, root, &network)
-            })
-            .await??;
-            Ok(Arc::new(payload))
-        }
-    })
+    race_sources(
+        &sources,
+        deadline,
+        &notify,
+        Resource::Block,
+        Duration::ZERO,
+        |source| {
+            let network = network.clone();
+            let decoders = decoders.clone();
+            let root = announcement.root;
+            let stats = stats.clone();
+            async move {
+                let bytes = source
+                    .read_measured(&format!("/eth/v2/beacon/blocks/{root}"), "block", stats)
+                    .await?;
+                let permit = decoders.acquire_owned().await?;
+                let payload = tokio::task::spawn_blocking(move || {
+                    // A canceled request must not release capacity while its decoder still runs.
+                    let _permit = permit;
+                    RelayPayload::decode(&bytes, root, &network)
+                })
+                .await??;
+                Ok(Arc::new(payload))
+            }
+        },
+    )
     .await
 }
 
@@ -660,13 +736,18 @@ async fn run_generation(
                 };
                 blobs_in_progress.remove(&work.payload.beacon_root);
                 match result {
-                    Ok(Ok((payload, blob_source))) => {
+                    Ok(Ok(ConsensusAcquisition::Complete(payload, blob_source))) => {
                         { let mut s = stats.lock(); s.consensus_acquired += 1; s.consensus_acquisition.success(work.payload.slot, "complete blobs and proofs acquired");
                           s.record(Record::BlobReady { root: work.payload.beacon_root, slot: work.payload.slot,
                             mode: work.mode, mode_epoch: work.mode_epoch, blob_count: work.payload.blob_commitments.len(), source: blob_source, ready_us: stats::micros(work.first_seen.elapsed()) });
                           s.consensus_acquisition_latency.record(stats::micros(work.first_seen.elapsed())); }
                         consensus_cache.insert(payload.block.beacon_root, payload.clone()).await;
                         let _ = consensus_delivery.send(Arc::new(ConsensusWork { work, payload }));
+                    }
+                    Ok(Ok(ConsensusAcquisition::SkippedAllTargetsKnown)) => {
+                        let mut s = stats.lock();
+                        s.consensus_blob_skipped += 1;
+                        s.consensus_acquisition.success(work.payload.slot, "all consensus targets already known");
                     }
                     _ => { let mut s = stats.lock(); s.consensus_acquisition_failed += 1; s.consensus_acquisition.failure("complete blobs or proofs unavailable");
                         s.record(Record::AcquisitionFailed { root: work.payload.beacon_root, slot: work.payload.slot, consensus: true, started_mode_epoch: work.mode_epoch }); },

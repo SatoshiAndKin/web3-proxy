@@ -52,6 +52,9 @@ struct Attempt {
 }
 
 impl ConsensusTarget {
+    pub(super) fn confirmed(&self, root: B256) -> bool {
+        self.confirmed.contains_key(&root)
+    }
     pub fn new(name: String, config: &config::ConsensusTarget, ttl: Duration) -> Result<Self> {
         Ok(Self {
             name,

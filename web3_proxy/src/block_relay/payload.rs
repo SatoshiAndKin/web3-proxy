@@ -33,6 +33,12 @@ pub struct RelayPayload {
 }
 
 impl RelayPayload {
+    pub fn versioned_hashes(&self) -> Vec<B256> {
+        self.blob_commitments
+            .iter()
+            .map(|commitment| kzg_to_versioned_hash(commitment.as_slice()))
+            .collect()
+    }
     pub fn decode(bytes: &[u8], expected_root: B256, network: &Network) -> Result<Self> {
         // Check the version before decoding a body whose format a future fork can change.
         #[derive(Deserialize)]

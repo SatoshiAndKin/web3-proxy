@@ -77,7 +77,11 @@ the server rejects the combined topics. A gossip event can precede full-block
 availability. An imported event wakes the pending fetch after a 404. Reads race
 all verified sources; the first **verified full block**, not the first HTTP
 response, wins. Retry ready sources while slower requests remain pending. A
-reconnect reconciles up to eight recent ancestors by root.
+reconnect reconciles up to eight recent ancestors by root. Configure a source's
+`cost_class` and `resources` explicitly. Free sources start immediately. Metered
+sources wait for `block_relay.rpc.metered_fallback_delay_ms` (500 ms by default)
+and receive at most two dispatched attempts per resource. A source that lacks the
+`blob` resource is never asked for complete blobs.
 
 The relay checks the complete Beacon root, execution block hash, payload
 timestamp, and transaction/blob-commitment order. It includes the parent Beacon

@@ -1,5 +1,5 @@
 use super::{
-    config::{Network, Source, SLOTS_PER_EPOCH},
+    config::{CostClass, Network, Resource, Source, SLOTS_PER_EPOCH},
     transport,
 };
 use alloy::primitives::B256;
@@ -24,6 +24,8 @@ pub(super) async fn race_sources<T, F, Fut>(
     sources: &[Arc<BeaconSource>],
     deadline: Instant,
     notify: &tokio::sync::Notify,
+    resource: Resource,
+    metered_delay: Duration,
     read: F,
 ) -> Result<(T, String)>
 where
@@ -32,14 +34,28 @@ where
 {
     let mut race = futures_util::stream::FuturesUnordered::new();
     let mut in_flight = vec![false; sources.len()];
+    let started = Instant::now();
     let mut retry = true;
-    let mut delay = Duration::from_millis(20);
-    let mut next_retry = Instant::now() + delay;
+    let mut delay = Duration::from_millis(50);
+    let mut next_retry = started + delay;
+    let mut metered_attempts = 0u8;
+    let mut metered_in_flight = false;
     loop {
         if retry {
             for (index, source) in sources.iter().enumerate() {
-                if in_flight[index] || !source.verified.load(Ordering::Acquire) {
+                if in_flight[index]
+                    || !source.verified.load(Ordering::Acquire)
+                    || !source.resources.contains(&resource)
+                    || (source.cost_class == CostClass::Metered
+                        && (metered_in_flight
+                            || Instant::now() < started + metered_delay
+                            || metered_attempts >= 2))
+                {
                     continue;
+                }
+                if source.cost_class == CostClass::Metered {
+                    metered_attempts += 1;
+                    metered_in_flight = true;
                 }
                 in_flight[index] = true;
                 let future = read(source.clone());
@@ -51,12 +67,15 @@ where
             _ = tokio::time::sleep_until(deadline) => anyhow::bail!("acquisition deadline"),
             Some((index, result)) = race.next(), if !race.is_empty() => {
                 in_flight[index] = false;
+                if sources[index].cost_class == CostClass::Metered {
+                    metered_in_flight = false;
+                }
                 if let Ok(value) = result { return Ok((value, sources[index].name.clone())); }
             }
             _ = notify.notified() => retry = true,
             _ = tokio::time::sleep_until(next_retry) => {
                 retry = true;
-                delay = (delay * 2).min(Duration::from_millis(200));
+                delay = (delay * 2).min(Duration::from_secs(1));
                 next_retry = Instant::now() + delay;
             }
         }
@@ -76,6 +95,8 @@ pub struct Announcement {
 pub struct BeaconSource {
     pub name: String,
     pub(super) http: transport::BeaconHttp,
+    pub(super) cost_class: CostClass,
+    pub(super) resources: Vec<Resource>,
     pub verified: AtomicBool,
 }
 impl BeaconSource {
@@ -97,6 +118,8 @@ impl BeaconSource {
         Ok(Self {
             name,
             http: transport::BeaconHttp::new(&config.beacon_url, &config.headers)?,
+            cost_class: config.cost_class,
+            resources: config.resources.clone(),
             verified: AtomicBool::new(false),
         })
     }

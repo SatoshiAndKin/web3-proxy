@@ -1,4 +1,5 @@
 //! Private, bounded HTTP transport. Never put URLs or remote response text in errors.
+use alloy::primitives::{Bytes, B256};
 use alloy_rpc_types_engine::{Claims, JwtSecret, PayloadStatus};
 use anyhow::{ensure, Result};
 use futures_util::StreamExt;
@@ -193,6 +194,29 @@ impl Rpc {
         payload: &super::payload::RelayPayload,
     ) -> Result<PayloadStatus> {
         self.send(payload.body.clone(), ENGINE_TIMEOUT).await
+    }
+    pub async fn get_blobs_v2(&self, hashes: &[B256]) -> Result<Option<Vec<Bytes>>> {
+        #[derive(Deserialize)]
+        struct Blob {
+            blob: Bytes,
+            #[serde(rename = "versionedHash")]
+            versioned_hash: B256,
+        }
+        let result: Option<Vec<Blob>> = self.call("engine_getBlobsV2", (hashes,)).await?;
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        ensure!(
+            result.len() == hashes.len(),
+            "incomplete engine blob response"
+        );
+        for (item, expected) in result.iter().zip(hashes) {
+            ensure!(
+                item.versioned_hash == *expected,
+                "engine blob hash mismatch"
+            );
+        }
+        Ok(Some(result.into_iter().map(|item| item.blob).collect()))
     }
     pub async fn send<T: DeserializeOwned>(
         &self,

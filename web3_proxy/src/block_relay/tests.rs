@@ -516,6 +516,7 @@ fn relay_config(
         state_dir: directory.path().to_owned(),
         network,
         cache_max_bytes: 1024 * 1024,
+        rpc: config::RpcPolicy::default(),
         consensus_targets: BTreeMap::new(),
         proof_workers: 2,
         sources: sources
@@ -526,6 +527,8 @@ fn relay_config(
                     config::Source {
                         beacon_url: url.to_string(),
                         headers: BTreeMap::new(),
+                        cost_class: config::CostClass::Free,
+                        resources: vec![config::Resource::Block, config::Resource::Blob],
                     },
                 )
             })
@@ -710,6 +713,8 @@ async fn rejects_wrong_network_capability_and_bad_config_without_losing_current_
         &config::Source {
             beacon_url: server.url.clone(),
             headers: BTreeMap::new(),
+            cost_class: config::CostClass::Free,
+            resources: vec![config::Resource::Block, config::Resource::Blob],
         },
     )
     .unwrap();

@@ -26,6 +26,25 @@ pub struct Config {
     pub proof_workers: usize,
     #[serde(default = "cache_bytes")]
     pub cache_max_bytes: u64,
+    #[serde(default)]
+    pub rpc: RpcPolicy,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RpcPolicy {
+    /// Delay before the first request to a metered source.
+    #[serde(default = "metered_fallback_delay_ms")]
+    pub metered_fallback_delay_ms: u64,
+}
+impl Default for RpcPolicy {
+    fn default() -> Self {
+        Self {
+            metered_fallback_delay_ms: metered_fallback_delay_ms(),
+        }
+    }
+}
+fn metered_fallback_delay_ms() -> u64 {
+    500
 }
 fn proof_workers() -> usize {
     2
@@ -83,6 +102,26 @@ pub struct Source {
     pub beacon_url: String,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cost_class: CostClass,
+    #[serde(default = "default_source_resources")]
+    pub resources: Vec<Resource>,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CostClass {
+    #[default]
+    Free,
+    Metered,
+}
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Resource {
+    Block,
+    Blob,
+}
+fn default_source_resources() -> Vec<Resource> {
+    vec![Resource::Block, Resource::Blob]
 }
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -153,6 +192,10 @@ impl Config {
             "relay cache capacity must be positive"
         );
         ensure!(
+            self.rpc.metered_fallback_delay_ms <= self.network.seconds_per_slot * 1000,
+            "metered fallback delay must fit within one slot"
+        );
+        ensure!(
             !self.network.forks.is_empty(),
             "relay requires a fork schedule"
         );
@@ -183,6 +226,16 @@ impl Config {
                     beacons.insert(endpoint.to_string()),
                     "duplicate Beacon target endpoint"
                 );
+            }
+        }
+        for source in self.sources.values() {
+            ensure!(
+                !source.resources.is_empty(),
+                "source must advertise a resource"
+            );
+            let mut resources = std::collections::BTreeSet::new();
+            for resource in &source.resources {
+                ensure!(resources.insert(*resource), "source resource listed twice");
             }
         }
         Ok(())
