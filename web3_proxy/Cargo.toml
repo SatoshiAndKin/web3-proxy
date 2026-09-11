@@ -11,6 +11,7 @@ default = []
 [dependencies]
 deduped_broadcast = { path = "../deduped_broadcast" }
 latency = { path = "../latency" }
+nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 
 # TODO: regex has several "perf" features that we might want to use
 anyhow = { version = "1.0.104", features = ["backtrace"] }

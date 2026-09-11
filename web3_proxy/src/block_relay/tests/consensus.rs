@@ -399,6 +399,8 @@ fn consensus_work(
     let now = Instant::now();
     let work = Arc::new(Work {
         first_seen_unix_us: stats::unix_micros(),
+        first_seen_us: 0,
+        mode_epoch: 0,
         payload: block.clone(),
         first_seen: now,
         acquired: now,

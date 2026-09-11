@@ -14,12 +14,46 @@ use tokio::{
 
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-pub(super) type Sender = mpsc::Sender<Record>;
+pub(super) type Sender = mpsc::Sender<super::telemetry::Envelope>;
 
 #[derive(Serialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub(super) enum Record {
+    Configured {
+        sources: Vec<String>,
+        execution_targets: Vec<String>,
+        consensus_targets: Vec<String>,
+        genesis_time: u64,
+        seconds_per_slot: u64,
+    },
+    ModeChanged {
+        previous: super::config::Mode,
+    },
+    Acquired {
+        started_mode_epoch: u64,
+        root: alloy::primitives::B256,
+        hash: alloy::primitives::B256,
+        slot: u64,
+        number: u64,
+        first_seen_us: u64,
+        acquired_us: u64,
+        source: String,
+        blob_count: usize,
+    },
+    SubmissionStarted {
+        attempt_id: u64,
+        layer: super::stats::Layer,
+        root: alloy::primitives::B256,
+        hash: alloy::primitives::B256,
+        slot: u64,
+        target: String,
+        serialized_request_bytes: usize,
+        canonical_before_call: Option<super::telemetry::Head>,
+    },
     Submission {
+        attempt_id: u64,
+        started_mode: super::config::Mode,
+        started_mode_epoch: u64,
         layer: super::stats::Layer,
         root: alloy::primitives::B256,
         hash: alloy::primitives::B256,
@@ -33,6 +67,8 @@ pub(super) enum Record {
         root: alloy::primitives::B256,
         slot: u64,
         mode: super::config::Mode,
+        mode_epoch: u64,
+        blob_count: usize,
         source: String,
         ready_us: u64,
     },
@@ -42,8 +78,30 @@ pub(super) enum Record {
         source: String,
         event: &'static str,
         at_unix_us: u64,
+        observed_us: u64,
+    },
+    Disposition {
+        layer: super::stats::Layer,
+        root: alloy::primitives::B256,
+        hash: alloy::primitives::B256,
+        slot: u64,
+        target: String,
+        reason: &'static str,
+    },
+    Head {
+        target: String,
+        head: super::telemetry::Head,
+    },
+    Resources {
+        resources: super::telemetry::Resources,
+        started_mode_epoch: u64,
+    },
+    ModeTotals {
+        totals: sonic_rs::Value,
+        losses: sonic_rs::Value,
     },
     AcquisitionFailed {
+        started_mode_epoch: u64,
         root: alloy::primitives::B256,
         slot: u64,
         consensus: bool,
@@ -102,7 +160,7 @@ impl Recording {
                 .await?,
         ))
     }
-    async fn append(&mut self, record: &Record) -> Result<()> {
+    async fn append(&mut self, record: &super::telemetry::Envelope) -> Result<()> {
         let mut bytes = sonic_rs::to_vec(record)?;
         bytes.push(b'\n');
         let size = u64::try_from(bytes.len())?;
@@ -129,7 +187,7 @@ impl Recording {
     /// a bounded rate; consume and count dropped records while storage is unavailable.
     pub async fn supervise(
         state_dir: PathBuf,
-        mut records: mpsc::Receiver<Record>,
+        mut records: mpsc::Receiver<super::telemetry::Envelope>,
         stats: super::stats::Shared,
     ) {
         let mut writer: Option<Self> = None;
@@ -206,9 +264,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut recording = Recording::open(directory.path()).await.unwrap();
         let record = Record::AcquisitionFailed {
+            started_mode_epoch: 0,
             root: alloy::primitives::B256::ZERO,
             slot: 1,
             consensus: false,
+        };
+        let record = super::super::telemetry::Envelope {
+            context: super::super::telemetry::Telemetry::default().context(Default::default()),
+            event: record,
         };
         recording.append(&record).await.unwrap();
         recording.file_bytes = MAX_FILE_BYTES;

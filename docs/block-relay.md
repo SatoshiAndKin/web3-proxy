@@ -130,7 +130,9 @@ Set `state_dir` to an absolute path for private measurement files. Different
 forwarders use their own directories. The directory should survive container
 replacement. Changing it requires a process restart. Do not list one physical
 Engine endpoint through multiple DNS aliases. Pair each Engine URL with the
-direct RPC URL of that execution instance.
+direct RPC URL and `ws_url` of that execution instance. The WebSocket endpoint
+must support `eth_subscribe` with `newHeads`. Its independent observer runs in
+both modes. A failed or silent stream reconnects without delaying delivery.
 
 ## Run against the existing stack
 
@@ -215,7 +217,56 @@ Private diagnostic records use the tracing target
 `web3_proxy::block_relay::samples`. Enable its debug level and retain those logs
 privately. The service also retains the last 1,024 records in memory for callers
 of `BlockRelay::samples()`. Public `/status` omits those records, URLs, headers,
-JWT paths, and JWT contents. Its histograms are cumulative for the process lifetime and mix modes; do not use them as the trial comparison.
+JWT paths, and JWT contents. The older top-level histograms are cumulative for the
+process lifetime and mix modes. Use `telemetry.modes.observe` and
+`telemetry.modes.inject` for separate totals. Those totals reset on a configuration
+generation change. A mode-only reload retains both sets of totals.
+
+Every new JSONL row has a `context`: schema `1`, process `session`, increasing
+`sequence`, monotonic and Unix microseconds, configuration `generation`,
+`mode_epoch`, and `mode`. A mode epoch changes on every mode or config change.
+The process session changes on restart. Never subtract monotonic times or CPU
+counters from different sessions. Sequence gaps and status drop counters expose
+missing records. Existing files remain untouched; old rows without this context
+cannot support the new timing analysis.
+
+The same instrumentation runs in observe and inject:
+
+| Measurement | Evidence and limit |
+| --- | --- |
+| `acquired`, `blob_ready` | First source announcement, verified payload availability, complete blobs and valid proofs. Execution does not wait for blobs. |
+| `head` | Independent execution `newHeads` notification, hash, height, block timestamp, observer time and connection ID. This includes network delivery delay. It does not gate or suppress injection. |
+| `submission_started`, `submission` | Unique attempt ID, layer, target, block, serialized request bytes, call start, result and elapsed time. A timeout stays `unknown`. A missing completion is missing evidence. |
+| `observation` | Import and canonical confirmation through direct RPC or Beacon reads, probe count/errors, first probe start, last missing query and first ready response. |
+| `disposition` | Observe mode, deadline, confirmed already-known skip, duplicate suppression or invalid ancestry. These are different outcomes. Queue loss remains visible in counters. |
+| `resources` | Process CPU time across all threads, current RSS on Linux and process peak RSS. Sampled every five seconds on the blocking pool. |
+| `mode_totals` | Per-mode counts, source fetch attempts/results/cancellations/bytes, submission bytes, histograms and process loss counters. Written each minute, before a mode change and at graceful shutdown. |
+
+`telemetry.head_streams` and `telemetry.resource_status` show current measurement
+conditions and historical errors. Check their last progress time. Measurement
+failure does not stop useful forwarding. The queue, file and storage bounds
+apply to all new records too.
+
+Mode totals exclude block latencies and request completions that cross a mode
+epoch. Raw rows retain their origin epoch for diagnosis. CPU totals exclude
+intervals that cross a mode change or failed sample. Source fetch counters charge
+a request to its starting mode and count cancelled race losers. Byte counts cover
+successful fetched bodies and serialized submission bodies. They exclude partial
+cancelled reads, HTTP/TLS overhead, probes and event streams. CPU includes this
+measurement work. When embedded in `proxyd`, process CPU and memory also include
+the proxy; use the standalone forwarder to measure its separate resource cost.
+
+A matching head or completed readiness response **before call start** proves
+that this call was redundant for that target's initial import. An import observed
+after a call does not prove that the call caused it. Native peers, Lighthouse and
+another forwarder can import the same block. `VALID` verifies validity and may
+describe an already-known block. Keep these categories separate.
+
+Compare verified payload time with the independent head observation on the same
+process clock. A positive lead shows a possible delivery opportunity. A negative
+lead means the target's head arrived first. Neither value measures time saved.
+Block timestamp to head observation uses the wall clock; verify clock quality
+before comparing that value across hosts or periods.
 
 Each record includes its execution/consensus layer, Beacon root, execution hash and slot, announcement source, successful
 fetch source, mode, acquisition time, target, last confirmed absence, first RPC

@@ -101,6 +101,14 @@ pub enum Layer {
     Execution,
     Consensus,
 }
+impl Layer {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::Consensus => "consensus",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Observation {
@@ -140,6 +148,7 @@ impl Serialize for Distribution {
 
 #[derive(Default, Serialize)]
 pub struct Stats {
+    pub telemetry: super::telemetry::Telemetry,
     pub enabled: bool,
     pub supervisor_running: bool,
     pub acquisition: Endpoint,
@@ -186,6 +195,12 @@ pub struct Sample {
     pub announcement_source: String,
     pub event: &'static str,
     pub mode: Mode,
+    pub mode_epoch: u64,
+    pub first_seen_us: u64,
+    pub first_probe_us: Option<u64>,
+    pub first_ready_probe_started_us: Option<u64>,
+    pub probes: u64,
+    pub probe_errors: u64,
     /// Wall clock only joins records across observers. Durations use Instant.
     pub first_seen_unix_us: u64,
     pub acquired_us: u64,
@@ -205,6 +220,12 @@ impl Sample {
             announcement_source: work.announcement_source.clone(),
             event: work.event,
             mode: work.mode,
+            mode_epoch: work.mode_epoch,
+            first_seen_us: work.first_seen_us,
+            first_probe_us: None,
+            first_ready_probe_started_us: None,
+            probes: 0,
+            probe_errors: 0,
             first_seen_unix_us: work.first_seen_unix_us,
             acquired_us: micros(work.acquired.duration_since(work.first_seen)),
             target: target.into(),
@@ -215,6 +236,21 @@ impl Sample {
     }
 }
 impl Stats {
+    pub fn change_mode(&mut self, next: Mode) {
+        if self.mode == next {
+            return;
+        }
+        let recording = self.recorder.is_some();
+        if recording {
+            self.record_totals();
+        }
+        let previous = self.mode;
+        self.mode = next;
+        self.telemetry.mode_epoch += 1;
+        if recording {
+            self.record(super::recording::Record::ModeChanged { previous });
+        }
+    }
     fn fresh(&self, endpoint: &Endpoint) -> bool {
         endpoint.fresh(std::time::Duration::from_secs(self.seconds_per_slot * 3))
             && endpoint.last_progress_slot >= self.latest_source_slot.saturating_sub(3)
@@ -300,6 +336,89 @@ impl Stats {
         source.success(slot, "recent block event");
     }
     pub fn record(&mut self, record: super::recording::Record) {
+        use super::recording::Record;
+        match &record {
+            Record::Acquired {
+                acquired_us,
+                started_mode_epoch,
+                ..
+            } if *started_mode_epoch == self.telemetry.mode_epoch => {
+                let mode = self.telemetry.mode(self.mode);
+                mode.acquired += 1;
+                mode.acquisition.record(*acquired_us);
+            }
+            Record::BlobReady {
+                mode,
+                mode_epoch,
+                blob_count,
+                ready_us,
+                ..
+            } if *mode_epoch == self.telemetry.mode_epoch => {
+                let mode = self.telemetry.mode(*mode);
+                mode.blob_complete += 1;
+                mode.blobs += *blob_count as u64;
+                mode.blob_ready.record(*ready_us);
+            }
+            Record::AcquisitionFailed {
+                consensus,
+                started_mode_epoch,
+                ..
+            } if *started_mode_epoch == self.telemetry.mode_epoch => {
+                let mode = self.telemetry.mode(self.mode);
+                if *consensus {
+                    mode.blob_failed += 1;
+                } else {
+                    mode.acquisition_failed += 1;
+                }
+            }
+            Record::SubmissionStarted {
+                layer,
+                target,
+                serialized_request_bytes,
+                canonical_before_call,
+                ..
+            } => {
+                let target = self.telemetry.target(self.mode, *layer, target);
+                target.calls += 1;
+                target.serialized_request_bytes += *serialized_request_bytes as u64;
+                target.canonical_before_call += u64::from(canonical_before_call.is_some());
+            }
+            Record::Submission {
+                layer,
+                target,
+                outcome,
+                elapsed_us,
+                started_mode,
+                started_mode_epoch,
+                ..
+            } if *started_mode_epoch == self.telemetry.mode_epoch => {
+                let target = self.telemetry.target(*started_mode, *layer, target);
+                *target.outcomes.entry(outcome.clone()).or_default() += 1;
+                target.request_duration.record(*elapsed_us);
+            }
+            Record::Submission { .. }
+            | Record::BlobReady { .. }
+            | Record::Acquired { .. }
+            | Record::AcquisitionFailed { .. } => self.telemetry.mixed_mode_samples += 1,
+            Record::Disposition {
+                layer,
+                target,
+                reason,
+                ..
+            } => {
+                *self
+                    .telemetry
+                    .target(self.mode, *layer, target)
+                    .dispositions
+                    .entry((*reason).into())
+                    .or_default() += 1;
+            }
+            _ => {}
+        }
+        let record = super::telemetry::Envelope {
+            context: self.telemetry.context(self.mode),
+            event: record,
+        };
         if self
             .recorder
             .as_ref()
@@ -310,7 +429,56 @@ impl Stats {
                 .failure("measurement queue full or unavailable");
         }
     }
+    pub fn disposition(
+        &mut self,
+        layer: Layer,
+        payload: &super::payload::RelayPayload,
+        target: &str,
+        reason: &'static str,
+    ) {
+        self.record(super::recording::Record::Disposition {
+            layer,
+            root: payload.beacon_root,
+            hash: payload.hash,
+            slot: payload.slot,
+            target: target.into(),
+            reason,
+        });
+    }
+    pub fn record_totals(&mut self) {
+        let totals = sonic_rs::to_value(&self.telemetry.modes).expect("serializable mode totals");
+        // These are process counters. Report deltas within a capture; never subtract
+        // counters from different sessions. Missing rows are never successful work.
+        let losses = sonic_rs::json!({
+            "recording_dropped": self.recording_dropped,
+            "recording_errors": self.recording.errors,
+            "acquisition_dropped": self.acquisition_dropped,
+            "consensus_acquisition_dropped": self.consensus_acquisition_dropped,
+            "observation_dropped": self.observation_dropped,
+            "mixed_mode_samples": self.telemetry.mixed_mode_samples,
+            "execution_queue_dropped": self.execution_targets.iter().map(|(name, target)| (name, target.queue_dropped)).collect::<BTreeMap<_, _>>(),
+            "consensus_queue_dropped": self.consensus_targets.iter().map(|(name, target)| (name, target.queue_dropped)).collect::<BTreeMap<_, _>>(),
+        });
+        self.record(super::recording::Record::ModeTotals { totals, losses });
+    }
     pub fn sample(&mut self, sample: Sample) {
+        if sample.mode_epoch == self.telemetry.mode_epoch && sample.mode == self.mode {
+            let target = self
+                .telemetry
+                .target(sample.mode, sample.layer, &sample.target);
+            target.observations += 1;
+            if let Some(ready) = sample.first_ready_us {
+                target.ready.record(ready);
+                target.left_censored += u64::from(sample.last_missing_us.is_none());
+            } else {
+                target.missing += 1;
+            }
+            if let Some(canonical) = sample.canonical_us {
+                target.canonical.record(canonical);
+            }
+        } else {
+            self.telemetry.mixed_mode_samples += 1;
+        }
         self.record(super::recording::Record::Observation(sample.clone()));
         tracing::debug!(target: "web3_proxy::block_relay::samples", sample = %sonic_rs::to_string(&sample).unwrap_or_default(), "block relay observation");
         if self.samples.len() == 1024 {

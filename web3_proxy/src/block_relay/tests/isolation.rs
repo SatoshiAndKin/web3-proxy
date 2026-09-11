@@ -262,6 +262,7 @@ async fn recording_recovers_after_storage_repair_without_clearing_error_history(
     ));
     until(|| stats.lock().recording.errors == 1).await;
     stats.lock().record(recording::Record::AcquisitionFailed {
+        started_mode_epoch: 0,
         root: B256::ZERO,
         slot: 1,
         consensus: false,
@@ -276,12 +277,14 @@ async fn recording_recovers_after_storage_repair_without_clearing_error_history(
     .await
     .unwrap();
     let expected = recording::Record::AcquisitionFailed {
+        started_mode_epoch: 0,
         root: B256::with_last_byte(2),
         slot: 2,
         consensus: false,
     };
-    let expected = sonic_rs::to_string(&expected).unwrap();
+    let expected = sonic_rs::to_value(&expected).unwrap();
     stats.lock().record(recording::Record::AcquisitionFailed {
+        started_mode_epoch: 0,
         root: B256::with_last_byte(2),
         slot: 2,
         consensus: false,
@@ -294,10 +297,18 @@ async fn recording_recovers_after_storage_repair_without_clearing_error_history(
         .unwrap()
         .collect();
     assert_eq!(files.len(), 1);
+    let line = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+    assert_eq!(line.lines().count(), 1);
+    let mut recorded: sonic_rs::Value = sonic_rs::from_str(line.trim()).unwrap();
+    assert_eq!(recorded["context"]["schema"], json!(1));
     assert_eq!(
-        std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap(),
-        format!("{expected}\n")
+        recorded["context"]["sequence"],
+        json!(2),
+        "lost first record stays visible"
     );
+    use sonic_rs::JsonValueMutTrait;
+    recorded.as_object_mut().unwrap().remove(&"context");
+    assert_eq!(recorded, expected);
     assert_eq!(
         std::fs::read_to_string(directory.path().join("history")).unwrap(),
         "preserve"

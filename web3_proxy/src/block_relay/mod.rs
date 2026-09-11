@@ -8,6 +8,7 @@ mod source;
 mod stats;
 mod status;
 mod target;
+mod telemetry;
 pub mod transport;
 mod tree_hash;
 pub use service::BlockRelay;

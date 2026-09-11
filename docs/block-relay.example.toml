@@ -47,11 +47,13 @@ beacon_url = "http://127.0.0.1:5067"
 [block_relay.execution_targets.geth]
 engine_url = "http://127.0.0.1:9051"
 rpc_url = "http://127.0.0.1:8545"
+ws_url = "ws://127.0.0.1:8546"
 jwt_secret_path = "${GETH_JWT_PATH}"
 
 [block_relay.execution_targets.reth]
 engine_url = "http://127.0.0.1:8557"
 rpc_url = "http://127.0.0.1:8547"
+ws_url = "ws://127.0.0.1:8548"
 jwt_secret_path = "${RETH_JWT_PATH}"
 
 [block_relay.consensus_targets.lighthouse_geth]
