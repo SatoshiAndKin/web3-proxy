@@ -145,8 +145,18 @@ impl BeaconHttp {
             .get_or_init(|| async { self.fetch_bytes(path).await.map_err(|e| e.to_string()) })
             .await
             .clone();
-        self.inner.shared_reads.lock().await.remove(&key);
+        self.remove_finished_read(&key, &shared).await;
         result.map_err(|e| anyhow::anyhow!(e))
+    }
+    async fn remove_finished_read(&self, key: &str, shared: &Arc<SharedRead>) {
+        let mut reads = self.inner.shared_reads.lock().await;
+        // A late waiter must not remove a newer read for the same key.
+        if reads
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, shared))
+        {
+            reads.remove(key);
+        }
     }
     async fn fetch_bytes(&self, path: &str) -> Result<Option<bytes::Bytes>> {
         let pool = if path.starts_with("/eth/v1/beacon/blobs/") {
@@ -396,6 +406,108 @@ impl Rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn old_waiter_cannot_remove_replacement_read() {
+        let http = BeaconHttp::new("http://localhost", &BTreeMap::new()).unwrap();
+        let key = "/eth/v1/beacon/headers/head";
+        let old = Arc::new(SharedRead {
+            result: tokio::sync::OnceCell::new(),
+        });
+        old.result.set(Ok(None)).unwrap();
+        http.inner
+            .shared_reads
+            .lock()
+            .await
+            .insert(key.into(), old.clone());
+        let late_waiter = old.clone();
+        http.remove_finished_read(key, &old).await;
+        assert!(!http.inner.shared_reads.lock().await.contains_key(key));
+
+        let replacement = Arc::new(SharedRead {
+            result: tokio::sync::OnceCell::new(),
+        });
+        http.inner
+            .shared_reads
+            .lock()
+            .await
+            .insert(key.into(), replacement.clone());
+        http.remove_finished_read(key, &late_waiter).await;
+        let current = http.inner.shared_reads.lock().await.get(key).cloned();
+        assert!(current.is_some_and(|current| Arc::ptr_eq(&current, &replacement)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_beacon_reads_share_responses_but_not_credentials() {
+        use axum::{
+            body::Body,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use tokio::sync::{mpsc, oneshot};
+        let (tx, mut requests) = mpsc::unbounded_channel();
+        let server = Router::new().route(
+            "/read",
+            get(move |headers: HeaderMap| {
+                let tx = tx.clone();
+                async move {
+                    let (reply, rx) = oneshot::channel::<(StatusCode, Body)>();
+                    tx.send((headers["x-token"].to_str().unwrap().to_owned(), reply))
+                        .unwrap();
+                    rx.await.unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let mut registry = BeaconReadCoordinators::default();
+        let headers = BTreeMap::from([("x-token".into(), "first".into())]);
+        let first = registry.get_or_insert(&url, &headers, "mainnet").unwrap();
+        let same = registry.get_or_insert(&url, &headers, "mainnet").unwrap();
+        let other = registry
+            .get_or_insert(
+                &url,
+                &BTreeMap::from([("x-token".into(), "second".into())]),
+                "mainnet",
+            )
+            .unwrap();
+        for status in [
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let a = first.get_bytes("/read");
+            let b = same.get_bytes("/read");
+            let c = other.get_bytes("/read");
+            let control = async {
+                let mut identities = Vec::new();
+                for _ in 0..2 {
+                    let (identity, reply) = requests.recv().await.unwrap();
+                    identities.push(identity);
+                    reply.send((status, Body::from("shared body"))).unwrap();
+                }
+                identities.sort();
+                assert_eq!(identities, ["first", "second"]);
+            };
+            let (a, b, c, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(a, b, c, control)
+            })
+            .await
+            .unwrap();
+            let expected = match status {
+                StatusCode::OK => Ok(Some(bytes::Bytes::from_static(b"shared body"))),
+                StatusCode::NOT_FOUND => Ok(None),
+                _ => Err("HTTP status 429".to_owned()),
+            };
+            for result in [a, b, c] {
+                assert_eq!(result.map_err(|e| e.to_string()), expected);
+            }
+            assert!(requests.try_recv().is_err());
+        }
+        server.abort();
+    }
 
     #[test]
     fn endpoint_identity_normalizes_url_but_keeps_credentials_and_networks_separate() {
