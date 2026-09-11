@@ -17,6 +17,7 @@ anyhow = { version = "1.0.104", features = ["backtrace"] }
 alloy = { version = "2.4.1", default-features = false, features = [
     "consensus",
     "eips",
+    "kzg",
     "node-bindings",
     "provider-http",
     "provider-ws-ring",
@@ -27,6 +28,10 @@ alloy = { version = "2.4.1", default-features = false, features = [
     "signer-local",
     "std",
 ] }
+alloy-rpc-types-beacon = { version = "=2.4.1", features = ["ssz"] }
+alloy-rpc-types-engine = { version = "=2.4.1", features = ["jwt-aws-lc-rs"] }
+eventsource-stream = "0.2.3"
+tree_hash = "0.12"
 arc-swap = { version = "1.9.2" }
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
 async-stream = "0.3.6"
@@ -60,8 +65,9 @@ serde-inline-default = "1.0.2"
 serde_json = { version = "1.0.151", default-features = false, features = ["raw_value"] }
 shellexpand = { version = "3.1.2", default-features = false, features = ["base-0"] }
 sonic-rs = "0.5.8"
-tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
 tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
 toml = "1.1.4"
 tower-http = { version = "0.7.0", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }
 tower-layer = "0.3.3"
@@ -74,6 +80,7 @@ url = { version = "2.5.8" }
 # check-if-email-exists = "0.9.0"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 test-log = { version = "0.2.21", default-features = false, features = ["trace"] }
 tokio = { version = "1.53.1", default-features = false, features = ["test-util"] }
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}

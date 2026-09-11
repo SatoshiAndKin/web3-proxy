@@ -26,7 +26,6 @@ use std::{net::SocketAddr, sync::atomic::Ordering};
 use tokio::{
     net::{TcpListener, TcpSocket},
     process::Command,
-    sync::broadcast,
 };
 use tower_http::{cors::CorsLayer, normalize_path::NormalizePathLayer, trace::TraceLayer};
 use tracing::{error, error_span, info, trace_span};
@@ -145,11 +144,8 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
 }
 
 /// Start the frontend server.
-pub async fn serve(
-    app: Arc<App>,
-    mut shutdown_receiver: broadcast::Receiver<()>,
-    shutdown_complete_sender: broadcast::Sender<()>,
-) -> Web3ProxyResult<()> {
+pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
+    let mut shutdown_receiver = app.frontend_shutdown.subscribe();
     // TODO: read config for if fastest/versus should be available publicly. default off
     let router = make_router(app.clone());
 
@@ -188,14 +184,15 @@ pub async fn serve(
 
     app.frontend_port.store(port, Ordering::SeqCst);
 
-    let server = server
+    let shutdown_app = app.clone();
+    let result = server
         // TODO: option to use with_connect_info. we want it in dev, but not when running behind a proxy, but not
         .with_graceful_shutdown(async move {
-            let _ = shutdown_receiver.recv().await;
+            let _ = shutdown_receiver.wait_for(|stopping| *stopping).await;
 
-            if let Some(shutdown_script) = app.config.shutdown_script.as_ref() {
+            if let Some(shutdown_script) = shutdown_app.config.shutdown_script.as_ref() {
                 let shutdown_script = Command::new(shutdown_script)
-                    .args(&app.config.shutdown_script_args)
+                    .args(&shutdown_app.config.shutdown_script_args)
                     .spawn()
                     .expect("failed to execute script");
 
@@ -211,10 +208,14 @@ pub async fn serve(
         })
         .await
         .map_err(Into::into);
-
-    let _ = shutdown_complete_sender.send(());
-
-    server
+    app.frontend_shutdown.send_replace(true);
+    app.frontend_tasks.close();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(23),
+        app.frontend_tasks.wait(),
+    )
+    .await?;
+    result
 }
 
 #[cfg(test)]

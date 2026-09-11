@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod block_number;
+pub mod block_relay;
 pub mod config;
 pub mod errors;
 pub mod frontend;

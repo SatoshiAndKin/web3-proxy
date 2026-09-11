@@ -145,6 +145,9 @@ impl Harness {
         background.abort();
         head_sender.send_replace(Some(head));
         let app = Arc::new(App {
+            frontend_tasks: tokio_util::task::TaskTracker::new(),
+            frontend_shutdown: watch::channel(false).0,
+            block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
             config: AppConfig::default(),
@@ -249,6 +252,64 @@ fn assert_answers(response: Value, count: usize) {
                 .collect()
         )
     );
+}
+
+#[tokio::test]
+async fn frontend_shutdown_rejects_readiness_and_drains_an_active_http_request() {
+    let mut h = Harness::new(1, 64).await;
+    let health = crate::frontend::status::health(State(h.app.clone()))
+        .await
+        .unwrap()
+        .into_response();
+    assert_eq!(health.status(), 200);
+    let mut server = tokio::spawn(crate::frontend::serve(h.app.clone()));
+    let port = timeout(Duration::from_secs(2), async {
+        loop {
+            let port = h.app.frontend_port.load(Ordering::Relaxed);
+            if port != 0 {
+                break port;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/"))
+            .header("x-forwarded-for", "127.0.0.1")
+            .header("content-type", "application/json")
+            .body(sonic_rs::to_vec(&client_call(0)).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    });
+    let incoming = h.next().await;
+    h.app.frontend_shutdown.send_replace(true);
+    let health = crate::frontend::status::health(State(h.app.clone()))
+        .await
+        .unwrap()
+        .into_response();
+    assert_eq!(health.status(), 503);
+    assert!(
+        timeout(Duration::from_millis(30), &mut server)
+            .await
+            .is_err(),
+        "shutdown must wait for the active HTTP request"
+    );
+    incoming.succeed();
+    assert_eq!(
+        request.await.unwrap(),
+        json!({"jsonrpc":"2.0","id":0,"result":"0x0000"})
+    );
+    timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

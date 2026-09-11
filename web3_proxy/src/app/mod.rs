@@ -49,6 +49,10 @@ pub type Web3ProxyJoinHandle<T> = JoinHandle<Web3ProxyResult<T>>;
 /// The application
 // TODO: i'm sure this is more arcs than necessary, but spawning futures makes references hard
 pub struct App {
+    /// One retained shutdown state for HTTP readiness, listeners, and WebSockets.
+    pub frontend_shutdown: watch::Sender<bool>,
+    pub frontend_tasks: tokio_util::task::TaskTracker,
+    pub block_relay: Arc<crate::block_relay::BlockRelay>,
     /// Send requests to the best server available
     pub balanced_rpcs: Arc<Web3Rpcs>,
     /// Send 4337 Abstraction Bundler requests to one of these servers
@@ -132,6 +136,7 @@ impl App {
         frontend_port: Arc<AtomicU16>,
         mut top_config: TopConfig,
         shutdown_sender: broadcast::Sender<()>,
+        frontend_shutdown: watch::Sender<bool>,
         watch_consensus_head_sender: watch::Sender<Option<BlockHeader>>,
     ) -> anyhow::Result<Web3ProxyAppSpawn> {
         let mut config_watcher_shutdown_receiver = shutdown_sender.subscribe();
@@ -233,6 +238,9 @@ impl App {
         let tx_subscriptions = Semaphore::new(1);
 
         let app = Self {
+            frontend_tasks: tokio_util::task::TaskTracker::new(),
+            frontend_shutdown,
+            block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs,
             bundler_4337_rpcs,
             config: top_config.app.clone(),
@@ -247,6 +255,13 @@ impl App {
         };
 
         let app = Arc::new(app);
+
+        let relay = app.block_relay.clone();
+        let relay_shutdown = shutdown_sender.subscribe();
+        important_background_handles.push(tokio::spawn(async move {
+            relay.run(chain_id, relay_shutdown).await;
+            Ok(())
+        }));
 
         if let Err(app) = APP.set(app.clone()) {
             error!(?app, "global APP can only be set once!");
@@ -327,6 +342,12 @@ impl App {
     async fn apply_top_config_rpcs(&self, new_top_config: &TopConfig) -> Web3ProxyResult<()> {
         info!("applying new config");
 
+        let relay = self
+            .block_relay
+            .apply(new_top_config.block_relay.as_ref())
+            .await
+            .web3_context("updating block relay");
+
         let balanced = self
             .balanced_rpcs
             .apply_server_configs(self, &new_top_config.balanced_rpcs)
@@ -349,6 +370,7 @@ impl App {
         balanced?;
         protected?;
         bundler_4337?;
+        relay?;
 
         Ok(())
     }
@@ -1148,6 +1170,9 @@ mod tests {
         let (_, watch_consensus_head_receiver) = watch::channel(None);
 
         Arc::new(App {
+            frontend_tasks: tokio_util::task::TaskTracker::new(),
+            frontend_shutdown: watch::channel(false).0,
+            block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
             config: AppConfig::default(),
@@ -1169,6 +1194,56 @@ mod tests {
         };
         header.inner.number = number;
         BlockHeader::new(Arc::new(header))
+    }
+
+    #[tokio::test]
+    async fn frontend_shutdown_closes_existing_websocket_with_1001_without_a_node() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = app_with_no_backend().await;
+        let mut server = tokio::spawn(crate::frontend::serve(app.clone()));
+        let address = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let port = app.frontend_port.load(std::sync::atomic::Ordering::Relaxed);
+                if port != 0 {
+                    break std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+        let mut headers = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(client.read_u8().await.unwrap());
+                assert!(headers.len() < 8192);
+            }
+        })
+        .await
+        .unwrap();
+        assert!(headers.starts_with(b"HTTP/1.1 101"));
+        app.frontend_shutdown.send_replace(true);
+        let mut prefix = [0; 2];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut prefix))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix[0], 0x88, "expected an unfragmented Close frame");
+        assert!(
+            prefix[1] >= 2 && prefix[1] < 126,
+            "expected a short unmasked server frame"
+        );
+        let mut body = vec![0; usize::from(prefix[1])];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(u16::from_be_bytes([body[0], body[1]]), 1001);
+        tokio::time::timeout(Duration::from_secs(2), &mut server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
     }
 
     #[tokio::test]

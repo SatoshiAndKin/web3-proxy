@@ -10,6 +10,11 @@ All other requests are sent to an RPC server that is currently on the latest blo
 
 Each server has different limits that can be configured. The `soft_limit` is the number of parallel active requests where a server starts to slow down, while the `hard_limit` is where a server starts giving rate limits or other errors.
 
+An optional [block relay](docs/block-relay.md) monitors local and external Beacon
+APIs outside the balanced RPC pool. It can run alone against existing Geth, Reth,
+and other Engine V4 clients. It starts in observe mode; speed gains need a measured
+comparison before enabling injection.
+
 ## Quick development
 
 1. Copy `.env.example` to `.env` and set local secrets.
