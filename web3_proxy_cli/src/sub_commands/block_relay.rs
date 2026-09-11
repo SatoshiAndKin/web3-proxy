@@ -81,7 +81,7 @@ impl BlockRelaySubCommand {
                 run.abort();
                 status.abort();
                 anyhow::bail!(
-                    "relay shutdown deadline exceeded; unresolved Engine requests remain journaled"
+                    "relay shutdown deadline exceeded; unfinished imports remain unknown"
                 );
             }
         }

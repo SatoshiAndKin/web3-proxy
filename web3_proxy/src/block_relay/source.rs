@@ -196,12 +196,12 @@ impl BeaconSource {
         stats: super::stats::Shared,
     ) {
         loop {
-            self.verified.store(false, Ordering::Release);
             match self.validate(&network).await {
                 Ok(()) => {
                     self.verified.store(true, Ordering::Release);
                 }
                 Err(error) => {
+                    self.verified.store(false, Ordering::Release);
                     stats.lock().source_error(&self.name, &error.to_string());
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;

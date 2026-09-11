@@ -21,7 +21,7 @@ async fn repeated_parent_evidence_and_redelivery_do_not_retry_syncing_forever() 
         target.observe(parent.clone(), worker.stats.clone()).await;
         worker.tx.send(child.clone()).unwrap();
     }
-    until(|| worker.stats.lock().execution_targets["a"].skipped_known == 3).await;
+    until(|| worker.stats.lock().execution_targets["a"].suppressed_duplicate == 3).await;
     worker.finish().await;
     assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(2); 2]);
     assert_eq!(rpc.state.lock().max_inflight, 1);
@@ -241,7 +241,7 @@ async fn rejected_repair_ancestor_blocks_the_entire_remaining_chain() {
 }
 
 #[tokio::test]
-async fn equivalent_engine_url_reload_preserves_unknown_import_suspension() {
+async fn equivalent_engine_url_reload_retains_unknown_history_and_delivers_new_work() {
     let network = network();
     let beacon_source = MockBeacon::new(network.clone());
     let beacon_server = Server::beacon(beacon_source.clone()).await;
@@ -275,6 +275,7 @@ async fn equivalent_engine_url_reload_preserves_unknown_import_suspension() {
         beacon_source.state.lock().queries.len() == 2 && beacon_source.events.receiver_count() == 1
     })
     .await;
+    rpc.state.lock().wrong_valid_hash = false;
     block.data.message.body.graffiti = B256::with_last_byte(55);
     let ExecutionPayload::V3(p) = &mut block.data.message.body.execution_payload.0 else {
         unreachable!()
@@ -283,13 +284,16 @@ async fn equivalent_engine_url_reload_preserves_unknown_import_suspension() {
     rehash_execution(&mut block);
     let next_root = beacon_source.add(&block);
     beacon_source.announce("block", next_root, block.data.message.slot);
-    until(|| relay.snapshot()["acquired"].as_u64() == Some(1)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    until(|| relay.snapshot()["execution_targets"]["a"]["valid"].as_u64() == Some(1)).await;
+    assert_eq!(
+        relay.snapshot()["execution_targets"]["a"]["unknown"].as_u64(),
+        Some(1)
+    );
     stop.send(()).unwrap();
     run.await.unwrap();
     assert_eq!(
         rpc.payload_hashes().len(),
-        1,
-        "URL normalization lost the pending Engine import"
+        2,
+        "an unknown import must not block newer work after reload"
     );
 }

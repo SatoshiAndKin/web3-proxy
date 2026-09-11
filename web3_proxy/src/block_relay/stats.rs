@@ -9,18 +9,36 @@ use std::{
 
 pub type Shared = Arc<Mutex<Stats>>;
 
+#[derive(Clone, Copy)]
+pub(super) enum WorkerLayer {
+    Source,
+    Execution,
+    Consensus,
+}
+
 #[derive(Default, Serialize)]
 pub struct Endpoint {
     pub connected: bool,
     pub detail: String,
     pub events: u64,
     pub errors: u64,
+    pub restarts: u64,
     pub last_event_unix_us: Option<u64>,
     pub last_progress_slot: u64,
     #[serde(skip)]
     pub last_progress: Option<tokio::time::Instant>,
 }
 impl Endpoint {
+    pub fn success(&mut self, slot: u64, detail: &str) {
+        self.connected = true;
+        self.detail = detail.into();
+        self.progress(slot);
+    }
+    pub fn failure(&mut self, detail: &str) {
+        self.connected = false;
+        self.errors += 1;
+        self.detail = detail.into();
+    }
     pub fn progress(&mut self, slot: u64) {
         self.last_event_unix_us = Some(unix_micros());
         self.last_progress = Some(tokio::time::Instant::now());
@@ -34,6 +52,7 @@ impl Endpoint {
 #[derive(Serialize, Default)]
 pub struct TargetStats {
     pub health: Endpoint,
+    pub observation: Endpoint,
     pub sent: u64,
     pub valid: u64,
     pub accepted: u64,
@@ -41,6 +60,7 @@ pub struct TargetStats {
     pub invalid: u64,
     pub unknown: u64,
     pub skipped_known: u64,
+    pub suppressed_duplicate: u64,
     pub skipped_invalid_ancestor: u64,
     pub queue_dropped: u64,
     pub repairs: u64,
@@ -56,6 +76,7 @@ pub struct TargetStats {
 #[derive(Serialize, Default)]
 pub struct ConsensusStats {
     pub health: Endpoint,
+    pub observation: Endpoint,
     pub sent: u64,
     pub published: u64,
     pub accepted: u64,
@@ -120,6 +141,10 @@ impl Serialize for Distribution {
 #[derive(Default, Serialize)]
 pub struct Stats {
     pub enabled: bool,
+    pub supervisor_running: bool,
+    pub acquisition: Endpoint,
+    pub consensus_acquisition: Endpoint,
+    pub recording: Endpoint,
     pub mode: Mode,
     pub config_error: Option<String>,
     pub seconds_per_slot: u64,
@@ -190,24 +215,71 @@ impl Sample {
     }
 }
 impl Stats {
+    fn fresh(&self, endpoint: &Endpoint) -> bool {
+        endpoint.fresh(std::time::Duration::from_secs(self.seconds_per_slot * 3))
+            && endpoint.last_progress_slot >= self.latest_source_slot.saturating_sub(3)
+    }
     pub fn ready(&self) -> bool {
-        let freshness = std::time::Duration::from_secs(self.seconds_per_slot * 3);
-        let fresh = |endpoint: &Endpoint| {
-            endpoint.fresh(freshness)
-                && endpoint.last_progress_slot >= self.latest_source_slot.saturating_sub(3)
-        };
         self.enabled
-            && self.config_error.is_none()
-            && self.recording_dropped == 0
-            && self
+            && self.sources.values().any(|s| self.fresh(s))
+            && ((self.fresh(&self.acquisition)
+                && self
+                    .execution_targets
+                    .values()
+                    .any(|t| self.fresh(&t.health)))
+                || (self.fresh(&self.consensus_acquisition)
+                    && self
+                        .consensus_targets
+                        .values()
+                        .any(|t| self.fresh(&t.health))))
+    }
+    pub fn operation(&self) -> &'static str {
+        if !self.ready() {
+            return "unavailable";
+        }
+        if self.config_error.is_some()
+            || self
                 .recorder
                 .as_ref()
-                .is_some_and(|sender| !sender.is_closed())
-            && !self.sources.is_empty()
-            && !(self.execution_targets.is_empty() && self.consensus_targets.is_empty())
-            && self.sources.values().all(fresh)
-            && self.execution_targets.values().all(|t| fresh(&t.health))
-            && self.consensus_targets.values().all(|t| fresh(&t.health))
+                .is_none_or(|sender| sender.is_closed() || sender.capacity() == 0)
+            || !self.recording.fresh(std::time::Duration::from_secs(5))
+            || !self.sources.values().all(|s| self.fresh(s))
+            || !self
+                .execution_targets
+                .values()
+                .all(|t| self.fresh(&t.health) && self.fresh(&t.observation))
+            || !self
+                .consensus_targets
+                .values()
+                .all(|t| self.fresh(&t.health) && self.fresh(&t.observation))
+            || (!self.execution_targets.is_empty() && !self.fresh(&self.acquisition))
+            || (!self.consensus_targets.is_empty() && !self.fresh(&self.consensus_acquisition))
+        {
+            "degraded"
+        } else {
+            "healthy"
+        }
+    }
+    pub fn worker_error(&mut self, layer: WorkerLayer, name: &str, detail: &str) {
+        let endpoint = match layer {
+            WorkerLayer::Source => self.sources.entry(name.into()).or_default(),
+            WorkerLayer::Execution => {
+                &mut self
+                    .execution_targets
+                    .entry(name.into())
+                    .or_default()
+                    .health
+            }
+            WorkerLayer::Consensus => {
+                &mut self
+                    .consensus_targets
+                    .entry(name.into())
+                    .or_default()
+                    .health
+            }
+        };
+        endpoint.failure(detail);
+        endpoint.restarts += 1;
     }
     pub fn source_error(&mut self, name: &str, detail: &str) {
         let source = self.sources.entry(name.to_string()).or_default();
@@ -225,15 +297,17 @@ impl Stats {
         self.latest_source_slot = self.latest_source_slot.max(slot);
         let source = self.sources.entry(name.to_string()).or_default();
         source.events += 1;
-        source.progress(slot);
+        source.success(slot, "recent block event");
     }
     pub fn record(&mut self, record: super::recording::Record) {
         if self
             .recorder
             .as_ref()
-            .is_some_and(|sender| sender.try_send(record).is_err())
+            .is_none_or(|sender| sender.try_send(record).is_err())
         {
             self.recording_dropped += 1;
+            self.recording
+                .failure("measurement queue full or unavailable");
         }
     }
     pub fn sample(&mut self, sample: Sample) {
@@ -260,89 +334,65 @@ pub fn micros(duration: std::time::Duration) -> u64 {
 mod tests {
     use super::*;
     #[tokio::test(start_paused = true)]
-    async fn readiness_requires_recent_events_from_every_source_and_both_target_layers() {
-        let (send, _recv) = tokio::sync::mpsc::channel(1);
-        let mut stats = Stats {
+    async fn health_tracks_useful_layers_and_recovers_without_erasing_history() {
+        let mut s = Stats {
             enabled: true,
             seconds_per_slot: 12,
-            recorder: Some(send),
             ..Default::default()
         };
-        stats.source_connected("local", "block");
-        stats.source_connected("external", "block");
-        stats
-            .execution_targets
-            .entry("el".into())
-            .or_default()
-            .health
-            .connected = true;
-        stats
-            .consensus_targets
-            .entry("cl".into())
-            .or_default()
-            .health
-            .connected = true;
-        assert!(!stats.ready());
-        stats.source_event("local", 10);
-        stats
-            .execution_targets
+        s.source_connected("local", "block");
+        s.source_connected("silent", "block");
+        s.execution_targets.entry("el".into()).or_default();
+        s.consensus_targets.entry("cl".into()).or_default();
+        assert_eq!(s.operation(), "unavailable");
+        s.source_event("local", 10);
+        s.acquisition.success(10, "block");
+        s.execution_targets
             .get_mut("el")
             .unwrap()
             .health
-            .progress(10);
-        stats
-            .consensus_targets
+            .success(10, "Engine");
+        assert!(s.ready());
+        assert_eq!(s.operation(), "degraded");
+        s.recording.failure("disk full");
+        s.recording_dropped = 5;
+        s.execution_targets
+            .get_mut("el")
+            .unwrap()
+            .health
+            .failure("timeout");
+        assert!(!s.ready());
+        s.consensus_acquisition.success(10, "blobs");
+        s.consensus_targets
             .get_mut("cl")
             .unwrap()
             .health
-            .progress(10);
-        assert!(
-            !stats.ready(),
-            "external keepalives do not prove a working feed"
-        );
-        stats.source_event("external", 10);
-        assert!(stats.ready());
-        stats
-            .execution_targets
+            .success(10, "published");
+        assert!(s.ready(), "one useful layer is sufficient");
+        s.source_event("silent", 10);
+        s.execution_targets
             .get_mut("el")
             .unwrap()
             .health
-            .connected = false;
-        assert!(!stats.ready(), "suspended Engine must not report ready");
-        stats
-            .execution_targets
+            .success(10, "Engine");
+        s.execution_targets
             .get_mut("el")
             .unwrap()
-            .health
-            .connected = true;
-        stats.recording_dropped = 1;
-        assert!(
-            !stats.ready(),
-            "missing measurement records invalidate readiness"
-        );
-        stats.recording_dropped = 0;
+            .observation
+            .success(10, "RPC");
+        s.consensus_targets
+            .get_mut("cl")
+            .unwrap()
+            .observation
+            .success(10, "Beacon");
+        s.recording.success(0, "recorded");
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        s.recorder = Some(sender);
+        assert_eq!(s.operation(), "healthy");
+        assert_eq!(s.recording.errors, 1);
+        assert_eq!(s.recording_dropped, 5);
+        assert_eq!(s.execution_targets["el"].health.errors, 1);
         tokio::time::advance(std::time::Duration::from_secs(37)).await;
-        assert!(!stats.ready());
-        stats.source_event("local", 10);
-        stats.source_event("external", 10);
-        stats
-            .execution_targets
-            .get_mut("el")
-            .unwrap()
-            .health
-            .progress(10);
-        assert!(
-            !stats.ready(),
-            "stale consensus confirmation must not report ready"
-        );
-        stats
-            .consensus_targets
-            .get_mut("cl")
-            .unwrap()
-            .health
-            .progress(10);
-        assert!(stats.ready());
-        stats.source_connected("external", "block");
-        assert!(!stats.ready(), "reconnect requires a new block event");
+        assert!(!s.ready());
     }
 }

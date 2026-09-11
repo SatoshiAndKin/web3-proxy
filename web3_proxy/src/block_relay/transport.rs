@@ -143,18 +143,29 @@ pub async fn body(response: reqwest::Response) -> Result<bytes::Bytes> {
 }
 
 #[derive(Clone)]
+enum Credential {
+    Secret(JwtSecret),
+    File(std::path::PathBuf),
+}
+
+#[derive(Clone)]
 pub struct Rpc {
     client: reqwest::Client,
     url: Url,
-    jwt: Option<JwtSecret>,
+    credential: Option<Credential>,
 }
 impl Rpc {
     pub fn new(url: &str, jwt: Option<JwtSecret>) -> Result<Self> {
         Ok(Self {
             client: client()?,
             url: super::config::url(url)?,
-            jwt,
+            credential: jwt.map(Credential::Secret),
         })
+    }
+    pub fn with_jwt_file(url: &str, path: &std::path::Path) -> Result<Self> {
+        let mut rpc = Self::new(url, None)?;
+        rpc.credential = Some(Credential::File(path.to_owned()));
+        Ok(rpc)
     }
     pub async fn call<T: DeserializeOwned>(
         &self,
@@ -194,7 +205,20 @@ impl Rpc {
                 .post(self.url.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(bytes);
-            if let Some(jwt) = &self.jwt {
+            let jwt = match &self.credential {
+                Some(Credential::File(path)) => {
+                    let text = tokio::fs::read_to_string(path)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("cannot read target JWT secret"))?;
+                    Some(
+                        JwtSecret::from_hex(text.trim())
+                            .map_err(|_| anyhow::anyhow!("invalid target JWT secret"))?,
+                    )
+                }
+                Some(Credential::Secret(secret)) => Some(*secret),
+                None => None,
+            };
+            if let Some(jwt) = jwt {
                 let token = jwt
                     .encode(&Claims::default())
                     .map_err(|_| anyhow::anyhow!("JWT creation failed"))?;

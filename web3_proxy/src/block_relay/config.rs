@@ -164,23 +164,25 @@ impl Config {
             ensure!(versions.insert(fork.version), "duplicate fork version");
             ensure!(names.insert(&fork.name), "duplicate fork name");
         }
-        for source in self.sources.values() {
-            url(&source.beacon_url)?;
-        }
+        // Invalid endpoint configuration affects only that endpoint. Reject duplicate valid
+        // destinations globally because they would create concurrent workers for one node.
         let mut engines = std::collections::BTreeSet::new();
         for target in self.execution_targets.values() {
-            ensure!(
-                engines.insert(url(&target.engine_url)?.to_string()),
-                "duplicate Engine endpoint"
-            );
-            url(&target.rpc_url)?;
+            if let Ok(endpoint) = url(&target.engine_url) {
+                ensure!(
+                    engines.insert(endpoint.to_string()),
+                    "duplicate Engine endpoint"
+                );
+            }
         }
         let mut beacons = std::collections::BTreeSet::new();
         for target in self.consensus_targets.values() {
-            ensure!(
-                beacons.insert(url(&target.beacon_url)?.to_string()),
-                "duplicate Beacon target endpoint"
-            );
+            if let Ok(endpoint) = url(&target.beacon_url) {
+                ensure!(
+                    beacons.insert(endpoint.to_string()),
+                    "duplicate Beacon target endpoint"
+                );
+            }
         }
         Ok(())
     }

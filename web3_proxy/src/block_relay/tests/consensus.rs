@@ -358,7 +358,6 @@ async fn publication_202_without_import_does_not_count_as_ready() {
             mode,
             cache: moka::future::Cache::new(16),
             stats: stats.clone(),
-            ttl: Duration::from_secs(768),
         },
     ));
     tx.send(Arc::new(ConsensusWork {
@@ -451,7 +450,6 @@ async fn consensus_repairs_cached_ancestors_oldest_first_and_retries_child() {
             mode,
             cache,
             stats: stats.clone(),
-            ttl: Duration::from_secs(768),
         },
     ));
     tx.send(child.clone()).unwrap();
@@ -513,7 +511,6 @@ async fn consensus_parent_readiness_wakes_waiting_child_without_republishing_par
             mode,
             cache: moka::future::Cache::new(16),
             stats: stats.clone(),
-            ttl: Duration::from_secs(768),
         },
     ));
     tx.send(child_work.clone()).unwrap();
@@ -581,4 +578,71 @@ async fn fresh_observe_mode_fetches_both_layers_without_any_submission() {
         relay.snapshot()["consensus_targets"]["cl"]["sent"].as_u64(),
         Some(0)
     );
+}
+
+#[tokio::test]
+async fn stalled_consensus_import_observations_do_not_delay_new_publications() {
+    let network = network();
+    let first = beacon(&network);
+    let next = child_of(&first, &network);
+    let beacon = MockBeacon::new(network.clone());
+    beacon.state.lock().header_gate = Some(Arc::new(tokio::sync::Notify::new()));
+    let server = Server::beacon(beacon.clone()).await;
+    let target = Arc::new(
+        ConsensusTarget::new(
+            "cl".into(),
+            &target_config(&server.url),
+            Duration::from_secs(768),
+        )
+        .unwrap(),
+    );
+    let stats = Arc::new(parking_lot::Mutex::new(stats::Stats::default()));
+    let (tx, rx) = broadcast::channel(8);
+    let (stop, stop_rx) = watch::channel(false);
+    let (_, mode) = watch::channel(config::Mode::Inject);
+    let run = tokio::spawn(target.run(
+        rx,
+        crate::block_relay::consensus::Context {
+            network: network.clone(),
+            stop: stop_rx,
+            mode,
+            cache: moka::future::Cache::new(16),
+            stats: stats.clone(),
+        },
+    ));
+    tx.send(consensus_work(&first, &network)).unwrap();
+    until(|| {
+        stats
+            .lock()
+            .consensus_targets
+            .get("cl")
+            .is_some_and(|t| t.published == 1)
+    })
+    .await;
+    tx.send(consensus_work(&next, &network)).unwrap();
+    let delivered = timeout(
+        Duration::from_millis(500),
+        until(|| stats.lock().consensus_targets["cl"].published == 2),
+    )
+    .await;
+    stop.send_replace(true);
+    run.await.unwrap();
+    assert!(
+        delivered.is_ok(),
+        "header reads delayed the publication worker"
+    );
+    assert_eq!(
+        beacon
+            .state
+            .lock()
+            .publications
+            .iter()
+            .map(|p| p.0)
+            .collect::<Vec<_>>(),
+        [
+            tree_hash::block_root(&first.data.message).unwrap(),
+            tree_hash::block_root(&next.data.message).unwrap()
+        ]
+    );
+    assert_eq!(stats.lock().consensus_targets["cl"].ready, 0);
 }

@@ -1,7 +1,7 @@
+use super::stats::WorkerLayer as Layer;
 use super::{
     config::{Config, Mode, SLOTS_PER_EPOCH},
     consensus::{ConsensusTarget, ConsensusWork},
-    journal::StateStore,
     payload::{ConsensusPayload, RelayPayload},
     recording::{Record, Recording},
     source::{race_sources, Announcement, BeaconSource},
@@ -10,7 +10,6 @@ use super::{
     transport::Rpc,
 };
 use alloy::primitives::B256;
-use alloy_rpc_types_engine::JwtSecret;
 use anyhow::Result;
 use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use moka::future::Cache;
@@ -37,7 +36,7 @@ pub(super) struct Work {
 
 struct Prepared {
     config: Config,
-    store: Arc<StateStore>,
+    errors: Vec<(Layer, String, String)>,
     sources: Vec<Arc<BeaconSource>>,
     execution_targets: Vec<Arc<Target>>,
     consensus_targets: Vec<Arc<ConsensusTarget>>,
@@ -61,33 +60,64 @@ impl Prepared {
                 "changing proof workers requires a process restart"
             );
         }
-        let store = match &previous {
-            Some(previous) => previous.store.clone(),
-            None => StateStore::open(&config.state_dir)?,
-        };
+        let mut errors = Vec::new();
         let sources = config
             .sources
             .iter()
-            .map(|(name, config)| BeaconSource::new(name.clone(), config).map(Arc::new))
-            .collect::<Result<_>>()?;
+            .filter_map(
+                |(name, config)| match BeaconSource::new(name.clone(), config) {
+                    Ok(source) => Some(Arc::new(source)),
+                    Err(error) => {
+                        errors.push((Layer::Source, name.clone(), error.to_string()));
+                        None
+                    }
+                },
+            )
+            .collect();
         let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * config.network.seconds_per_slot);
         let targets = config
             .execution_targets
             .iter()
-            .map(|(name, config)| {
-                let jwt = JwtSecret::from_file(&config.jwt_secret_path)
-                    .map_err(|_| anyhow::anyhow!("cannot read a target JWT secret"))?;
-                Ok(Arc::new(Target {
-                    name: name.clone(),
-                    engine: Rpc::new(&config.engine_url, Some(jwt))?,
-                    rpc: Rpc::new(&config.rpc_url, None)?,
-                    journal: store.journal(&config.engine_url)?,
-                    probes: tokio::sync::Semaphore::new(4),
-                    confirmed: Cache::builder().max_capacity(512).time_to_live(ttl).build(),
-                    evidence: Notify::new(),
-                }))
+            .filter_map(|(name, target_config)| {
+                let previous_target = previous.as_ref().and_then(|p| {
+                    p.config
+                        .execution_targets
+                        .iter()
+                        .find_map(|(old_name, old)| {
+                            (super::config::url(&old.engine_url).ok()
+                                == super::config::url(&target_config.engine_url).ok())
+                            .then(|| p.execution_targets.iter().find(|t| &t.name == old_name))
+                            .flatten()
+                        })
+                });
+                let create =
+                    || -> Result<Target> {
+                        Ok(Target {
+                            name: name.clone(),
+                            engine: Rpc::with_jwt_file(
+                                &target_config.engine_url,
+                                &target_config.jwt_secret_path,
+                            )?,
+                            rpc: Rpc::new(&target_config.rpc_url, None)?,
+                            handled: previous_target.map(|t| t.handled.clone()).unwrap_or_else(
+                                || Cache::builder().max_capacity(512).time_to_live(ttl).build(),
+                            ),
+                            confirmed: previous_target.map(|t| t.confirmed.clone()).unwrap_or_else(
+                                || Cache::builder().max_capacity(512).time_to_live(ttl).build(),
+                            ),
+                            probes: tokio::sync::Semaphore::new(4),
+                            evidence: Notify::new(),
+                        })
+                    };
+                match create() {
+                    Ok(target) => Some(Arc::new(target)),
+                    Err(error) => {
+                        errors.push((Layer::Execution, name.clone(), error.to_string()));
+                        None
+                    }
+                }
             })
-            .collect::<Result<_>>()?;
+            .collect();
         let decoders = previous
             .as_ref()
             .map(|p| p.decoders.clone())
@@ -99,11 +129,36 @@ impl Prepared {
         let consensus_targets = config
             .consensus_targets
             .iter()
-            .map(|(name, config)| ConsensusTarget::new(name.clone(), config, ttl).map(Arc::new))
-            .collect::<Result<_>>()?;
+            .filter_map(
+                |(name, c)| match ConsensusTarget::new(name.clone(), c, ttl) {
+                    Ok(mut target) => {
+                        if let Some(old) = previous.as_ref().and_then(|p| {
+                            p.config
+                                .consensus_targets
+                                .iter()
+                                .find_map(|(old_name, old)| {
+                                    (super::config::url(&old.beacon_url).ok()
+                                        == super::config::url(&c.beacon_url).ok())
+                                    .then(|| {
+                                        p.consensus_targets.iter().find(|t| &t.name == old_name)
+                                    })
+                                    .flatten()
+                                })
+                        }) {
+                            target.retain_delivery(old);
+                        }
+                        Some(Arc::new(target))
+                    }
+                    Err(error) => {
+                        errors.push((Layer::Consensus, name.clone(), error.to_string()));
+                        None
+                    }
+                },
+            )
+            .collect();
         Ok(Self {
             config,
-            store,
+            errors,
             sources,
             execution_targets: targets,
             consensus_targets,
@@ -121,6 +176,9 @@ pub struct BlockRelay {
     stats: Shared,
 }
 impl BlockRelay {
+    pub fn live(&self) -> bool {
+        self.stats.lock().supervisor_running
+    }
     pub fn ready(&self) -> bool {
         self.stats.lock().ready()
     }
@@ -136,7 +194,19 @@ impl BlockRelay {
         })
     }
     pub fn snapshot(&self) -> sonic_rs::Value {
-        sonic_rs::to_value(&*self.stats.lock()).expect("serializable relay status")
+        let stats = self.stats.lock();
+        use sonic_rs::JsonValueMutTrait;
+        let mut value = sonic_rs::to_value(&*stats).expect("serializable relay status");
+        let object = value.as_object_mut().expect("status object");
+        object.insert(
+            "operation",
+            sonic_rs::to_value(&stats.operation()).expect("operation"),
+        );
+        object.insert(
+            "forwarding_available",
+            sonic_rs::to_value(&stats.ready()).expect("availability"),
+        );
+        value
     }
     pub fn samples(&self) -> Vec<super::stats::Sample> {
         self.stats.lock().samples.iter().cloned().collect()
@@ -182,6 +252,16 @@ impl BlockRelay {
         Ok(())
     }
     pub async fn run(self: Arc<Self>, chain_id: u64, mut shutdown: broadcast::Receiver<()>) {
+        struct Running(Shared);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let mut s = self.0.lock();
+                s.supervisor_running = false;
+                s.enabled = false;
+            }
+        }
+        self.stats.lock().supervisor_running = true;
+        let _running = Running(self.stats.clone());
         let mut desired = self.desired.subscribe();
         loop {
             let prepared = desired.borrow_and_update().clone();
@@ -191,27 +271,40 @@ impl BlockRelay {
             };
             {
                 let mut stats = self.stats.lock();
-                *stats = Stats {
-                    enabled: true,
-                    mode: *self.mode.borrow(),
-                    seconds_per_slot: prepared.config.network.seconds_per_slot,
-                    sources: prepared
-                        .sources
-                        .iter()
-                        .map(|s| (s.name.clone(), Default::default()))
-                        .collect(),
-                    execution_targets: prepared
+                stats.enabled = true;
+                stats.mode = *self.mode.borrow();
+                stats.seconds_per_slot = prepared.config.network.seconds_per_slot;
+                stats
+                    .sources
+                    .retain(|name, _| prepared.config.sources.contains_key(name));
+                stats
+                    .execution_targets
+                    .retain(|name, _| prepared.config.execution_targets.contains_key(name));
+                stats
+                    .consensus_targets
+                    .retain(|name, _| prepared.config.consensus_targets.contains_key(name));
+                for name in prepared.config.sources.keys() {
+                    stats.sources.entry(name.clone()).or_default().connected = false;
+                }
+                for name in prepared.config.execution_targets.keys() {
+                    stats
                         .execution_targets
-                        .iter()
-                        .map(|t| (t.name.clone(), Default::default()))
-                        .collect(),
-                    consensus_targets: prepared
+                        .entry(name.clone())
+                        .or_default()
+                        .health
+                        .connected = false;
+                }
+                for name in prepared.config.consensus_targets.keys() {
+                    stats
                         .consensus_targets
-                        .iter()
-                        .map(|t| (t.name.clone(), Default::default()))
-                        .collect(),
-                    ..Default::default()
-                };
+                        .entry(name.clone())
+                        .or_default()
+                        .health
+                        .connected = false;
+                }
+                for (layer, name, detail) in &prepared.errors {
+                    stats.worker_error(*layer, name, detail);
+                }
             }
             let (stop, stop_rx) = watch::channel(false);
             let generation = run_generation(
@@ -320,10 +413,13 @@ async fn run_generation(
     stats: Shared,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
-    let recording = Recording::open(&prepared.config.state_dir).await?;
     let (record_tx, record_rx) = mpsc::channel(1024);
     stats.lock().recorder = Some(record_tx);
-    let mut recording = tokio::spawn(recording.run(record_rx));
+    let mut recording = tokio::spawn(Recording::supervise(
+        prepared.config.state_dir.clone(),
+        record_rx,
+        stats.clone(),
+    ));
     let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * prepared.config.network.seconds_per_slot);
     let payloads = Cache::<B256, Arc<RelayPayload>>::builder()
         .max_capacity(prepared.config.cache_max_bytes)
@@ -353,48 +449,61 @@ async fn run_generation(
     let mut in_progress = HashMap::<B256, Arc<Notify>>::new();
     let (worker_stop, worker_stop_rx) = watch::channel(false);
     for source in &prepared.sources {
-        source_tasks.spawn(source.clone().run(
-            prepared.config.network.clone(),
-            announcements.clone(),
+        let source = source.clone();
+        let network = prepared.config.network.clone();
+        let announcements = announcements.clone();
+        let stats = stats.clone();
+        source_tasks.spawn(supervise(
+            Layer::Source,
+            source.name.clone(),
             stats.clone(),
+            worker_stop_rx.clone(),
+            move || {
+                source
+                    .clone()
+                    .run(network.clone(), announcements.clone(), stats.clone())
+            },
         ));
     }
     for target in &prepared.execution_targets {
-        target_tasks.spawn(target.clone().run(
-            delivery.subscribe(),
-            super::target::WorkerContext {
-                chain_id,
-                stop: worker_stop_rx.clone(),
-                mode: mode.clone(),
-                cache: payloads.clone(),
-                stats: stats.clone(),
-                ttl,
-            },
+        let target = target.clone();
+        let delivery = delivery.clone();
+        let context = super::target::WorkerContext {
+            chain_id,
+            stop: worker_stop_rx.clone(),
+            mode: mode.clone(),
+            cache: payloads.clone(),
+            stats: stats.clone(),
+        };
+        target_tasks.spawn(supervise(
+            Layer::Execution,
+            target.name.clone(),
+            stats.clone(),
+            worker_stop_rx.clone(),
+            move || target.clone().run(delivery.subscribe(), context.clone()),
         ));
     }
     for target in &prepared.consensus_targets {
-        target_tasks.spawn(target.clone().run(
-            consensus_delivery.subscribe(),
-            super::consensus::Context {
-                network: prepared.config.network.clone(),
-                stop: worker_stop_rx.clone(),
-                mode: mode.clone(),
-                cache: consensus_cache.clone(),
-                stats: stats.clone(),
-                ttl,
-            },
+        let target = target.clone();
+        let delivery = consensus_delivery.clone();
+        let context = super::consensus::Context {
+            network: prepared.config.network.clone(),
+            stop: worker_stop_rx.clone(),
+            mode: mode.clone(),
+            cache: consensus_cache.clone(),
+            stats: stats.clone(),
+        };
+        target_tasks.spawn(supervise(
+            Layer::Consensus,
+            target.name.clone(),
+            stats.clone(),
+            worker_stop_rx.clone(),
+            move || target.clone().run(delivery.subscribe(), context.clone()),
         ));
     }
-    drop(announcements);
     let result = loop {
         tokio::select! {
             _ = stop.changed() => break Ok(()),
-            result = &mut recording => {
-                stats.lock().recorder = None;
-                break match result { Ok(result) => result, Err(_) => Err(anyhow::anyhow!("measurement task failed")) };
-            },
-            ended = source_tasks.join_next(), if !source_tasks.is_empty() => break Err(anyhow::anyhow!("source worker stopped: {}", ended.is_some())),
-            ended = target_tasks.join_next(), if !target_tasks.is_empty() => break Err(anyhow::anyhow!("target worker stopped: {}", ended.is_some())),
             _ = observations.join_next(), if !observations.is_empty() => {},
             event = incoming.recv() => {
                 let Some(event) = event else { break Err(anyhow::anyhow!("all Beacon sources stopped")); };
@@ -419,14 +528,18 @@ async fn run_generation(
                 });
             }
             acquired = acquisitions.join_next(), if !acquisitions.is_empty() => {
-                let Some(Ok((event, acquired))) = acquired else { break Err(anyhow::anyhow!("acquisition worker failed")); };
+                let Some(Ok((event, acquired))) = acquired else {
+                    stats.lock().acquisition_failed += 1;
+                    in_progress.retain(|_, notify| Arc::strong_count(notify) > 1);
+                    continue;
+                };
                 in_progress.remove(&event.root);
                 let (payload, source) = match acquired {
                     Ok(value) => value,
-                    Err(_) => { let mut s = stats.lock(); s.acquisition_failed += 1;
+                    Err(_) => { let mut s = stats.lock(); s.acquisition_failed += 1; s.acquisition.failure("block acquisition failed");
                         s.record(Record::AcquisitionFailed { root: event.root, slot: event.slot, consensus: false }); continue; }
                 };
-                if payload.slot != event.slot { stats.lock().acquisition_failed += 1; continue; }
+                if payload.slot != event.slot { let mut s = stats.lock(); s.acquisition_failed += 1; s.acquisition.failure("block slot mismatch"); continue; }
                 seen.insert(event.root, ()).await;
                 payloads.insert(payload.hash, payload.clone()).await;
                 let acquired = Instant::now();
@@ -435,7 +548,7 @@ async fn run_generation(
                     deadline: event.at + Duration::from_secs(prepared.config.network.seconds_per_slot),
                     source, announcement_source: event.source, event: event.kind, mode: *mode.borrow() });
                 {
-                    let mut s = stats.lock(); s.acquired += 1;
+                    let mut s = stats.lock(); s.acquired += 1; s.acquisition.success(work.payload.slot, "verified block acquired");
                     s.acquisition_latency.record(stats::micros(acquired.duration_since(event.at)));
                 }
                 let _ = delivery.send(work.clone());
@@ -454,6 +567,7 @@ async fn run_generation(
                 // Probes cannot delay fanout. They use each target's direct RPC endpoint.
                 let targets = prepared.execution_targets.clone(); let stats = stats.clone();
                 let consensus_targets = prepared.consensus_targets.clone();
+                let count = prepared.config.execution_targets.len() + prepared.config.consensus_targets.len();
                 observations.spawn(async move {
                     let mut probes = FuturesUnordered::new();
                     for target in &targets { probes.push(target.observe(work.clone(), stats.clone()).boxed()); }
@@ -465,7 +579,6 @@ async fn run_generation(
                         if let Some(value) = result.canonical { canonical.push(value); }
                     }
                     let mut s = stats.lock();
-                    let count = targets.len() + consensus_targets.len();
                     if ready.len() == count {
                         let last = *ready.iter().max().expect("nonempty targets");
                         let first = *ready.iter().min().expect("nonempty targets");
@@ -476,18 +589,22 @@ async fn run_generation(
                 });
             }
             acquired = blob_acquisitions.join_next(), if !blob_acquisitions.is_empty() => {
-                let Some(Ok((work, result))) = acquired else { break Err(anyhow::anyhow!("blob worker failed")); };
+                let Some(Ok((work, result))) = acquired else {
+                    stats.lock().consensus_acquisition_failed += 1;
+                    blobs_in_progress.retain(|_, notify| Arc::strong_count(notify) > 1);
+                    continue;
+                };
                 blobs_in_progress.remove(&work.payload.beacon_root);
                 match result {
                     Ok(Ok((payload, blob_source))) => {
-                        { let mut s = stats.lock(); s.consensus_acquired += 1;
+                        { let mut s = stats.lock(); s.consensus_acquired += 1; s.consensus_acquisition.success(work.payload.slot, "complete blobs and proofs acquired");
                           s.record(Record::BlobReady { root: work.payload.beacon_root, slot: work.payload.slot,
                             mode: work.mode, source: blob_source, ready_us: stats::micros(work.first_seen.elapsed()) });
                           s.consensus_acquisition_latency.record(stats::micros(work.first_seen.elapsed())); }
                         consensus_cache.insert(payload.block.beacon_root, payload.clone()).await;
                         let _ = consensus_delivery.send(Arc::new(ConsensusWork { work, payload }));
                     }
-                    _ => { let mut s = stats.lock(); s.consensus_acquisition_failed += 1;
+                    _ => { let mut s = stats.lock(); s.consensus_acquisition_failed += 1; s.consensus_acquisition.failure("complete blobs or proofs unavailable");
                         s.record(Record::AcquisitionFailed { root: work.payload.beacon_root, slot: work.payload.slot, consensus: true }); },
                 }
             }
@@ -497,7 +614,7 @@ async fn run_generation(
     acquisitions.abort_all();
     blob_acquisitions.abort_all();
     observations.abort_all();
-    // On worker failure, drop senders and stop peers as well; do not leave detached imports.
+    // Stop only for shutdown or configuration replacement. Drain in-flight imports.
     drop(delivery);
     drop(consensus_delivery);
     worker_stop.send_replace(true);
@@ -506,10 +623,44 @@ async fn run_generation(
     while blob_acquisitions.join_next().await.is_some() {}
     while acquisitions.join_next().await.is_some() {}
     while observations.join_next().await.is_some() {}
-    if stats.lock().recorder.take().is_some() {
-        recording
-            .await
-            .map_err(|_| anyhow::anyhow!("measurement task failed"))??;
+    stats.lock().recorder.take();
+    if tokio::time::timeout(Duration::from_secs(2), &mut recording)
+        .await
+        .is_err()
+    {
+        recording.abort();
     }
     result
+}
+
+/// A worker owns no durable delivery history. Restart only this endpoint after a panic or exit.
+pub(super) async fn supervise<F, Fut>(
+    layer: Layer,
+    name: String,
+    stats: Shared,
+    mut stop: watch::Receiver<bool>,
+    mut run: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let result = std::panic::AssertUnwindSafe(run()).catch_unwind().await;
+        if *stop.borrow() {
+            return;
+        }
+        stats.lock().worker_error(
+            layer,
+            &name,
+            if result.is_err() {
+                "worker panicked; restarting"
+            } else {
+                "worker exited; restarting"
+            },
+        );
+        tokio::select! { _ = stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+    }
 }

@@ -24,9 +24,9 @@ ports, relay status, or private measurements on the public Internet.
 Use `stop_grace_period: 30s`. Both commands have a 25-second application drain
 and two-second runtime cleanup budget. Proxy shutdown marks readiness false,
 stops listeners, drains active HTTP requests, and closes WebSockets with code
-1001. Clients must reconnect after a host update. An unresolved Engine request
-remains journaled across relay replacement.
+1001. Clients must reconnect after a host update. An unresolved Engine request remains unknown. It does not suspend newer work.
+Use `/live` for forwarder container startup and report dependency health separately.
 
 Validate the selected image on each host before changing traffic. Keep the
 previous digest and private configuration for rollback. A built image does not
-prove that block delivery is faster; complete the measured relay trial first.
+prove that block delivery is faster. Measure full-fleet latency during broadcast.

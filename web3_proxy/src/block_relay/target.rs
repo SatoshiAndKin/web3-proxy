@@ -1,6 +1,5 @@
 use super::{
     config::Mode,
-    journal::{Journal, Pending},
     payload::RelayPayload,
     stats::{self, Sample, Shared},
     transport::Rpc,
@@ -25,15 +24,13 @@ pub struct Target {
     pub name: String,
     pub engine: Rpc,
     pub rpc: Rpc,
-    /// A lost Engine response does not cancel execution on the node. Keep the
-    /// target suspended until RPC confirms the block, including after a restart.
-    pub journal: Arc<Journal>,
+    pub(super) handled: Cache<B256, Delivery>,
     pub probes: tokio::sync::Semaphore,
     pub(super) confirmed: Cache<B256, ()>,
     pub(super) evidence: Notify,
 }
 #[derive(Clone)]
-enum Delivery {
+pub(super) enum Delivery {
     Valid,
     Accepted,
     Syncing { parent_was_valid: bool },
@@ -65,25 +62,24 @@ struct Block {
     number: U64,
 }
 
+#[derive(Clone)]
 pub(super) struct WorkerContext {
     pub chain_id: u64,
     pub stop: watch::Receiver<bool>,
     pub mode: watch::Receiver<Mode>,
     pub cache: Cache<B256, Arc<RelayPayload>>,
     pub stats: Shared,
-    pub ttl: Duration,
 }
 
 impl Target {
     pub async fn validate(&self, chain_id: u64) -> Result<()> {
-        let (engine_chain, rpc_chain, methods): (U64, U64, Vec<String>) = tokio::try_join!(
+        let (engine_chain, methods): (U64, Vec<String>) = tokio::try_join!(
             self.engine.call("eth_chainId", [] as [u8; 0]),
-            self.rpc.call("eth_chainId", [] as [u8; 0]),
             self.engine
                 .call("engine_exchangeCapabilities", (["engine_newPayloadV4"],)),
         )?;
         ensure!(
-            engine_chain.to::<u64>() == chain_id && rpc_chain == engine_chain,
+            engine_chain.to::<u64>() == chain_id,
             "execution chain ID mismatch"
         );
         ensure!(
@@ -118,12 +114,8 @@ impl Target {
             mode,
             cache,
             stats,
-            ttl,
         } = context;
-        let handled = Cache::<B256, Delivery>::builder()
-            .max_capacity(512)
-            .time_to_live(ttl)
-            .build();
+        let handled = &self.handled;
         let mut pending = VecDeque::new();
         let mut waiting = BTreeMap::<B256, Arc<Work>>::new();
         loop {
@@ -151,33 +143,6 @@ impl Target {
         loop {
             if *stop.borrow() {
                 return;
-            }
-            let (uncertain, failed) = self.journal.status();
-            if let Some(pending_import) = uncertain {
-                if self
-                    .has_block(pending_import.hash, pending_import.number)
-                    .await
-                    .unwrap_or(false)
-                    && self.journal.complete(pending_import).await.is_ok()
-                {
-                    handled.insert(pending_import.hash, Delivery::Valid).await;
-                    self.wake_children(pending_import.hash, &mut waiting, &mut pending, &stats);
-                    let mut s = stats.lock();
-                    let t = s.execution_targets.entry(self.name.clone()).or_default();
-                    t.health.connected = true;
-                    t.health.detail = "Engine response lost; RPC has confirmed the block".into();
-                } else {
-                    self.suspended(&stats, "Engine result unknown; awaiting RPC confirmation and durable journal recovery");
-                    tokio::select! { _ = stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
-                    continue;
-                }
-            } else if failed {
-                self.suspended(
-                    &stats,
-                    "Engine journal write failed; repair storage before restarting",
-                );
-                tokio::select! { _ = stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
-                continue;
             }
             // RPC probes and repair reads report through the same target state.
             // Process it before dequeuing work, including after an idle wake-up.
@@ -296,7 +261,7 @@ impl Target {
                     .execution_targets
                     .entry(self.name.clone())
                     .or_default()
-                    .skipped_known += 1;
+                    .suppressed_duplicate += 1;
                 continue;
             }
             if handled
@@ -318,6 +283,7 @@ impl Target {
                     .get(&p.parent_hash)
                     .await
                     .is_some_and(|s| s.is_valid());
+            handled.insert(p.hash, Delivery::Unknown).await;
             let result = self.deliver(p, &stats).await;
             if let Ok(status) = result {
                 let syncing = status.is_syncing();
@@ -328,7 +294,7 @@ impl Target {
                     )
                     .await;
                 if syncing && !*stop.borrow() && Instant::now() < work.deadline {
-                    self.repair(&work, &cache, &handled, &stats, &stop, &mode)
+                    self.repair(&work, &cache, handled, &stats, &stop, &mode)
                         .await;
                 }
                 waiting.retain(|_, w| Instant::now() < w.deadline);
@@ -405,14 +371,6 @@ impl Target {
         }
     }
     async fn deliver(&self, payload: &RelayPayload, stats: &Shared) -> Result<PayloadStatus> {
-        let pending = Pending {
-            hash: payload.hash,
-            number: payload.number,
-        };
-        if let Err(error) = self.journal.begin(pending).await {
-            self.suspended(stats, &error.to_string());
-            return Err(error);
-        }
         stats
             .lock()
             .execution_targets
@@ -420,48 +378,60 @@ impl Target {
             .or_default()
             .sent += 1;
         let start = Instant::now();
-        let mut result = self.engine.new_payload(payload).await.and_then(|status| {
+        let result = self.engine.new_payload(payload).await.and_then(|status| {
             ensure!(
                 !status.is_valid() || status.latest_valid_hash == Some(payload.hash),
                 "VALID response hash mismatch"
             );
             Ok(status)
         });
-        if result.is_ok() {
-            if let Err(error) = self.journal.complete(pending).await {
-                result = Err(error);
-            }
-        }
         let mut s = stats.lock();
         let t = s.execution_targets.entry(self.name.clone()).or_default();
         t.engine_latency.record(stats::micros(start.elapsed()));
         match &result {
-            Ok(status) => match &status.status {
-                PayloadStatusEnum::Valid => t.valid += 1,
-                PayloadStatusEnum::Accepted => t.accepted += 1,
-                PayloadStatusEnum::Syncing => t.syncing += 1,
-                PayloadStatusEnum::Invalid { .. } => t.invalid += 1,
-            },
+            Ok(status) => {
+                t.health.connected = true;
+                t.health.detail = "Engine response received".into();
+                t.health.progress(payload.slot);
+                match &status.status {
+                    PayloadStatusEnum::Valid => t.valid += 1,
+                    PayloadStatusEnum::Accepted => t.accepted += 1,
+                    PayloadStatusEnum::Syncing => t.syncing += 1,
+                    PayloadStatusEnum::Invalid { .. } => {
+                        t.invalid += 1;
+                        t.health.failure("Engine rejected payload");
+                    }
+                }
+            }
             Err(error) => {
                 t.unknown += 1;
                 t.health.connected = false;
                 t.health.errors += 1;
-                t.health.detail = format!("injection suspended: {error}");
+                t.health.detail = error.to_string();
             }
         }
+        s.record(super::recording::Record::Submission {
+            layer: stats::Layer::Execution,
+            root: payload.beacon_root,
+            hash: payload.hash,
+            slot: payload.slot,
+            target: self.name.clone(),
+            elapsed_us: stats::micros(start.elapsed()),
+            outcome: match &result {
+                Ok(status) => match status.status {
+                    PayloadStatusEnum::Valid => "valid",
+                    PayloadStatusEnum::Accepted => "accepted",
+                    PayloadStatusEnum::Syncing => "syncing",
+                    PayloadStatusEnum::Invalid { .. } => "invalid",
+                },
+                Err(_) => "unknown",
+            }
+            .into(),
+        });
         if result.as_ref().is_ok_and(|s| s.is_invalid()) {
             tracing::error!(target_name = %self.name, block_hash = %payload.hash, "Engine rejected relay payload");
         }
         result
-    }
-    fn suspended(&self, stats: &Shared, detail: &str) {
-        let mut stats = stats.lock();
-        let target = stats
-            .execution_targets
-            .entry(self.name.clone())
-            .or_default();
-        target.health.connected = false;
-        target.health.detail = detail.into();
     }
     async fn repair(
         &self,
@@ -490,14 +460,16 @@ impl Target {
                 }
                 return;
             }
-            if matches!(previous, Some(Delivery::Unknown)) {
-                return;
-            }
             if handled.get(&hash).await.is_some_and(|s| s.is_valid())
-                || self.has_block(hash, number).await.unwrap_or(false)
+                || tokio::time::timeout_at(work.deadline, self.has_block(hash, number))
+                    .await
+                    .is_ok_and(|result| result.unwrap_or(false))
             {
                 anchored = true;
                 break;
+            }
+            if matches!(previous, Some(Delivery::Unknown)) {
+                return;
             }
             if chain.len() == 8 {
                 break;
@@ -546,7 +518,9 @@ impl Target {
                     .get(&payload.parent_hash)
                     .await
                     .is_some_and(|s| s.is_valid());
+            handled.insert(payload.hash, Delivery::Unknown).await;
             let Ok(status) = self.deliver(&payload, stats).await else {
+                handled.insert(payload.hash, Delivery::Unknown).await;
                 return;
             };
             let valid = status.is_valid();
@@ -586,7 +560,13 @@ impl Target {
                         sample.last_missing_us =
                             Some(stats::micros(query_start.duration_since(work.first_seen)))
                     }
-                    Err(_) => {} // An RPC error is not evidence that the block is absent.
+                    Err(error) => stats
+                        .lock()
+                        .execution_targets
+                        .entry(self.name.clone())
+                        .or_default()
+                        .observation
+                        .failure(&error.to_string()),
                 }
             }
             if sample.first_ready_us.is_some() {
@@ -618,6 +598,8 @@ impl Target {
         let t = s.execution_targets.entry(self.name.clone()).or_default();
         if let Some(ready) = ready {
             t.health.progress(work.payload.slot);
+            t.observation
+                .success(work.payload.slot, "RPC import confirmed");
             t.ready += 1;
             t.ready_latency.record(ready);
             if sample.last_missing_us.is_none() {
@@ -625,6 +607,8 @@ impl Target {
             }
         } else {
             t.incomplete += 1;
+            t.observation
+                .failure("RPC import unconfirmed before deadline");
         }
         if let Some(canonical) = sample.canonical_us {
             t.canonical_latency.record(canonical);

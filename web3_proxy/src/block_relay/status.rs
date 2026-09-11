@@ -23,7 +23,16 @@ impl BlockRelay {
     }
     fn router(self: Arc<Self>) -> Router {
         Router::new()
-            .route("/live", get(|| async { StatusCode::OK }))
+            .route(
+                "/live",
+                get(|State(relay): State<Arc<BlockRelay>>| async move {
+                    if relay.live() {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }),
+            )
             .route(
                 "/health",
                 get(|State(relay): State<Arc<BlockRelay>>| async move {
@@ -52,13 +61,30 @@ impl BlockRelay {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn live_is_not_ready_until_every_source_has_recent_block_events() {
+    async fn live_requires_running_supervisor_and_health_requires_forwarding() {
         let relay = BlockRelay::new();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (stop, _) = tokio::sync::broadcast::channel(1);
         let server = tokio::spawn(relay.clone().serve_status(listener, stop.subscribe()));
         let client = super::super::transport::client().unwrap();
+        assert_eq!(
+            client
+                .get(format!("{url}/live"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let run = tokio::spawn(relay.clone().run(1, stop.subscribe()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !relay.live() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             client
                 .get(format!("{url}/live"))
@@ -88,5 +114,7 @@ mod tests {
         );
         stop.send(()).unwrap();
         server.await.unwrap().unwrap();
+        run.await.unwrap();
+        assert!(!relay.live());
     }
 }

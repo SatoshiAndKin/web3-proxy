@@ -53,6 +53,7 @@ pub struct BeaconState {
     pub headers: BTreeMap<B256, alloy_rpc_types_beacon::header::HeaderResponse>,
     pub publications: Vec<(B256, String, sonic_rs::Value)>,
     pub publication_gates: BTreeMap<B256, Arc<tokio::sync::Notify>>,
+    pub header_gate: Option<Arc<tokio::sync::Notify>>,
     pub publication_status: u16,
     pub import_publications: bool,
     pub require_parent: bool,
@@ -87,6 +88,7 @@ impl MockBeacon {
                 headers: Default::default(),
                 publications: Default::default(),
                 publication_gates: Default::default(),
+                header_gate: None,
                 publication_status: 200,
                 import_publications: true,
                 require_parent: false,
@@ -191,6 +193,8 @@ async fn handle_beacon(
             let root = uri.path().rsplit('/').next().unwrap().parse().unwrap();
             state.blob_reads.push(root);
             state.blob_gates.get(&root).cloned()
+        } else if uri.path().starts_with("/eth/v1/beacon/headers/") {
+            state.header_gate.clone()
         } else {
             None
         }
@@ -280,15 +284,10 @@ pub struct RpcState {
 #[derive(Clone)]
 pub struct MockRpc {
     pub state: Arc<Mutex<RpcState>>,
-    store: Arc<crate::block_relay::journal::StateStore>,
-    _directory: Arc<tempfile::TempDir>,
 }
 impl MockRpc {
     pub fn new() -> Self {
-        let directory = Arc::new(tempfile::tempdir().unwrap());
         Self {
-            store: crate::block_relay::journal::StateStore::open(directory.path()).unwrap(),
-            _directory: directory,
             state: Arc::new(Mutex::new(RpcState {
                 chain_id: 1,
                 supports_v4: true,
@@ -304,7 +303,10 @@ impl MockRpc {
             name: name.to_string(),
             engine: transport::Rpc::new(url, Some(secret())).unwrap(),
             rpc: transport::Rpc::new(url, None).unwrap(),
-            journal: self.store.journal(url).unwrap(),
+            handled: moka::future::Cache::builder()
+                .max_capacity(512)
+                .time_to_live(Duration::from_secs(768))
+                .build(),
             probes: tokio::sync::Semaphore::new(4),
             confirmed: moka::future::Cache::builder()
                 .max_capacity(512)

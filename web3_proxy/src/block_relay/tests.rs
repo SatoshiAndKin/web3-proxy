@@ -10,7 +10,7 @@ use tokio::{
 };
 
 mod consensus;
-mod journal;
+mod isolation;
 mod mocks;
 mod network;
 mod review;
@@ -315,7 +315,6 @@ impl Worker {
                 mode: mode_rx,
                 cache: cache.clone(),
                 stats: stats.clone(),
-                ttl: Duration::from_secs(768),
             },
         ));
         Self {
@@ -752,22 +751,21 @@ async fn rejects_wrong_network_capability_and_bad_config_without_losing_current_
     let relay = BlockRelay::new();
     relay.apply(Some(&config)).await.unwrap();
     let mut bad = config.clone();
-    bad.execution_targets.get_mut("a").unwrap().jwt_secret_path =
-        "/missing/credential-must-not-leak".into();
+    bad.proof_workers = 0;
     assert_eq!(
         relay.apply(Some(&bad)).await.unwrap_err().to_string(),
-        "cannot read a target JWT secret"
+        "proof workers must be between 1 and 16"
     );
     assert_eq!(
         relay.snapshot()["config_error"].as_str(),
-        Some("cannot read a target JWT secret")
+        Some("proof workers must be between 1 and 16")
     );
     assert!(!format!("{bad:?}").contains("credential-must-not-leak"));
     relay.apply(Some(&config)).await.unwrap();
     assert!(relay.snapshot()["config_error"].is_null());
     assert_eq!(
         relay.apply(Some(&bad)).await.unwrap_err().to_string(),
-        "cannot read a target JWT secret"
+        "proof workers must be between 1 and 16"
     );
     let mut new_mode = config;
     new_mode.mode = config::Mode::Inject;
@@ -778,7 +776,7 @@ async fn rejects_wrong_network_capability_and_bad_config_without_losing_current_
 }
 
 #[tokio::test]
-async fn unknown_timeout_suspends_target_until_rpc_confirms_without_blind_retry() {
+async fn unknown_timeout_allows_new_work_without_claiming_the_lost_import() {
     let rpc = MockRpc::new();
     let server = Server::rpc(rpc.clone()).await;
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -799,16 +797,20 @@ async fn unknown_timeout_suspends_target_until_rpc_confirms_without_blind_retry(
     .await
     .unwrap();
     worker.tx.send(work(2, 1, 2, config::Mode::Inject)).unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(rpc.payload_hashes(), vec![B256::with_last_byte(1)]);
-    gate.notify_one();
     until(|| worker.stats.lock().execution_targets["a"].valid == 1).await;
+    assert_eq!(worker.stats.lock().execution_targets["a"].unknown, 1);
+    assert!(!rpc
+        .state
+        .lock()
+        .known
+        .contains_key(&B256::with_last_byte(1)));
+    gate.notify_one();
     worker.finish().await;
     assert_eq!(
         rpc.payload_hashes(),
         vec![B256::with_last_byte(1), B256::with_last_byte(2)]
     );
-    assert_eq!(rpc.state.lock().max_inflight, 1);
+    assert_eq!(rpc.state.lock().max_inflight, 2);
 }
 
 #[tokio::test]

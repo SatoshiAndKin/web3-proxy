@@ -3,7 +3,7 @@
 The objective is to reduce the time until every execution and consensus node
 imports a new block, and every stack exposes the canonical head. This feature is
 an experiment, not a proven speed improvement. Duplicate execution and consensus
-work can make a node slower. Measure the whole fleet before retaining injection.
+work can make a node slower. Measure the whole fleet while forwarding runs.
 
 Use the existing Geth, Reth, and Lighthouse instances. Do not start more
 Ethereum clients for this feature. Keep their existing native peer connections.
@@ -29,7 +29,7 @@ signature and consensus rules. The relay does not sign blocks or need validator 
 
 This implementation supports Electra/Fulu blocks with the mainnet SSZ preset.
 It checks network genesis, slot duration, configured fork versions and epochs,
-both execution chain IDs, and target support for Engine V4. It rejects unknown
+the Engine chain ID, and target support for Engine V4. It rejects unknown
 block versions. A newly advertised fork requires a configuration review; a new
 block schema also requires code and tests. Do not add its name to the config and
 assume it works. The relay does not support PoW or arbitrary EVM chains.
@@ -112,21 +112,25 @@ child after new parent evidence, not on a timer. Native sync handles larger gaps
 and missing state. Invalid ancestors prevent descendant submissions.
 
 The Engine response deadline is eight seconds. A timeout or malformed response
-does not prove that the node stopped execution. The worker suspends new submissions
-until direct RPC confirms that block. Before each Engine request, it writes and
-syncs a local journal. It clears that record only after a valid Engine response
-or matching RPC confirmation. Suspension survives reloads and process restarts.
-Corrupt records and storage failures stop injection. Do not delete a journal to
-clear an unknown import.
+leaves that import **unknown**. It does not prove that execution stopped or
+succeeded. After the deadline, the target worker proceeds with eligible newer
+work. Duplicate suppression prevents repeated sends of the unknown hash. RPC
+confirmation can establish that the block is available and wake waiting children.
+Workers retain delivery history, including invalid ancestry, across worker
+restarts and config reloads with the same normalized Engine endpoint.
 
-Set `state_dir` to an absolute path on persistent local storage. Each forwarder
-owns its directory with a local file lock. Different hosts use different
-directories and can submit to the same targets independently. The directory
-must survive container replacement. Changing it requires a process restart.
-Journal filenames hash normalized Engine URLs; records contain no credentials.
-Avoid changing an Engine endpoint's DNS identity while its import is unresolved.
-Do not list one physical Engine endpoint through multiple DNS or URL aliases.
-Pair each Engine URL with the direct RPC URL of that same execution instance.
+There is no runtime Engine journal. Existing journal files remain untouched as
+historical data. Storage faults cannot prevent Engine submissions. Each source
+and target restarts independently after an exit or panic. JWT files are read
+within that target's request deadline and retried independently. Invalid endpoint
+settings appear in status; other endpoints continue. Network validation remains
+required for each source and target. Direct RPC probes do not gate Engine sends.
+
+Set `state_dir` to an absolute path for private measurement files. Different
+forwarders use their own directories. The directory should survive container
+replacement. Changing it requires a process restart. Do not list one physical
+Engine endpoint through multiple DNS aliases. Pair each Engine URL with the
+direct RPC URL of that execution instance.
 
 ## Run against the existing stack
 
@@ -151,22 +155,23 @@ stops intake and drains current imports within a 25-second application deadline.
 Its private status listener defaults to `127.0.0.1:18550`. Use `--status-address`
 to set the container listener address; keep the host port private.
 
-- `/live` checks the status server only.
-- `/health` requires recent block events from every configured source, recent
-  readiness evidence from both target layers, and a working measurement log.
-  Keepalives and HTTP 200 alone do not pass. A suspended Engine does not pass.
-- `/status` returns counters, latency distributions, source freshness, and
-  target health. It accepts no control writes.
+- `/live` confirms that the relay supervisor is running. Use it for container startup.
+- `/health` reports recent useful acquisition and forwarding on at least one
+  configured layer. One working source and target can pass. It never gates forwarding.
+- `/status` reports `healthy`, `degraded`, or `unavailable` operation, with current
+  source, target, acquisition, probe, and recording conditions plus historical
+  counters. Recovery clears degradation without erasing errors. Silent sources
+  and missing blobs remain visible. The endpoint accepts no control writes.
 
 The service writes private JSONL files below `state_dir/observations`. These
 include source events, acquisition failures, blob readiness, and per-target
 observations with their mode, slot, root, and missing/ready bounds. Durations use
 a monotonic clock. Wall-clock timestamps only help join observer records.
-The writer has a bounded queue, syncs each second, rotates at 16 MiB, and stops
-at 512 MiB total. It does not erase trial evidence. Archive measurements before
-that limit. A queue overflow makes readiness fail; a writer failure stops the
-generation and drains its imports. The last unsynced records can be lost on a
-crash. Reconcile recorded roots against the chain before evaluating a trial.
+The writer has a bounded queue, syncs each second, rotates at 16 MiB, and caps
+storage at 512 MiB total. It never erases evidence. Full storage, queue overflow,
+and disk errors increment visible error/drop counters. The writer retries storage
+at a bounded rate while forwarding continues. The last unsynced records can be
+lost on a crash. Reconcile recorded roots against the chain before evaluating a trial.
 
 Alternatively, add `[block_relay]` to the existing proxy config and use `proxyd`.
 The same service then appears under `block_relay` in `/status`. Its failure does
@@ -210,8 +215,7 @@ Private diagnostic records use the tracing target
 `web3_proxy::block_relay::samples`. Enable its debug level and retain those logs
 privately. The service also retains the last 1,024 records in memory for callers
 of `BlockRelay::samples()`. Public `/status` omits those records, URLs, headers,
-JWT paths, and JWT contents. Its histograms are cumulative since the last full
-config reload and mix modes; do not use them as the trial comparison.
+JWT paths, and JWT contents. Its histograms are cumulative for the process lifetime and mix modes; do not use them as the trial comparison.
 
 Each record includes its execution/consensus layer, Beacon root, execution hash and slot, announcement source, successful
 fetch source, mode, acquisition time, target, last confirmed absence, first RPC
@@ -231,21 +235,19 @@ canonical readiness across all targets, incomplete observations, left-censoring,
 dropped work, source outages, Engine outcomes, and Beacon publication responses.
 Never discard timeouts to improve a percentile. A successful POST is not a speed result.
 
-Use a preselected, randomized sequence of epoch-sized observe/inject windows.
-Exclude the first two slots after each mode transition from latency comparisons
-to reduce carryover. Keep those slots in the safety report. Exclude reconnect
-reconciliation events from latency comparisons. Retain same-slot competitors by
-hash; report canonical blocks separately. Collect at least 10,000 eligible blocks
-per mode and report confidence intervals by resampling whole epoch windows.
-Keep all targets in each block's denominator. Count a block as incomplete if any
-target is missing. Independently reconcile the observed slot/block set against
-Lighthouse so source/acquisition failures cannot silently disappear from the trial.
+Observe at least 32 current canonical blocks during functional acceptance. Check
+complete block and blob acquisition, submission results, direct RPC and Beacon
+imports, and destination coverage. Keep execution forwarding active if complete
+blobs are unavailable; report the consensus limitation and do not claim complete
+acceptance. Distinguish RPC-confirmed already-known skips from duplicate
+suppression and failed delivery.
 
-Enable injection only if the all-node readiness tail improves without a material
-increase in incomplete blocks, Engine errors, RPC latency, or Lighthouse import
-latency. If the interval is inconclusive, keep observe mode. If contention or
-canonical readiness dominates, payload relay is not the proven fix; inspect
-the existing Lighthouse gossip path and node execution timings first.
+A speed claim requires comparable full-fleet data and uncertainty estimates.
+Use the same sources, targets, probe load, and observer location across trials.
+Include incomplete blocks and errors in the results. Larger randomized trials
+can improve the estimate; they are not a prerequisite for broadcast. Roll back
+an affected application only for a confirmed release defect. A source, target,
+or recording outage alone is not a reason to disable healthy forwarding.
 
 ## Bounds
 

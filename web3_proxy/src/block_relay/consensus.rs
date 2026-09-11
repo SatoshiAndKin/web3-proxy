@@ -31,17 +31,24 @@ pub(super) struct ConsensusTarget {
     pub name: String,
     http: BeaconHttp,
     confirmed: Cache<B256, ()>,
+    attempts: Cache<B256, Attempt>,
     evidence: Notify,
     probes: Semaphore,
 }
 
+#[derive(Clone)]
 pub(super) struct Context {
     pub network: config::Network,
     pub stop: watch::Receiver<bool>,
     pub mode: watch::Receiver<Mode>,
     pub cache: Cache<B256, Arc<ConsensusPayload>>,
     pub stats: Shared,
-    pub ttl: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct Attempt {
+    count: u8,
+    parent_confirmed: bool,
 }
 
 impl ConsensusTarget {
@@ -50,9 +57,15 @@ impl ConsensusTarget {
             name,
             http: BeaconHttp::new(&config.beacon_url, &config.headers)?,
             confirmed: Cache::builder().max_capacity(512).time_to_live(ttl).build(),
+            attempts: Cache::builder().max_capacity(512).time_to_live(ttl).build(),
             evidence: Notify::new(),
             probes: Semaphore::new(4),
         })
+    }
+
+    pub fn retain_delivery(&mut self, previous: &Self) {
+        self.confirmed = previous.confirmed.clone();
+        self.attempts = previous.attempts.clone();
     }
 
     async fn header(&self, root: B256) -> Result<Option<HeaderResponse>> {
@@ -82,7 +95,7 @@ impl ConsensusTarget {
                 .is_ok_and(|h| h.is_some_and(|h| !h.execution_optimistic))
     }
 
-    async fn publish(&self, payload: &ConsensusPayload, stats: &Shared) -> bool {
+    async fn publish(&self, payload: &ConsensusPayload, stats: &Shared) {
         if self.confirmed.contains_key(&payload.block.beacon_root) {
             stats
                 .lock()
@@ -90,7 +103,7 @@ impl ConsensusTarget {
                 .entry(self.name.clone())
                 .or_default()
                 .skipped_known += 1;
-            return true;
+            return;
         }
         let started = Instant::now();
         stats
@@ -104,17 +117,22 @@ impl ConsensusTarget {
             let mut s = stats.lock();
             let t = s.consensus_targets.entry(self.name.clone()).or_default();
             t.publish_latency.record(stats::micros(started.elapsed()));
-            match result {
+            match &result {
                 Ok(200) => {
                     t.published += 1;
-                    t.health.connected = true;
+                    t.health
+                        .success(payload.block.slot, "Beacon publication HTTP 200");
                 }
                 Ok(202) => {
                     t.accepted += 1;
-                    t.health.connected = true;
+                    t.health.success(
+                        payload.block.slot,
+                        "Beacon publication HTTP 202; import unconfirmed",
+                    );
                 }
                 Ok(code) => {
                     t.rejected += 1;
+                    t.health.connected = false;
                     t.health.errors += 1;
                     t.health.detail = format!("Beacon publication HTTP {code}");
                 }
@@ -126,8 +144,18 @@ impl ConsensusTarget {
                 }
             }
         }
-        // A 200 or 202 is not an import observation. Confirm the root independently.
-        self.has_block(payload.block.beacon_root).await
+        stats.lock().record(super::recording::Record::Submission {
+            layer: stats::Layer::Consensus,
+            root: payload.block.beacon_root,
+            hash: payload.block.hash,
+            slot: payload.block.slot,
+            target: self.name.clone(),
+            elapsed_us: stats::micros(started.elapsed()),
+            outcome: result
+                .map(|code| format!("http_{code}"))
+                .unwrap_or_else(|_| "unknown".into()),
+        });
+        // Independent observers confirm imports and wake children. Never await a read here.
     }
 
     fn active(work: &Work, context: &Context) -> bool {
@@ -137,17 +165,19 @@ impl ConsensusTarget {
             && Instant::now() < work.deadline
     }
 
-    async fn repair(&self, work: &ConsensusWork, context: &Context) -> bool {
+    async fn ancestors(
+        &self,
+        work: &ConsensusWork,
+        context: &Context,
+    ) -> Vec<Arc<ConsensusPayload>> {
         let mut root = work.payload.block.parent_beacon_root;
         let mut chain = Vec::new();
-        let mut anchored = false;
         for _ in 0..=8 {
             if !Self::active(&work.work, context) {
-                return false;
+                return Vec::new();
             }
             if self.has_block(root).await {
-                anchored = true;
-                break;
+                return chain;
             }
             if chain.len() == 8 {
                 break;
@@ -167,29 +197,14 @@ impl ConsensusTarget {
             root = parent.block.parent_beacon_root;
             chain.push(parent);
         }
-        if !anchored {
-            context
-                .stats
-                .lock()
-                .consensus_targets
-                .entry(self.name.clone())
-                .or_default()
-                .repair_gaps += 1;
-            return false;
-        }
-        for parent in chain.into_iter().rev() {
-            if !Self::active(&work.work, context) || !self.publish(&parent, &context.stats).await {
-                return false;
-            }
-            context
-                .stats
-                .lock()
-                .consensus_targets
-                .entry(self.name.clone())
-                .or_default()
-                .repairs += 1;
-        }
-        true
+        context
+            .stats
+            .lock()
+            .consensus_targets
+            .entry(self.name.clone())
+            .or_default()
+            .repair_gaps += 1;
+        Vec::new()
     }
 
     pub async fn run(
@@ -219,10 +234,9 @@ impl ConsensusTarget {
             }
             tokio::select! { _ = context.stop.changed() => return, _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
         }
-        let attempts = Cache::<B256, u8>::builder()
-            .max_capacity(512)
-            .time_to_live(context.ttl)
-            .build();
+        let attempts = &self.attempts;
+        let mut repairs = tokio::task::JoinSet::<(Arc<Work>, Vec<Arc<ConsensusPayload>>)>::new();
+        let mut confirmations = tokio::task::JoinSet::new();
         let mut waiting = BTreeMap::<B256, Arc<ConsensusWork>>::new();
         let mut pending = VecDeque::new();
         loop {
@@ -291,6 +305,19 @@ impl ConsensusTarget {
                 tokio::select! {
                     _ = context.stop.changed() => return,
                     _ = self.evidence.notified() => continue,
+                    _ = confirmations.join_next(), if !confirmations.is_empty() => continue,
+                    result = repairs.join_next(), if !repairs.is_empty() => {
+                        if let Some(Ok((work, parents))) = result {
+                            for payload in parents {
+                                if waiting.len() == 128 {
+                                    context.stats.lock().consensus_targets.entry(self.name.clone()).or_default().queue_dropped += 1;
+                                    break;
+                                }
+                                waiting.entry(payload.block.beacon_root).or_insert_with(|| Arc::new(ConsensusWork { work: work.clone(), payload }));
+                            }
+                        }
+                        continue;
+                    }
                     item = incoming.recv() => match item {
                         Ok(work) => work,
                         Err(broadcast::error::RecvError::Closed) => return,
@@ -312,27 +339,66 @@ impl ConsensusTarget {
                     .skipped_known += 1;
                 continue;
             }
-            let tried = attempts.get(&root).await.unwrap_or_default();
-            if tried >= 2
-                || (tried > 0
-                    && !self
-                        .confirmed
-                        .contains_key(&work.payload.block.parent_beacon_root))
-            {
+            let previous = attempts.get(&root).await;
+            let parent_confirmed = self
+                .confirmed
+                .contains_key(&work.payload.block.parent_beacon_root);
+            if previous.is_some_and(|a| a.count >= 2 || a.parent_confirmed || !parent_confirmed) {
                 continue;
             }
-            attempts.insert(root, tried + 1).await;
-            if self.publish(&work.payload, &context.stats).await {
-                continue;
+            let count = previous.map_or(1, |a| a.count + 1);
+            attempts
+                .insert(
+                    root,
+                    Attempt {
+                        count,
+                        parent_confirmed,
+                    },
+                )
+                .await;
+            self.publish(&work.payload, &context.stats).await;
+            // The observer has its own bounded task and read permits. A stalled header
+            // cannot delay the next publication. It also confirms repaired ancestors.
+            while confirmations.try_join_next().is_some() {}
+            if confirmations.len() < 128 {
+                let target = self.clone();
+                let work = work.clone();
+                confirmations.spawn(async move {
+                    let poll = async {
+                        while Instant::now() < work.work.deadline {
+                            if target.has_block(work.payload.block.beacon_root).await {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    };
+                    let _ = tokio::time::timeout_at(work.work.deadline, poll).await;
+                });
+            } else {
+                context.stats.lock().observation_dropped += 1;
             }
-            if tried == 0
-                && self.repair(&work, &context).await
-                && Self::active(&work.work, &context)
-            {
-                attempts.insert(root, 2).await;
-                if self.publish(&work.payload, &context.stats).await {
-                    continue;
-                }
+            if count == 1 && repairs.len() < 8 {
+                let target = self.clone();
+                let work = work.clone();
+                let context = context.clone();
+                repairs.spawn(async move {
+                    let parents = tokio::time::timeout_at(
+                        work.work.deadline,
+                        target.ancestors(&work, &context),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    if !parents.is_empty() {
+                        context
+                            .stats
+                            .lock()
+                            .consensus_targets
+                            .entry(target.name.clone())
+                            .or_default()
+                            .repairs += parents.len() as u64;
+                    }
+                    (work.work.clone(), parents)
+                });
             }
             if waiting.len() < 128 {
                 waiting.insert(root, work);
@@ -374,7 +440,14 @@ impl ConsensusTarget {
                     sample.last_missing_us =
                         Some(stats::micros(query_start.duration_since(work.first_seen)))
                 }
-                _ => {} // Errors and optimistic responses are not proof of absence or completed import.
+                Err(error) => stats
+                    .lock()
+                    .consensus_targets
+                    .entry(self.name.clone())
+                    .or_default()
+                    .observation
+                    .failure(&error.to_string()),
+                _ => {} // Optimistic responses are not proof of absence or completed import.
             }
             tokio::time::sleep(if work.first_seen.elapsed() < Duration::from_secs(1) {
                 Duration::from_millis(10)
@@ -388,7 +461,8 @@ impl ConsensusTarget {
         let t = s.consensus_targets.entry(self.name.clone()).or_default();
         if let Some(ready) = ready {
             t.health.progress(work.payload.slot);
-            t.health.connected = true;
+            t.observation
+                .success(work.payload.slot, "Beacon import confirmed");
             t.ready += 1;
             t.ready_latency.record(ready);
             if sample.last_missing_us.is_none() {
@@ -396,6 +470,8 @@ impl ConsensusTarget {
             }
         } else {
             t.incomplete += 1;
+            t.observation
+                .failure("Beacon import unconfirmed before deadline");
         }
         if optimistic {
             t.optimistic += 1;

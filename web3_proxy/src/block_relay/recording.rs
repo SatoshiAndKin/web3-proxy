@@ -19,6 +19,15 @@ pub(super) type Sender = mpsc::Sender<Record>;
 #[derive(Serialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub(super) enum Record {
+    Submission {
+        layer: super::stats::Layer,
+        root: alloy::primitives::B256,
+        hash: alloy::primitives::B256,
+        slot: u64,
+        target: String,
+        outcome: String,
+        elapsed_us: u64,
+    },
     Observation(Sample),
     BlobReady {
         root: alloy::primitives::B256,
@@ -116,21 +125,76 @@ impl Recording {
         self.file.get_ref().sync_data().await?;
         Ok(())
     }
-    pub async fn run(mut self, mut records: mpsc::Receiver<Record>) -> Result<()> {
-        let run = async {
-            let mut flush = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    _ = flush.tick() => self.flush().await?,
-                    record = records.recv() => match record {
-                        Some(record) => self.append(&record).await?,
-                        None => return self.flush().await,
+    /// Disk work never runs on the forwarding task. Retain files and retry storage at
+    /// a bounded rate; consume and count dropped records while storage is unavailable.
+    pub async fn supervise(
+        state_dir: PathBuf,
+        mut records: mpsc::Receiver<Record>,
+        stats: super::stats::Shared,
+    ) {
+        let mut writer: Option<Self> = None;
+        let mut pending_records = 0u64;
+        let mut retry_at = tokio::time::Instant::now();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if writer.is_none() && tokio::time::Instant::now() >= retry_at {
+                match tokio::time::timeout(Duration::from_secs(2), Self::open(&state_dir)).await {
+                    Ok(Ok(opened)) => writer = Some(opened),
+                    _ => {
+                        stats
+                            .lock()
+                            .recording
+                            .failure("cannot open measurement storage");
+                        retry_at = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
                 }
             }
-        };
-        run.await
-            .map_err(|_| anyhow::anyhow!("private relay measurement log failed; check storage"))
+            let result = tokio::select! {
+                _ = tick.tick() => {
+                    if let Some(writer) = writer.as_mut() {
+                        match tokio::time::timeout(Duration::from_secs(2), writer.flush()).await {
+                            Ok(Ok(())) => {
+                                pending_records = 0;
+                                stats.lock().recording.success(0, "measurement storage available");
+                                Ok(())
+                            }
+                            _ => Err(()),
+                        }
+                    } else { Ok(()) }
+                }
+                record = records.recv() => match record {
+                    Some(record) => {
+                        if let Some(writer) = writer.as_mut() {
+                            pending_records += 1;
+                            match tokio::time::timeout(Duration::from_secs(2), writer.append(&record)).await {
+                                Ok(Ok(())) => Ok(()),
+                                _ => Err(()),
+                            }
+                        } else { stats.lock().recording_dropped += 1; Ok(()) }
+                    }
+                    None => {
+                        if let Some(writer) = writer.as_mut() {
+                            if !matches!(tokio::time::timeout(Duration::from_secs(1), writer.flush()).await, Ok(Ok(()))) {
+                                let mut s = stats.lock();
+                                s.recording_dropped += pending_records;
+                                s.recording.failure("measurement flush failed");
+                            }
+                        }
+                        return;
+                    }
+                }
+            };
+            if result.is_err() {
+                let mut s = stats.lock();
+                s.recording
+                    .failure("measurement write failed; storage retry pending");
+                s.recording_dropped += pending_records;
+                pending_records = 0;
+                writer = None;
+                retry_at = tokio::time::Instant::now() + Duration::from_secs(5);
+            }
+        }
     }
 }
 
@@ -151,9 +215,7 @@ mod tests {
         recording.append(&record).await.unwrap();
         recording.total_bytes = MAX_TOTAL_BYTES;
         assert!(recording.append(&record).await.is_err());
-        let (send, recv) = mpsc::channel(1);
-        drop(send);
-        recording.run(recv).await.unwrap();
+        recording.flush().await.unwrap();
         let mut files = tokio::fs::read_dir(directory.path().join("observations"))
             .await
             .unwrap();
