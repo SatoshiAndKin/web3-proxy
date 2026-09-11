@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::{collections::BTreeMap, time::Duration};
 use tokio::{sync::watch, time::Instant};
 
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Context {

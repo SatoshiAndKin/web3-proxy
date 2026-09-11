@@ -4,16 +4,90 @@ use alloy_rpc_types_engine::{Claims, JwtSecret, PayloadStatus};
 use anyhow::{ensure, Result};
 use futures_util::StreamExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 use url::Url;
 
+/// Identity of a Beacon endpoint. Credentials are represented by a stable digest,
+/// never by their value, so transports cannot share reads across auth boundaries.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct EndpointIdentity {
+    pub url: String,
+    pub credential_identity: u64,
+    pub network_identity: String,
+}
+
+impl EndpointIdentity {
+    pub fn new(base: &str, headers: &BTreeMap<String, String>, network: &str) -> Result<Self> {
+        let mut normalized = super::config::url(base)?;
+        let path = normalized.path().trim_end_matches('/').to_owned();
+        normalized.set_path(if path.is_empty() { "/" } else { &path });
+        if (normalized.port() == Some(80) && normalized.scheme() == "http")
+            || (normalized.port() == Some(443) && normalized.scheme() == "https")
+        {
+            let _ = normalized.set_port(None);
+        }
+        let url = normalized.to_string();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let normalized_headers: BTreeMap<_, _> = headers
+            .iter()
+            .map(|(key, value)| (key.to_ascii_lowercase(), value))
+            .collect();
+        for (key, value) in normalized_headers {
+            key.hash(&mut hasher);
+            value.hash(&mut hasher);
+        }
+        Ok(Self {
+            url,
+            credential_identity: hasher.finish(),
+            network_identity: network.to_owned(),
+        })
+    }
+}
+
+/// Process-local registry for endpoint-scoped Beacon read coordinators.
+#[derive(Default)]
+pub struct BeaconReadCoordinators {
+    entries: HashMap<EndpointIdentity, BeaconHttp>,
+}
+
+impl BeaconReadCoordinators {
+    pub(super) fn get_or_insert(
+        &mut self,
+        base: &str,
+        headers: &BTreeMap<String, String>,
+        network: &str,
+    ) -> Result<BeaconHttp> {
+        let identity = EndpointIdentity::new(base, headers, network)?;
+        if let Some(http) = self.entries.get(&identity) {
+            return Ok(http.clone());
+        }
+        let http = BeaconHttp::new(base, headers)?;
+        self.entries.insert(identity, http.clone());
+        Ok(http)
+    }
+}
+
+struct SharedRead {
+    result: tokio::sync::OnceCell<std::result::Result<Option<bytes::Bytes>, String>>,
+}
+
 /// The same private Beacon transport serves source reads and consensus targets.
+#[derive(Clone)]
 pub(super) struct BeaconHttp {
+    inner: Arc<BeaconHttpInner>,
+}
+struct BeaconHttpInner {
     pub client: reqwest::Client,
     pub headers: reqwest::header::HeaderMap,
     base: Url,
     reads: tokio::sync::Semaphore,
     blob_reads: tokio::sync::Semaphore,
+    shared_reads: tokio::sync::Mutex<HashMap<String, Arc<SharedRead>>>,
 }
 impl BeaconHttp {
     pub fn new(base: &str, values: &std::collections::BTreeMap<String, String>) -> Result<Self> {
@@ -28,34 +102,65 @@ impl BeaconHttp {
             headers.insert(key, value);
         }
         Ok(Self {
-            client: client()?,
-            headers,
-            base: super::config::url(base)?,
-            reads: tokio::sync::Semaphore::new(2),
-            blob_reads: tokio::sync::Semaphore::new(2),
+            inner: Arc::new(BeaconHttpInner {
+                client: client()?,
+                headers,
+                base: super::config::url(base)?,
+                reads: tokio::sync::Semaphore::new(2),
+                blob_reads: tokio::sync::Semaphore::new(2),
+                shared_reads: tokio::sync::Mutex::new(HashMap::new()),
+            }),
         })
     }
     pub fn endpoint(&self, path: &str) -> Url {
-        let mut url = self.base.clone();
+        let mut url = self.inner.base.clone();
         url.set_path(&format!(
             "{}{}",
-            self.base.path().trim_end_matches('/'),
+            self.inner.base.path().trim_end_matches('/'),
             path
         ));
         url
     }
+    pub fn client(&self) -> &reqwest::Client {
+        &self.inner.client
+    }
+    pub fn headers(&self) -> &reqwest::header::HeaderMap {
+        &self.inner.headers
+    }
     pub async fn get_bytes(&self, path: &str) -> Result<Option<bytes::Bytes>> {
+        let key = path.to_owned();
+        let shared = {
+            let mut reads = self.inner.shared_reads.lock().await;
+            reads
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    Arc::new(SharedRead {
+                        result: tokio::sync::OnceCell::new(),
+                    })
+                })
+                .clone()
+        };
+        let result = shared
+            .result
+            .get_or_init(|| async { self.fetch_bytes(path).await.map_err(|e| e.to_string()) })
+            .await
+            .clone();
+        self.inner.shared_reads.lock().await.remove(&key);
+        result.map_err(|e| anyhow::anyhow!(e))
+    }
+    async fn fetch_bytes(&self, path: &str) -> Result<Option<bytes::Bytes>> {
         let pool = if path.starts_with("/eth/v1/beacon/blobs/") {
-            &self.blob_reads
+            &self.inner.blob_reads
         } else {
-            &self.reads
+            &self.inner.reads
         };
         let operation = async {
             let _permit = pool.acquire().await?;
             let response = self
+                .inner
                 .client
                 .get(self.endpoint(path))
-                .headers(self.headers.clone())
+                .headers(self.inner.headers.clone())
                 .send()
                 .await
                 .map_err(|_| anyhow::anyhow!("Beacon transport error"))?;
@@ -82,9 +187,10 @@ impl BeaconHttp {
             url.query_pairs_mut()
                 .append_pair("broadcast_validation", "gossip");
             let response = self
+                .inner
                 .client
                 .post(url)
-                .headers(self.headers.clone())
+                .headers(self.inner.headers.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header("Eth-Consensus-Version", &payload.block.fork)
                 .body(payload.body.clone())
@@ -284,5 +390,29 @@ impl Rpc {
         tokio::time::timeout(duration, operation)
             .await
             .map_err(|_| anyhow::anyhow!("RPC timeout; result unknown"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_identity_normalizes_url_but_keeps_credentials_and_networks_separate() {
+        let mut first = BTreeMap::new();
+        first.insert("X-Token".into(), "one".into());
+        let mut second = BTreeMap::new();
+        second.insert("x-token".into(), "two".into());
+        let a = EndpointIdentity::new("https://node.example:443/api/", &first, "mainnet").unwrap();
+        let b = EndpointIdentity::new("https://node.example/api", &first, "mainnet").unwrap();
+        assert_eq!(a, b);
+        assert_ne!(
+            a,
+            EndpointIdentity::new("https://node.example/api", &second, "mainnet").unwrap()
+        );
+        assert_ne!(
+            a,
+            EndpointIdentity::new("https://node.example/api", &first, "devnet").unwrap()
+        );
     }
 }
