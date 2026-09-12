@@ -55,10 +55,19 @@ impl ConsensusTarget {
     pub(super) fn confirmed(&self, root: B256) -> bool {
         self.confirmed.contains_key(&root)
     }
+    #[cfg(test)]
     pub fn new(name: String, config: &config::ConsensusTarget, ttl: Duration) -> Result<Self> {
+        Self::new_with_http(name, config, ttl, None)
+    }
+    pub(super) fn new_with_http(
+        name: String,
+        config: &config::ConsensusTarget,
+        ttl: Duration,
+        http: Option<BeaconHttp>,
+    ) -> Result<Self> {
         Ok(Self {
             name,
-            http: BeaconHttp::new(&config.beacon_url, &config.headers)?,
+            http: http.unwrap_or(BeaconHttp::new(&config.beacon_url, &config.headers)?),
             confirmed: Cache::builder().max_capacity(512).time_to_live(ttl).build(),
             attempts: Cache::builder().max_capacity(512).time_to_live(ttl).build(),
             evidence: Notify::new(),

@@ -1,5 +1,6 @@
 use super::one::Web3Rpc;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
+use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::jsonrpc::{
     self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
 };
@@ -413,7 +414,7 @@ impl BackendRequest {
                         {
                             response = Err(history_error);
                             ResponseType::Error
-                        } else if error.message.starts_with("execution reverted") {
+                        } else if error.is_execution_revert() {
                             ResponseType::Revert
                         } else if error.code == StatusCode::TOO_MANY_REQUESTS.as_u16() as i64 {
                             response = Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
@@ -607,7 +608,14 @@ impl OpenRequestHandle {
     pub async fn request<R: JsonRpcResultData>(
         self,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
-        self.request_with(|response| async { Ok(response) }).await
+        if matches!(
+            self.request.web3_request.proxy_mode(),
+            ProxyMode::Fastest(_)
+        ) {
+            self.request_parsed().await
+        } else {
+            self.request_with(|response| async { Ok(response) }).await
+        }
     }
 
     pub async fn request_parsed<R: JsonRpcResultData>(

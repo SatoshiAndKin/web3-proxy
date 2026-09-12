@@ -80,7 +80,7 @@ async fn receive(
 }
 
 pub(super) struct Harness {
-    app: Arc<App>,
+    pub(super) app: Arc<App>,
     pub(super) rpc: Arc<Web3Rpc>,
     incoming: mpsc::UnboundedReceiver<Incoming>,
     server: JoinHandle<()>,
@@ -97,14 +97,23 @@ impl Harness {
         Self::named("controlled-backend", concurrency, packet_size).await
     }
 
-    async fn named(name: &str, concurrency: usize, packet_size: usize) -> Self {
+    pub(super) async fn named(name: &str, concurrency: usize, packet_size: usize) -> Self {
+        Self::configured(name, concurrency, packet_size, |_| {}).await
+    }
+
+    pub(super) async fn configured(
+        name: &str,
+        concurrency: usize,
+        packet_size: usize,
+        configure: impl FnOnce(&mut Web3Rpc),
+    ) -> Self {
         let (sender, incoming) = mpsc::unbounded_channel();
         let router = Router::new().route("/", post(receive)).with_state(sender);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let (hard_limit_until, _) = watch::channel(Instant::now());
-        let rpc = Arc::new(Web3Rpc {
+        let mut rpc = Web3Rpc {
             name: name.into(),
             healthy: AtomicBool::new(true),
             http_client: Some(reqwest::Client::new()),
@@ -118,7 +127,9 @@ impl Harness {
             )),
             median_latency: Some(RollingQuantileLatency::spawn_median(100).await),
             ..Default::default()
-        });
+        };
+        configure(&mut rpc);
+        let rpc = Arc::new(rpc);
         let (head_sender, watch_consensus_head_receiver) = watch::channel(None);
         let (balanced_rpcs, background, _) = Web3Rpcs::spawn(
             Web3RpcsSpawnConfig::new(1, None, 0, 0, 1_000_000),
@@ -151,6 +162,7 @@ impl Harness {
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
             config: AppConfig::default(),
+            fastest_rpcs: watch::channel(crate::config::DEFAULT_FASTEST_RPCS).0,
             http_client: None,
             watch_consensus_head_receiver,
             pending_txid_firehose: DedupedBroadcaster::new(4, 16),
@@ -237,7 +249,7 @@ fn assert_timeout_responses(mut actual: Value, expected: Value) {
     }
 }
 
-async fn advance_to(target: Instant) {
+pub(super) async fn advance_to(target: Instant) {
     tokio::time::pause();
     tokio::time::advance(target.saturating_duration_since(Instant::now())).await;
     tokio::time::resume();
@@ -1244,7 +1256,7 @@ fn packet_params(packet: &Incoming) -> Vec<Value> {
         .collect()
 }
 
-async fn send_stalled_body(
+pub(super) async fn send_stalled_body(
     incoming: Incoming,
     prefix: String,
 ) -> mpsc::Sender<Result<Bytes, std::io::Error>> {

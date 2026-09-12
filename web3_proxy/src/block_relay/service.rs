@@ -64,18 +64,28 @@ impl Prepared {
             );
         }
         let mut errors = Vec::new();
+        let network_identity = format!(
+            "{}:{}:{:?}",
+            config.network.genesis_validators_root,
+            config.network.genesis_time,
+            config.network.forks
+        );
+        let mut coordinators = super::transport::BeaconReadCoordinators::default();
         let sources = config
             .sources
             .iter()
-            .filter_map(
-                |(name, config)| match BeaconSource::new(name.clone(), config) {
+            .filter_map(|(name, config)| {
+                match coordinators
+                    .get_or_insert(&config.beacon_url, &config.headers, &network_identity)
+                    .and_then(|http| BeaconSource::new_with_http(name.clone(), config, Some(http)))
+                {
                     Ok(source) => Some(Arc::new(source)),
                     Err(error) => {
                         errors.push((Layer::Source, name.clone(), error.to_string()));
                         None
                     }
-                },
-            )
+                }
+            })
             .collect();
         let ttl = Duration::from_secs(2 * SLOTS_PER_EPOCH * config.network.seconds_per_slot);
         let targets = config
@@ -132,8 +142,12 @@ impl Prepared {
         let consensus_targets = config
             .consensus_targets
             .iter()
-            .filter_map(
-                |(name, c)| match ConsensusTarget::new(name.clone(), c, ttl) {
+            .filter_map(|(name, c)| {
+                match coordinators
+                    .get_or_insert(&c.beacon_url, &c.headers, &network_identity)
+                    .and_then(|http| {
+                        ConsensusTarget::new_with_http(name.clone(), c, ttl, Some(http))
+                    }) {
                     Ok(mut target) => {
                         if let Some(old) = previous.as_ref().and_then(|p| {
                             p.config
@@ -156,8 +170,8 @@ impl Prepared {
                         errors.push((Layer::Consensus, name.clone(), error.to_string()));
                         None
                     }
-                },
-            )
+                }
+            })
             .collect();
         Ok(Self {
             config,

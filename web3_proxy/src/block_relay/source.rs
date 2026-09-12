@@ -114,10 +114,21 @@ impl BeaconSource {
         );
         result
     }
+    #[cfg(test)]
     pub fn new(name: String, config: &Source) -> Result<Self> {
+        Self::new_with_http(name, config, None)
+    }
+    pub(super) fn new_with_http(
+        name: String,
+        config: &Source,
+        http: Option<transport::BeaconHttp>,
+    ) -> Result<Self> {
         Ok(Self {
             name,
-            http: transport::BeaconHttp::new(&config.beacon_url, &config.headers)?,
+            http: http.unwrap_or(transport::BeaconHttp::new(
+                &config.beacon_url,
+                &config.headers,
+            )?),
             cost_class: config.cost_class,
             resources: config.resources.clone(),
             verified: AtomicBool::new(false),
@@ -261,9 +272,9 @@ impl BeaconSource {
             .append_pair("topics", "block_gossip,block");
         let send = |url| {
             self.http
-                .client
+                .client()
                 .get(url)
-                .headers(self.http.headers.clone())
+                .headers(self.http.headers().clone())
                 .send()
         };
         let mut response = tokio::time::timeout(transport::ENGINE_TIMEOUT, send(url))

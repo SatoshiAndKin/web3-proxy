@@ -60,6 +60,8 @@ pub struct App {
     /// application config
     /// TODO: this will need a large refactor to handle reloads while running. maybe use a watch::Receiver and a task_local?
     pub config: AppConfig,
+    /// Reloadable Fastest fanout. Each incoming request snapshots this value.
+    pub(crate) fastest_rpcs: watch::Sender<usize>,
     pub http_client: Option<reqwest::Client>,
     /// rpc clients that subscribe to newHeads use this channel
     /// don't drop this or the sender will stop working
@@ -244,6 +246,7 @@ impl App {
             balanced_rpcs,
             bundler_4337_rpcs,
             config: top_config.app.clone(),
+            fastest_rpcs: watch::channel(top_config.app.fastest_rpcs).0,
             frontend_port: frontend_port.clone(),
             hostname,
             http_client,
@@ -341,6 +344,8 @@ impl App {
 
     async fn apply_top_config_rpcs(&self, new_top_config: &TopConfig) -> Web3ProxyResult<()> {
         info!("applying new config");
+        self.fastest_rpcs
+            .send_replace(new_top_config.app.fastest_rpcs);
 
         let relay = self
             .block_relay
@@ -735,6 +740,10 @@ impl App {
                     last_success = Some(response_data);
                     break;
                 }
+                Err(err @ Web3ProxyError::ExhaustedBackends(_)) => {
+                    last_error = Some(err);
+                    break;
+                }
                 Err(err) => {
                     last_error = Some(err);
                 }
@@ -934,15 +943,24 @@ impl App {
             }
             "eth_estimateGas" => {
                 // TODO: timeout
-                let mut gas_estimate = self
+                let response = self
                     .balanced_rpcs
                     .try_proxy_connection::<U256>(
                         web3_request,
                     )
                     .await?
                     .parsed()
-                    .await?
-                    .into_result()?;
+                    .await?;
+                let mut gas_estimate = match response.payload {
+                    jsonrpc::ResponsePayload::Success { result } => result,
+                    jsonrpc::ResponsePayload::Error { error } => {
+                        if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_)) {
+                            // The scheduler already accepted this response and cancelled its losers.
+                            return Ok(jsonrpc::ParsedResponse::from_error(error, web3_request.id()).into());
+                        }
+                        return Err(Web3ProxyError::JsonRpcErrorData(error));
+                    }
+                };
 
                 let gas_increase = if let Some(gas_increase_percent) =
                     self.config.gas_increase_percent
@@ -993,6 +1011,7 @@ impl App {
                         }
                     },
                     Ok(SingleResponse::Stream(..)) => unimplemented!(),
+                    Err(Web3ProxyError::ExhaustedBackends(_)) => false,
                     Err(..) => true,
                 };
 
@@ -1176,6 +1195,7 @@ mod tests {
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
             config: AppConfig::default(),
+            fastest_rpcs: watch::channel(crate::config::DEFAULT_FASTEST_RPCS).0,
             http_client: None,
             watch_consensus_head_receiver,
             pending_txid_firehose: DedupedBroadcaster::new(4, 16),
@@ -1287,13 +1307,15 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":"latest-hashes","method":"eth_getBlockByNumber","params":["latest",false]}"#.into(),
         ];
 
-        for request in requests {
+        for (request, mode) in requests.into_iter().flat_map(|request| {
+            [ProxyMode::Best, ProxyMode::Fastest(2)].map(|mode| (request.clone(), mode))
+        }) {
             let request: SingleRequest = sonic_rs::from_str(&request).unwrap();
             let expected_id: serde_json::Value =
                 serde_json::from_str(&sonic_rs::to_string(&request.id).unwrap()).unwrap();
             let full_transactions = request.params[1].as_bool().unwrap();
             let (status, response, backend_rpcs) = app
-                .proxy_request(request, ProxyMode::Best, Some(head.clone()), None)
+                .proxy_request(request, mode, Some(head.clone()), None)
                 .await;
             let response = response.parsed().await.unwrap();
             let response: serde_json::Value =

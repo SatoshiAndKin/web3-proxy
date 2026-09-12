@@ -17,6 +17,9 @@ pub struct JsonRpcErrorData {
 }
 
 impl JsonRpcErrorData {
+    pub(crate) fn is_execution_revert(&self) -> bool {
+        self.message.starts_with("execution reverted")
+    }
     pub fn num_bytes(&self) -> u64 {
         sonic_rs::to_string(self)
             .expect("should always serialize")

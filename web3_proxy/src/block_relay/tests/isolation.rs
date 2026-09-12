@@ -300,7 +300,7 @@ async fn recording_recovers_after_storage_repair_without_clearing_error_history(
     let line = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
     assert_eq!(line.lines().count(), 1);
     let mut recorded: sonic_rs::Value = sonic_rs::from_str(line.trim()).unwrap();
-    assert_eq!(recorded["context"]["schema"], json!(1));
+    assert_eq!(recorded["context"]["schema"], json!(2));
     assert_eq!(
         recorded["context"]["sequence"],
         json!(2),
