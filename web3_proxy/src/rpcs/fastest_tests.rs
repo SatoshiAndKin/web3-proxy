@@ -11,14 +11,15 @@ use crate::{
     frontend::rpc_proxy_ws::ProxyMode,
     jsonrpc::{JsonRpcRequestEnum, SingleRequest, SingleResponse, ValidatedRequest},
 };
-use alloy::primitives::U64;
+use alloy::primitives::{U256, U64};
 use alloy::providers::Provider;
 use alloy::rpc::types::Header;
 use hashbrown::HashMap;
 use serde_json::{json, Value};
 use std::sync::{atomic::Ordering, Arc};
 use tokio::{
-    net::TcpListener,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     sync::{mpsc, watch},
     task::JoinHandle,
     time::{timeout, Duration, Instant},
@@ -30,6 +31,10 @@ struct Fleet {
 }
 impl Fleet {
     async fn new(synced: usize, total: usize) -> Self {
+        Self::configured(synced, total, AppConfig::default()).await
+    }
+
+    async fn configured(synced: usize, total: usize, config: AppConfig) -> Self {
         let mut nodes = Vec::new();
         for i in 0..total {
             let node = Harness::configured(&format!("node-{i}"), 4, 64, |rpc| {
@@ -46,6 +51,9 @@ impl Fleet {
             node.rpc.tier.store(i as u32 + 1, Ordering::SeqCst);
             nodes.push(node);
         }
+        let app = Arc::get_mut(&mut nodes[0].app).unwrap();
+        app.fastest_rpcs.send_replace(config.fastest_rpcs);
+        app.config = config;
         let app = nodes[0].app.clone();
         let fleet = Self { nodes, app };
         fleet.sync(synced);
@@ -103,6 +111,18 @@ impl Fleet {
                 .collect();
             assert!(node.rpc.request_permits.try_acquire().is_err());
             drop(permits);
+        }
+    }
+
+    async fn wait_for_active(&self, expected: &[usize]) {
+        while self
+            .nodes
+            .iter()
+            .map(|node| node.rpc.active_requests.load(Ordering::SeqCst))
+            .collect::<Vec<_>>()
+            != expected
+        {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -353,6 +373,42 @@ fn http_request(port: u16, path: &str, body: Value) -> JoinHandle<Value> {
     })
 }
 
+async fn websocket_client(port: u16) -> TcpStream {
+    let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    client.write_all(b"GET /fastest HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(client.read_u8().await.unwrap());
+    }
+    assert!(headers.starts_with(b"HTTP/1.1 101"));
+    client
+}
+
+async fn websocket_send(client: &mut TcpStream, body: &[u8]) {
+    assert!(body.len() < 126);
+    // Masked client text frame, with a deterministic all-zero mask.
+    client
+        .write_all(&[0x81, 0x80 | body.len() as u8, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    client.write_all(body).await.unwrap();
+}
+
+async fn websocket_response(client: &mut TcpStream) -> Value {
+    assert_eq!(client.read_u8().await.unwrap(), 0x81);
+    let len = client.read_u8().await.unwrap();
+    let len = match len {
+        0..=125 => u64::from(len),
+        126 => u64::from(client.read_u16().await.unwrap()),
+        127 => client.read_u64().await.unwrap(),
+        _ => panic!("server frame must not be masked"),
+    };
+    assert!(len < 8192);
+    let mut body = vec![0; len as usize];
+    client.read_exact(&mut body).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
 /// Keep Tokio time fixed while allowing socket I/O and ready tasks to run.
 /// The wall-clock bound only detects a hung test; it cannot fire the App retry timer.
 async fn without_advancing_time<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -365,7 +421,7 @@ async fn without_advancing_time<T>(future: impl std::future::Future<Output = T>)
             biased;
             value = &mut future => break value,
             _ = tokio::task::yield_now() => {
-                assert!(wall_start.elapsed() < Duration::from_secs(2), "response waited for a retry after exhaustion");
+                assert!(wall_start.elapsed() < Duration::from_secs(2), "response waited for an application retry");
             }
         }
     };
@@ -381,6 +437,241 @@ fn terminal_error(label: &str) -> Value {
 fn fail_with(call: Incoming, error: Value) {
     let id = call.body["id"].clone();
     call.respond(json!({"jsonrpc":"2.0","id":id,"error":error}));
+}
+
+fn gas_estimate_request(id: Value, data: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"eth_estimateGas","params":[{"to":"0x0000000000000000000000000000000000000000","data":data}]})
+}
+
+#[tokio::test]
+async fn accepted_fastest_gas_estimate_revert_returns_without_app_retry() {
+    let mut fleet = Fleet::new(3, 3).await;
+    let (port, server) = fleet.frontend().await;
+    let task = http_request(
+        port,
+        "/fastest",
+        gas_estimate_request(json!("client-id"), "0x"),
+    );
+    let pending = fleet.nodes[0].next().await;
+    let winner = fleet.nodes[1].next().await;
+    let error = json!({"code":3,"message":"execution reverted: estimate failed","data":{"reason":"exact \"data\"","return":"0xdeadbeef","details":[1,null]}});
+    assert_eq!(fleet.counts(), [1, 1, 0]);
+    let response = without_advancing_time(async {
+        fail_with(winner, error.clone());
+        task.await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        response,
+        json!({"jsonrpc":"2.0","id":"client-id","error":error})
+    );
+    assert_eq!(fleet.counts(), [1, 1, 0]);
+    fleet.idle();
+    drop(pending);
+    server.abort();
+}
+
+#[tokio::test]
+async fn accepted_fastest_gas_estimate_revert_does_not_restart_on_rankings() {
+    let mut fleet = Fleet::new(3, 3).await;
+    let (port, server) = fleet.frontend().await;
+    let mut task = http_request(port, "/fastest", gas_estimate_request(json!(42), "0x"));
+    let pending = fleet.nodes[0].next().await;
+    let winner = fleet.nodes[1].next().await;
+    let error = json!({"code":-32000,"message":"execution reverted"});
+    assert_eq!(fleet.counts(), [1, 1, 0]);
+    let response = without_advancing_time(async {
+        fail_with(winner, error.clone());
+        // The held loser can release its permit only when the race cancels it.
+        fleet.wait_for_active(&[0, 0, 0]).await;
+        fleet.idle();
+        fleet.sync(3);
+        loop {
+            assert_eq!(
+                fleet.counts(),
+                [1, 1, 0],
+                "ranking update restarted an accepted race"
+            );
+            tokio::select! {
+                response = &mut task => break response.unwrap(),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await;
+    assert_eq!(response, json!({"jsonrpc":"2.0","id":42,"error":error}));
+    fleet.sync(3);
+    for node in &mut fleet.nodes {
+        node.quiet().await;
+    }
+    assert_eq!(fleet.counts(), [1, 1, 0]);
+    fleet.idle();
+    drop(pending);
+    server.abort();
+}
+
+#[tokio::test]
+async fn accepted_fastest_gas_estimate_websocket_preserves_revert_and_escaped_id() {
+    let mut fleet = Fleet::new(3, 3).await;
+    let (port, server) = fleet.frontend().await;
+    let mut client = websocket_client(port).await;
+    websocket_send(
+        &mut client,
+        br#"{"jsonrpc":"2.0","id":"ws\u002d\"id\\","method":"eth_estimateGas","params":[{}]}"#,
+    )
+    .await;
+    let pending = fleet.nodes[0].next().await;
+    let winner = fleet.nodes[1].next().await;
+    let error =
+        json!({"code":3,"message":"execution reverted: websocket estimate","data":"0xdeadbeef"});
+    let response = without_advancing_time(async {
+        fail_with(winner, error.clone());
+        websocket_response(&mut client).await
+    })
+    .await;
+    assert_eq!(
+        response,
+        json!({"jsonrpc":"2.0","id":"ws-\"id\\","error":error})
+    );
+    fleet.sync(3);
+    for node in &mut fleet.nodes {
+        node.quiet().await;
+    }
+    assert_eq!(fleet.counts(), [1, 1, 0]);
+    fleet.idle();
+    drop((pending, client));
+    server.abort();
+}
+
+#[tokio::test]
+async fn accepted_fastest_gas_estimate_http_array_preserves_order_and_independent_results() {
+    let mut fleet = Fleet::new(3, 3).await;
+    let (port, server) = fleet.frontend().await;
+    let task = http_request(
+        port,
+        "/fastest",
+        json!([
+            gas_estimate_request(json!("duplicate"), "0x00"),
+            gas_estimate_request(json!("duplicate"), "0x01")
+        ]),
+    );
+    let mut pending = Vec::new();
+    let mut winners = Vec::new();
+    for (index, node) in fleet.nodes.iter_mut().take(2).enumerate() {
+        for _ in 0..2 {
+            let call = node.next().await;
+            assert!(
+                call.body.is_object(),
+                "gas estimates must use individual backend requests"
+            );
+            assert_eq!(call.body["method"], "eth_estimateGas");
+            assert_eq!(call.body["id"], "duplicate");
+            if index == 0 {
+                pending.push(call);
+            } else {
+                winners.push(call);
+            }
+        }
+    }
+    winners.sort_by_key(|call| call.body["params"][0]["data"].as_str().unwrap().to_owned());
+    assert_eq!(fleet.counts(), [2, 2, 0]);
+    let error = json!({"code":3,"message":"execution reverted: first item","data":"0xcafe"});
+    let response = without_advancing_time(async {
+        // Complete the second item, including its cancellation, before the first.
+        let success = winners.pop().unwrap();
+        assert_eq!(success.body["params"][0]["data"], "0x01");
+        succeed(success, json!("0x5208"));
+        fleet.wait_for_active(&[1, 1, 0]).await;
+        assert!(!task.is_finished());
+        let revert = winners.pop().unwrap();
+        assert_eq!(revert.body["params"][0]["data"], "0x00");
+        fail_with(revert, error.clone());
+        task.await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        response,
+        json!([
+            {"jsonrpc":"2.0","id":"duplicate","error":error},
+            {"jsonrpc":"2.0","id":"duplicate","result":"0x5208"}
+        ])
+    );
+    fleet.sync(3);
+    for node in &mut fleet.nodes {
+        node.quiet().await;
+    }
+    assert_eq!(fleet.counts(), [2, 2, 0]);
+    fleet.idle();
+    drop(pending);
+    server.abort();
+}
+
+#[tokio::test]
+async fn fastest_gas_estimate_keeps_configured_increases() {
+    for (percent, minimum, expected) in [
+        (None, None, 21_001u64),
+        (Some(10), None, 23_101),
+        (Some(10), Some(3_000), 24_001),
+        (None, Some(3_000), 24_001),
+    ] {
+        for path in ["/fastest", "/"] {
+            let config = AppConfig {
+                gas_increase_percent: percent.map(U256::from),
+                gas_increase_min: minimum.map(U256::from),
+                ..AppConfig::default()
+            };
+            let mut fleet = Fleet::configured(3, 3, config).await;
+            let (port, server) = fleet.frontend().await;
+            let task = http_request(port, path, gas_estimate_request(json!(7), "0x"));
+            let first = fleet.nodes[0].next().await;
+            let pending = if path == "/fastest" {
+                Some(fleet.nodes[1].next().await)
+            } else {
+                None
+            };
+            let response = without_advancing_time(async {
+                succeed(first, json!("0x5209"));
+                task.await.unwrap()
+            })
+            .await;
+            assert_eq!(
+                response,
+                json!({"jsonrpc":"2.0","id":7,"result":format!("0x{expected:x}")})
+            );
+            assert_eq!(fleet.counts(), [1, usize::from(pending.is_some()), 0]);
+            fleet.idle();
+            drop(pending);
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn best_gas_estimate_revert_keeps_app_error_handling_and_single_node_selection() {
+    let mut fleet = Fleet::new(3, 3).await;
+    let (port, server) = fleet.frontend().await;
+    let mut task = http_request(port, "/", gas_estimate_request(json!("best-id"), "0x"));
+    let call = fleet.nodes[0].next().await;
+    let error = json!({"code":3,"message":"execution reverted: best estimate","data":"0xabcd"});
+    without_advancing_time(async {
+        fail_with(call, error.clone());
+        fleet.wait_for_active(&[0, 0, 0]).await;
+    })
+    .await;
+    fleet.idle();
+    assert!(
+        timeout(Duration::from_millis(50), &mut task).await.is_err(),
+        "Best must retain the application retry wait"
+    );
+    assert_eq!(fleet.counts(), [1, 0, 0]);
+    advance_to(Instant::now() + Duration::from_secs(3)).await;
+    assert_eq!(
+        without_advancing_time(task).await.unwrap(),
+        json!({"jsonrpc":"2.0","id":"best-id","error":error})
+    );
+    assert_eq!(fleet.counts(), [1, 0, 0]);
+    fleet.idle();
+    server.abort();
 }
 
 async fn exhausted_http_method(method: &str, params: Value) {
@@ -482,46 +773,17 @@ async fn exhausted_fastest_http_batch_preserves_errors_ids_and_order() {
 
 #[tokio::test]
 async fn exhausted_fastest_websocket_preserves_wire_error_and_id() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut fleet = Fleet::new(2, 2).await;
     fleet.reload(1).await;
     let (port, server) = fleet.frontend().await;
-    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    client.write_all(b"GET /fastest HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
-    let mut headers = Vec::new();
-    while !headers.ends_with(b"\r\n\r\n") {
-        headers.push(client.read_u8().await.unwrap());
-    }
-    assert!(headers.starts_with(b"HTTP/1.1 101"));
+    let mut client = websocket_client(port).await;
     let body = br#"{"jsonrpc":"2.0","id":"ws\u002did","method":"eth_gasPrice","params":[]}"#;
-    assert!(body.len() < 126);
-    // Masked client text frame, with a deterministic all-zero mask.
-    client
-        .write_all(&[0x81, 0x80 | body.len() as u8, 0, 0, 0, 0])
-        .await
-        .unwrap();
-    client.write_all(body).await.unwrap();
+    websocket_send(&mut client, body).await;
     fail_with(fleet.nodes[0].next().await, terminal_error("first"));
     let last = fleet.nodes[1].next().await;
     fleet.sync(2);
     fail_with(last, terminal_error("last"));
-    let response = without_advancing_time(async {
-        assert_eq!(client.read_u8().await.unwrap(), 0x81);
-        let len = client.read_u8().await.unwrap();
-        let len = match len {
-            0..=125 => u64::from(len),
-            126 => u64::from(client.read_u16().await.unwrap()),
-            127 => client.read_u64().await.unwrap(),
-            _ => panic!("server frame must not be masked"),
-        };
-        assert!(len < 8192);
-        let mut body = vec![0; len as usize];
-        client.read_exact(&mut body).await.unwrap();
-        serde_json::from_slice::<Value>(&body).unwrap()
-    })
-    .await;
+    let response = without_advancing_time(websocket_response(&mut client)).await;
     assert_eq!(
         response,
         json!({"jsonrpc":"2.0","id":"ws-id","error":terminal_error("first")})

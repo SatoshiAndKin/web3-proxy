@@ -943,15 +943,24 @@ impl App {
             }
             "eth_estimateGas" => {
                 // TODO: timeout
-                let mut gas_estimate = self
+                let response = self
                     .balanced_rpcs
                     .try_proxy_connection::<U256>(
                         web3_request,
                     )
                     .await?
                     .parsed()
-                    .await?
-                    .into_result()?;
+                    .await?;
+                let mut gas_estimate = match response.payload {
+                    jsonrpc::ResponsePayload::Success { result } => result,
+                    jsonrpc::ResponsePayload::Error { error } => {
+                        if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_)) {
+                            // The scheduler already accepted this response and cancelled its losers.
+                            return Ok(jsonrpc::ParsedResponse::from_error(error, web3_request.id()).into());
+                        }
+                        return Err(Web3ProxyError::JsonRpcErrorData(error));
+                    }
+                };
 
                 let gas_increase = if let Some(gas_increase_percent) =
                     self.config.gas_increase_percent
