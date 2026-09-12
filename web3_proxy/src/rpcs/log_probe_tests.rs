@@ -1,5 +1,6 @@
 use super::*;
 use crate::rpcs::batch_tests::{Harness, Incoming};
+use crate::rpcs::test_support::{spawn, with_cleanup};
 use alloy::rpc::types::Header;
 use axum::body::Body;
 use axum::http::Response;
@@ -43,7 +44,7 @@ async fn start_probe(
     h: &mut Harness,
 ) -> tokio::task::JoinHandle<anyhow::Result<Option<u64>>> {
     let rpc = rpc.clone();
-    let task = tokio::spawn(async move { rpc.check_log_data_limit().await });
+    let task = spawn(async move { rpc.check_log_data_limit().await });
     let head = h.next().await;
     assert_eq!(head.body["method"], "eth_blockNumber");
     success(head, json!("0x186a0"));
@@ -63,64 +64,68 @@ async fn successful_depth(h: &mut Harness, depth: u64) {
 
 #[tokio::test]
 async fn log_probe_transient_errors_do_not_publish_pruning_and_recovery_retries() {
-    for failure in ["timeout", "http429", "rpc429", "disconnect", "unexpected"] {
-        for previous_limit in [0, 128] {
-            let mut h = Harness::new(1, 64).await;
-            let rpc = probe_rpc(&h, true, previous_limit).await;
-            let task = start_probe(&rpc, &mut h).await;
-            successful_depth(&mut h, 0).await;
-            successful_depth(&mut h, 32).await;
-            let failed = h.next().await;
-            assert_eq!(failed.body["params"][0]["fromBlock"], "0x18660");
-            match failure {
-                "timeout" => {
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                    drop(failed);
-                }
-                "http429" => {
-                    failed
-                        .reply
-                        .send(Response::builder().status(429).body(Body::empty()).unwrap())
-                        .unwrap();
-                }
-                "disconnect" => {
-                    drop(failed);
-                }
-                _ => {
-                    let id = failed.body["id"].clone();
-                    let code = if failure == "rpc429" { -32005 } else { -32603 };
-                    let message = if failure == "rpc429" {
-                        "rate limit exceeded"
-                    } else {
-                        "probe unavailable"
-                    };
-                    failed.respond(
+    with_cleanup(async {
+        for failure in ["timeout", "http429", "rpc429", "disconnect", "unexpected"] {
+            for previous_limit in [0, 128] {
+                let mut h = Harness::new(1, 64).await;
+                let rpc = probe_rpc(&h, true, previous_limit).await;
+                let task = start_probe(&rpc, &mut h).await;
+                successful_depth(&mut h, 0).await;
+                successful_depth(&mut h, 32).await;
+                let failed = h.next().await;
+                assert_eq!(failed.body["params"][0]["fromBlock"], "0x18660");
+                match failure {
+                    "timeout" => {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        drop(failed);
+                    }
+                    "http429" => {
+                        failed
+                            .reply
+                            .send(Response::builder().status(429).body(Body::empty()).unwrap())
+                            .unwrap();
+                    }
+                    "disconnect" => {
+                        drop(failed);
+                    }
+                    _ => {
+                        let id = failed.body["id"].clone();
+                        let code = if failure == "rpc429" { -32005 } else { -32603 };
+                        let message = if failure == "rpc429" {
+                            "rate limit exceeded"
+                        } else {
+                            "probe unavailable"
+                        };
+                        failed.respond(
                         json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
                     );
+                    }
                 }
+                assert!(
+                    task.await.unwrap().is_err(),
+                    "{failure} must leave detection incomplete"
+                );
+                assert_eq!(
+                    rpc.log_data_limit.load(atomic::Ordering::SeqCst),
+                    previous_limit,
+                    "{failure} must not publish the partial depth 32"
+                );
+                let recovered = start_probe(&rpc, &mut h).await;
+                for depth in [0, 32, 64, 128, 256, 512, 1024, 90_000, u64::MAX] {
+                    successful_depth(&mut h, depth).await;
+                }
+                assert_eq!(recovered.await.unwrap().unwrap(), Some(u64::MAX));
+                assert_eq!(rpc.log_data_limit.load(atomic::Ordering::SeqCst), u64::MAX);
+                assert!(rpc.has_log_data(U64::ZERO));
             }
-            assert!(
-                task.await.unwrap().is_err(),
-                "{failure} must leave detection incomplete"
-            );
-            assert_eq!(
-                rpc.log_data_limit.load(atomic::Ordering::SeqCst),
-                previous_limit,
-                "{failure} must not publish the partial depth 32"
-            );
-            let recovered = start_probe(&rpc, &mut h).await;
-            for depth in [0, 32, 64, 128, 256, 512, 1024, 90_000, u64::MAX] {
-                successful_depth(&mut h, depth).await;
-            }
-            assert_eq!(recovered.await.unwrap().unwrap(), Some(u64::MAX));
-            assert_eq!(rpc.log_data_limit.load(atomic::Ordering::SeqCst), u64::MAX);
-            assert!(rpc.has_log_data(U64::ZERO));
         }
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn log_probe_explicit_pruning_publishes_the_last_confirmed_depth() {
+    with_cleanup(async {
     let mut h = Harness::new(1, 64).await;
     let rpc = probe_rpc(&h, true, 0).await;
     let task = start_probe(&rpc, &mut h).await;
@@ -133,13 +138,17 @@ async fn log_probe_explicit_pruning_publishes_the_last_confirmed_depth() {
     assert_eq!(rpc.log_data_limit.load(atomic::Ordering::SeqCst), 32);
     assert!(rpc.has_log_data(U64::from(99_968)));
     assert!(!rpc.has_log_data(U64::from(99_967)));
+    }).await;
 }
 
 #[tokio::test]
 async fn log_probe_keeps_manual_limits_without_backend_traffic() {
-    let mut h = Harness::new(1, 64).await;
-    let rpc = probe_rpc(&h, false, 128).await;
-    assert_eq!(rpc.check_log_data_limit().await.unwrap(), None);
-    assert_eq!(rpc.log_data_limit.load(atomic::Ordering::SeqCst), 128);
-    h.quiet().await;
+    with_cleanup(async {
+        let mut h = Harness::new(1, 64).await;
+        let rpc = probe_rpc(&h, false, 128).await;
+        assert_eq!(rpc.check_log_data_limit().await.unwrap(), None);
+        assert_eq!(rpc.log_data_limit.load(atomic::Ordering::SeqCst), 128);
+        h.quiet().await;
+    })
+    .await;
 }

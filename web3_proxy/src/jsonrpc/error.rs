@@ -17,6 +17,16 @@ pub struct JsonRpcErrorData {
 }
 
 impl JsonRpcErrorData {
+    pub(crate) fn is_known_transaction(&self) -> bool {
+        matches!(
+            self.message.as_ref(),
+            "already known"
+                | "ALREADY_EXISTS: already known"
+                | "INTERNAL_ERROR: existing tx with same hash"
+                | ""
+        )
+    }
+
     pub(crate) fn is_execution_revert(&self) -> bool {
         self.message.starts_with("execution reverted")
     }

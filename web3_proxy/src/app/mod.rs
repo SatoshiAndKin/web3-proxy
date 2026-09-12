@@ -178,6 +178,7 @@ impl App {
         let deduped_txid_firehose = DedupedBroadcaster::new(100, 20_000);
 
         // TODO: remove this. it should only be done by apply_top_config
+        let frontend_tasks = tokio_util::task::TaskTracker::new();
         let (balanced_rpcs, balanced_handle, consensus_connections_watcher) = Web3Rpcs::spawn(
             Web3RpcsSpawnConfig::new(
                 chain_id,
@@ -187,6 +188,8 @@ impl App {
                 top_config.app.block_cache_max_bytes,
             ),
             "balanced rpcs".into(),
+            frontend_tasks.clone(),
+            frontend_shutdown.subscribe(),
             Some(watch_consensus_head_sender),
             Some(deduped_txid_firehose.clone()),
         )
@@ -206,6 +209,8 @@ impl App {
                 top_config.app.block_cache_max_bytes,
             ),
             "protected rpcs".into(),
+            frontend_tasks.clone(),
+            frontend_shutdown.subscribe(),
             // subscribing to new heads here won't work well. if they are fast, they might be ahead of balanced_rpcs
             // they also often have low rate limits
             // however, they are well connected to miners/validators. so maybe using them as a safety check would be good
@@ -227,6 +232,8 @@ impl App {
                 top_config.app.block_cache_max_bytes,
             ),
             "eip4337 rpcs".into(),
+            frontend_tasks.clone(),
+            frontend_shutdown.subscribe(),
             None,
             None,
         )
@@ -240,7 +247,7 @@ impl App {
         let tx_subscriptions = Semaphore::new(1);
 
         let app = Self {
-            frontend_tasks: tokio_util::task::TaskTracker::new(),
+            frontend_tasks,
             frontend_shutdown,
             block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs,
@@ -509,7 +516,7 @@ impl App {
                 let (response, rpcs) = match result {
                     Ok(request) => {
                         let (_, response, rpcs) = self
-                            .proxy_validated_request(request, OpenRequestHandle::request_parsed)
+                            .proxy_validated_request(request, OpenRequestHandle::request)
                             .await;
                         (response, rpcs)
                     }
@@ -520,8 +527,6 @@ impl App {
                         Vec::new(),
                     ),
                 };
-                // Finish each body before joining the other calls. A returned stream
-                // can still own the only backend slot those other calls need.
                 let parsed = match response.parsed().await {
                     Ok(response) => response,
                     Err(error) => error
@@ -621,15 +626,8 @@ impl App {
 
         // sometimes we get an error that the transaction is already known by our nodes,
         // that's not really an error. Return the hash like a successful response would.
-        // TODO: move this to a helper function. probably part of try_send_protected
         if let ResponseData::RpcError { error_data, .. } = &response {
-            let acceptable_error_messages = [
-                "already known",
-                "ALREADY_EXISTS: already known",
-                "INTERNAL_ERROR: existing tx with same hash",
-                "",
-            ];
-            if acceptable_error_messages.contains(&error_data.message.as_ref()) {
+            if error_data.is_known_transaction() {
                 response = ResponseData::from(json!(txid));
             }
         }
@@ -714,8 +712,8 @@ impl App {
         send: F,
     ) -> (StatusCode, jsonrpc::SingleResponse, Vec<Arc<Web3Rpc>>)
     where
-        F: Fn(OpenRequestHandle) -> Fut + Copy,
-        Fut: std::future::Future<Output = Web3ProxyResult<jsonrpc::SingleResponse>>,
+        F: Fn(OpenRequestHandle) -> Fut + Copy + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Web3ProxyResult<jsonrpc::SingleResponse>> + Send,
     {
         let mut ranked_rpcs_recv = self.balanced_rpcs.watch_ranked_rpcs.subscribe();
         let mut last_success = None;
@@ -819,8 +817,8 @@ impl App {
         send: F,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse>
     where
-        F: Fn(OpenRequestHandle) -> Fut + Copy,
-        Fut: std::future::Future<Output = Web3ProxyResult<jsonrpc::SingleResponse>>,
+        F: Fn(OpenRequestHandle) -> Fut + Copy + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Web3ProxyResult<jsonrpc::SingleResponse>> + Send,
     {
         if let Some(request) = web3_request.inner.jsonrpc_request() {
             if let Some(response) = self.balanced_rpcs.cached_block_response(request).await {
@@ -945,21 +943,25 @@ impl App {
                 // TODO: timeout
                 let response = self
                     .balanced_rpcs
-                    .try_proxy_connection::<U256>(
+                    .try_proxy_connection::<Option<U256>>(
                         web3_request,
                     )
                     .await?
                     .parsed()
                     .await?;
-                let mut gas_estimate = match response.payload {
+                let gas_estimate = match response.payload {
                     jsonrpc::ResponsePayload::Success { result } => result,
                     jsonrpc::ResponsePayload::Error { error } => {
-                        if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_)) {
-                            // The scheduler already accepted this response and cancelled its losers.
+                        if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_) | ProxyMode::Versus) {
+                            // The scheduler already accepted this response.
                             return Ok(jsonrpc::ParsedResponse::from_error(error, web3_request.id()).into());
                         }
                         return Err(Web3ProxyError::JsonRpcErrorData(error));
                     }
+                };
+
+                let Some(mut gas_estimate) = gas_estimate else {
+                    return Ok(jsonrpc::ParsedResponse::from_value(json!(null), web3_request.id()).into());
                 };
 
                 let gas_increase = if let Some(gas_increase_percent) =
@@ -988,19 +990,14 @@ impl App {
 
                 // TODO: validate params. we seem to get a lot of spam here of "0x"
 
-                let mut result = self
+                let result = self
                     .balanced_rpcs
                     .try_proxy_connection_with(web3_request, send)
                     .await;
 
-                // TODO: helper for doing parsed() inside a result?
-                if let Ok(SingleResponse::Stream(x)) = result {
-                    result = x.read().await.map(SingleResponse::Parsed);
-                }
-
                 // if we got "null" or "", it is probably because the tx is old. retry on nodes with old block data
                 // TODO: this feels fragile. how should we do this better/
-                let try_archive = match &result {
+                let try_archive = !matches!(web3_request.proxy_mode(), ProxyMode::Versus) && match &result {
                     Ok(SingleResponse::Parsed(x)) => {
                         match x.result().map(AsRef::as_ref) {
                             Some(value) if value.is_null() => true,
@@ -1010,7 +1007,6 @@ impl App {
                             Some(_) => false,
                         }
                     },
-                    Ok(SingleResponse::Stream(..)) => unimplemented!(),
                     Err(Web3ProxyError::ExhaustedBackends(_)) => false,
                     Err(..) => true,
                 };
@@ -1178,9 +1174,13 @@ mod tests {
     use sonic_rs::OwnedLazyValue;
 
     async fn app_with_no_backend() -> Arc<App> {
+        let frontend_tasks = tokio_util::task::TaskTracker::new();
+        let (frontend_shutdown, _) = watch::channel(false);
         let (balanced_rpcs, _handle, _) = Web3Rpcs::spawn(
             Web3RpcsSpawnConfig::new(1, None, 0, 0, 1_000_000),
             "cache-only-test".into(),
+            frontend_tasks.clone(),
+            frontend_shutdown.subscribe(),
             None,
             None,
         )
@@ -1189,8 +1189,8 @@ mod tests {
         let (_, watch_consensus_head_receiver) = watch::channel(None);
 
         Arc::new(App {
-            frontend_tasks: tokio_util::task::TaskTracker::new(),
-            frontend_shutdown: watch::channel(false).0,
+            frontend_tasks,
+            frontend_shutdown,
             block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
@@ -1308,7 +1308,8 @@ mod tests {
         ];
 
         for (request, mode) in requests.into_iter().flat_map(|request| {
-            [ProxyMode::Best, ProxyMode::Fastest(2)].map(|mode| (request.clone(), mode))
+            [ProxyMode::Best, ProxyMode::Fastest(2), ProxyMode::Versus]
+                .map(|mode| (request.clone(), mode))
         }) {
             let request: SingleRequest = sonic_rs::from_str(&request).unwrap();
             let expected_id: serde_json::Value =

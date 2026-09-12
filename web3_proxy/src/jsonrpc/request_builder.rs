@@ -120,8 +120,7 @@ pub struct ValidatedResponse {
     /// How many milliseconds it took to respond to the request
     pub response_millis: u64,
 
-    /// What time the (first) response was proxied.
-    /// TODO: think about how to store response times for ProxyMode::Versus
+    /// What time the client response was finalized. Later Versus attempts do not change it.
     pub response_timestamp: i64,
 
     /// If the request is invalid or received a jsonrpc error response (excluding reverts)

@@ -1,16 +1,15 @@
 use super::one::Web3Rpc;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
-use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::jsonrpc::{
     self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
 };
 use alloy::providers::Provider;
 use anyhow::Context;
 use derive_more::From;
-use futures::Future;
 use reqwest::StatusCode;
 use sonic_rs::JsonValueTrait;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::Arc;
@@ -310,8 +309,9 @@ impl BackendRequest {
 
             let response = response.error_for_status()?;
 
-            // Buffer responses up to 128 KiB. Stream larger responses.
-            jsonrpc::SingleResponse::read_if_short(response, 131_072, &self.web3_request).await
+            let bytes = response.bytes().await?;
+            let response: ParsedResponse<R> = sonic_rs::from_slice(&bytes)?;
+            Ok(response.into())
         } else if let Some(p) = self.rpc.ws_provider.load().as_ref() {
             // use the websocket provider if no other provider is available
             let method = self.web3_request.inner.method();
@@ -360,8 +360,20 @@ impl BackendRequest {
         if let Err(error) = &response {
             self.check_transport_error(error, start);
         }
-        // measure successes and errors
-        // originally i thought we wouldn't want errors, but I think it's a more accurate number including all requests
+        // Validate identity before recording a successful backend timing.
+        response = response.and_then(|response| {
+            let jsonrpc::SingleResponse::Parsed(parsed) = &response;
+            let actual: sonic_rs::Value = sonic_rs::from_str(&sonic_rs::to_string(&parsed.id)?)?;
+            let expected: sonic_rs::Value =
+                sonic_rs::from_str(&sonic_rs::to_string(&self.web3_request.id())?)?;
+            if actual != expected {
+                return Err(anyhow::anyhow!("backend response ID mismatch").into());
+            }
+            Ok(response)
+        });
+        if self.web3_request.expired() {
+            return Err(Web3ProxyError::Timeout(None));
+        }
         let latency = start.elapsed();
 
         trace!(
@@ -378,7 +390,6 @@ impl BackendRequest {
             Ok(jsonrpc::SingleResponse::Parsed(x, ..)) => {
                 matches!(&x.payload, ResponsePayload::Success { .. })
             }
-            Ok(jsonrpc::SingleResponse::Stream(..)) => true,
             Err(_) => false,
         };
 
@@ -393,7 +404,6 @@ impl BackendRequest {
             });
         } else {
             // only save reverts for some types of calls
-            // TODO: do something special for eth_sendRawTransaction too
             // we do **NOT** use self.error_handler here because it might have been modified
             let error_handler = self.error_handler;
 
@@ -409,7 +419,13 @@ impl BackendRequest {
                     ResponsePayload::Error { error } => {
                         trace!(?error, "jsonrpc error data");
 
-                        if let Some(history_error) =
+                        if self.web3_request.inner.method() == "eth_sendRawTransaction"
+                            && error.is_known_transaction()
+                        {
+                            // Preserve the reply for App's decoded transaction hash
+                            // and pending notification, without a success sample.
+                            ResponseType::Error
+                        } else if let Some(history_error) =
                             history_error_for_request(&self.web3_request, error)
                         {
                             response = Err(history_error);
@@ -426,6 +442,10 @@ impl BackendRequest {
                             // }
 
                             match error.code {
+                                -32603 => {
+                                    response = Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
+                                    ResponseType::Error
+                                }
                                 -32000 => {
                                     if error.message.contains("MDBX_PANIC:") {
                                         response = Err(Web3ProxyError::MdbxPanic(
@@ -497,7 +517,6 @@ impl BackendRequest {
                         }
                     }
                 },
-                Ok(jsonrpc::SingleResponse::Stream(..)) => unreachable!(),
                 Err(_) => ResponseType::Error,
             };
 
@@ -605,56 +624,18 @@ impl OpenRequestHandle {
         self.request.rpc.supports_batch()
     }
 
+    /// Hold the backend permit through the complete body read and validation.
     pub async fn request<R: JsonRpcResultData>(
         self,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
-        if matches!(
-            self.request.web3_request.proxy_mode(),
-            ProxyMode::Fastest(_)
-        ) {
-            self.request_parsed().await
-        } else {
-            self.request_with(|response| async { Ok(response) }).await
-        }
-    }
-
-    pub async fn request_parsed<R: JsonRpcResultData>(
-        self,
-    ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
-        self.request_with(|response| async { response.parsed().await.map(Into::into) })
-            .await
-    }
-
-    async fn request_with<R, F, Fut>(
-        self,
-        complete: F,
-    ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>>
-    where
-        R: JsonRpcResultData,
-        F: FnOnce(jsonrpc::SingleResponse<R>) -> Fut,
-        Fut: Future<Output = Web3ProxyResult<jsonrpc::SingleResponse<R>>>,
-    {
         let Self { request, permit } = self;
         request.check_submission()?;
-        let active = ActiveRequestGuard::new(&request.rpc, permit);
+        let _active = ActiveRequestGuard::new(&request.rpc, permit);
         let start = Instant::now();
-        let response = timeout_at(request.web3_request.expire_at(), async {
-            match request._request().await {
-                Ok(response) => complete(response).await,
-                Err(error) => Err(error),
-            }
-        })
-        .await
-        .unwrap_or_else(|error| Err(error.into()));
-        let response = request.check_response(response, start);
-        if request.web3_request.expired() {
-            return Err(Web3ProxyError::Timeout(None));
-        }
-        let mut response = response?;
-        if let jsonrpc::SingleResponse::Stream(stream) = &mut response {
-            stream.request_permit = Some(active);
-        }
-        Ok(response)
+        let response = timeout_at(request.web3_request.expire_at(), request._request())
+            .await
+            .unwrap_or_else(|error| Err(error.into()));
+        request.check_response(response, start)
     }
 
     /// Send one physical request, batching calls when the transport supports it.
@@ -679,9 +660,8 @@ impl OpenRequestHandle {
                     anyhow::anyhow!("backend transport requires one call per request").into(),
                 );
             }
-            return match (Self { request, permit }).request_parsed().await? {
+            return match (Self { request, permit }).request().await? {
                 jsonrpc::SingleResponse::Parsed(response) => Ok(vec![Ok(response)]),
-                jsonrpc::SingleResponse::Stream(_) => unreachable!("response was fully parsed"),
             };
         }
         request.check_submission()?;
@@ -775,9 +755,6 @@ impl OpenRequestHandle {
                     };
                     match handle.check_response(Ok(response.into()), started_at) {
                         Ok(jsonrpc::SingleResponse::Parsed(response)) => Ok(response),
-                        Ok(jsonrpc::SingleResponse::Stream(_)) => {
-                            unreachable!("packet responses are parsed")
-                        }
                         Err(error) => Err(error),
                     }
                 })

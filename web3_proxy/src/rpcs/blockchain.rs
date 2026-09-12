@@ -726,6 +726,8 @@ mod tests {
         let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
 
         Web3Rpcs {
+            frontend_tasks: tokio_util::task::TaskTracker::new(),
+            frontend_shutdown: watch::channel(false).1,
             name: "block-cache-test".into(),
             chain_id: 1,
             head_observation_publisher,
