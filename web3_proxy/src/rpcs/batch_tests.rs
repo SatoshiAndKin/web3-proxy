@@ -131,9 +131,13 @@ impl Harness {
         configure(&mut rpc);
         let rpc = Arc::new(rpc);
         let (head_sender, watch_consensus_head_receiver) = watch::channel(None);
+        let frontend_tasks = tokio_util::task::TaskTracker::new();
+        let (frontend_shutdown, _) = watch::channel(false);
         let (balanced_rpcs, background, _) = Web3Rpcs::spawn(
             Web3RpcsSpawnConfig::new(1, None, 0, 0, 1_000_000),
             "batch-test".into(),
+            frontend_tasks.clone(),
+            frontend_shutdown.subscribe(),
             Some(head_sender.clone()),
             None,
         )
@@ -156,8 +160,8 @@ impl Harness {
         background.abort();
         head_sender.send_replace(Some(head));
         let app = Arc::new(App {
-            frontend_tasks: tokio_util::task::TaskTracker::new(),
-            frontend_shutdown: watch::channel(false).0,
+            frontend_tasks,
+            frontend_shutdown,
             block_relay: crate::block_relay::BlockRelay::new(),
             balanced_rpcs: balanced_rpcs.clone(),
             bundler_4337_rpcs: balanced_rpcs.clone(),
@@ -703,8 +707,8 @@ async fn websocket_backend(
     })
 }
 
-struct WebSocketHarness {
-    rpc: Arc<Web3Rpc>,
+pub(super) struct WebSocketHarness {
+    pub(super) rpc: Arc<Web3Rpc>,
     incoming: mpsc::UnboundedReceiver<Incoming>,
     server: JoinHandle<()>,
 }
@@ -716,7 +720,7 @@ impl Drop for WebSocketHarness {
 }
 
 impl WebSocketHarness {
-    async fn new(concurrency: usize) -> Self {
+    pub(super) async fn new(concurrency: usize) -> Self {
         let (sender, incoming) = mpsc::unbounded_channel();
         let router = Router::new()
             .route("/", get(websocket_backend))
@@ -749,7 +753,7 @@ impl WebSocketHarness {
         }
     }
 
-    async fn next(&mut self) -> Incoming {
+    pub(super) async fn next(&mut self) -> Incoming {
         let call = timeout(Duration::from_secs(2), self.incoming.recv())
             .await
             .expect("WebSocket fallback must start")
@@ -763,7 +767,7 @@ impl WebSocketHarness {
         call
     }
 
-    async fn quiet(&mut self) {
+    pub(super) async fn quiet(&mut self) {
         match timeout(Duration::from_millis(50), self.incoming.recv()).await {
             Err(_) => {}
             Ok(Some(call)) => panic!("unexpected WebSocket request: {}", call.body),
@@ -975,7 +979,7 @@ async fn batch_mixed_pool_websocket_timeout_and_cancellation_release_slots() {
 }
 
 #[tokio::test]
-async fn individual_stream_shares_batch_slots_until_body_ends_or_is_dropped() {
+async fn individual_response_holds_batch_slot_until_validated_or_cancelled() {
     for finish_body in [true, false] {
         let mut h = Harness::new(1, 64).await;
         let request = crate::jsonrpc::ValidatedRequest::new_internal(
@@ -994,7 +998,8 @@ async fn individual_stream_shares_batch_slots_until_body_ends_or_is_dropped() {
         let task = tokio::spawn(handle.request::<Arc<sonic_rs::OwnedLazyValue>>());
         let incoming = h.next().await;
         let prefix = format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{}",
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"{}",
+            incoming.body["id"],
             "x".repeat(140_000)
         );
         let expected = format!("{prefix}\"}}");
@@ -1011,33 +1016,25 @@ async fn individual_stream_shares_batch_slots_until_body_ends_or_is_dropped() {
                     .unwrap(),
             )
             .unwrap();
-        let response = task.await.unwrap().unwrap();
-        assert!(matches!(
-            response,
-            crate::jsonrpc::SingleResponse::Stream(_)
-        ));
+        assert!(!task.is_finished());
         assert_eq!(h.rpc.active_requests.load(Ordering::SeqCst), 1);
         let batch = h.start(2);
         h.quiet().await;
-        let mut body = response.into_response().into_body().into_data_stream();
         if finish_body {
             sender.send(Ok(Bytes::from_static(b"\"}"))).await.unwrap();
             drop(sender);
-            let mut received = Vec::new();
-            while let Some(chunk) = futures::StreamExt::next(&mut body).await {
-                received.extend(chunk.unwrap());
-            }
-            assert_eq!(received, expected.as_bytes());
-            // Keep the completed body alive: EOF itself must release the slot.
-            h.next().await.succeed();
-            assert_answers(batch.await.unwrap(), 2);
-            h.idle();
+            let response = task.await.unwrap().unwrap();
+            let body = axum::body::to_bytes(response.into_response().into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body, expected.as_bytes());
         } else {
-            drop(body);
-            h.next().await.succeed();
-            assert_answers(batch.await.unwrap(), 2);
-            h.idle();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
         }
+        h.next().await.succeed();
+        assert_answers(batch.await.unwrap(), 2);
+        h.idle();
     }
 }
 

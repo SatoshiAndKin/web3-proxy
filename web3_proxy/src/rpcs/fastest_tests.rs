@@ -25,19 +25,29 @@ use tokio::{
     time::{timeout, Duration, Instant},
 };
 
-struct Fleet {
-    nodes: Vec<Harness>,
-    app: Arc<App>,
+pub(super) struct Fleet {
+    pub(super) nodes: Vec<Harness>,
+    pub(super) app: Arc<App>,
 }
 impl Fleet {
-    async fn new(synced: usize, total: usize) -> Self {
+    pub(super) async fn new(synced: usize, total: usize) -> Self {
         Self::configured(synced, total, AppConfig::default()).await
     }
 
-    async fn configured(synced: usize, total: usize, config: AppConfig) -> Self {
+    pub(super) async fn configured(synced: usize, total: usize, config: AppConfig) -> Self {
+        Self::with_backups(synced, total, config, &[]).await
+    }
+
+    pub(super) async fn with_backups(
+        synced: usize,
+        total: usize,
+        config: AppConfig,
+        backups: &[usize],
+    ) -> Self {
         let mut nodes = Vec::new();
         for i in 0..total {
             let node = Harness::configured(&format!("node-{i}"), 4, 64, |rpc| {
+                rpc.backup = backups.contains(&i);
                 let mut header: Header = Header::default();
                 header.inner.number = 42;
                 rpc.head_block_sender =
@@ -59,7 +69,7 @@ impl Fleet {
         fleet.sync(synced);
         fleet
     }
-    fn sync(&self, synced: usize) {
+    pub(super) fn sync(&self, synced: usize) {
         let head = self.app.balanced_rpcs.head_block().unwrap();
         let rpcs: Vec<_> = self.nodes.iter().map(|n| n.rpc.clone()).collect();
         let ranked = RankedRpcs::from_votes(
@@ -79,7 +89,7 @@ impl Fleet {
         *self.app.balanced_rpcs.by_name.write() =
             rpcs.into_iter().map(|r| (r.name.clone(), r)).collect();
     }
-    async fn request(&self, count: usize) -> Arc<ValidatedRequest> {
+    pub(super) async fn request(&self, count: usize) -> Arc<ValidatedRequest> {
         ValidatedRequest::new_with_app(
             &self.app,
             ProxyMode::Fastest(count),
@@ -93,17 +103,20 @@ impl Fleet {
         .await
         .unwrap()
     }
-    fn start(&self, request: Arc<ValidatedRequest>) -> JoinHandle<Web3ProxyResult<SingleResponse>> {
+    pub(super) fn start(
+        &self,
+        request: Arc<ValidatedRequest>,
+    ) -> JoinHandle<Web3ProxyResult<SingleResponse>> {
         let pool = self.app.balanced_rpcs.clone();
         tokio::spawn(async move { pool.try_proxy_connection(&request).await })
     }
-    fn counts(&self) -> Vec<usize> {
+    pub(super) fn counts(&self) -> Vec<usize> {
         self.nodes
             .iter()
             .map(|n| n.rpc.total_requests.load(Ordering::Relaxed))
             .collect()
     }
-    fn idle(&self) {
+    pub(super) fn idle(&self) {
         for node in &self.nodes {
             assert_eq!(node.rpc.active_requests.load(Ordering::SeqCst), 0);
             let permits: Vec<_> = (0..4)
@@ -114,7 +127,7 @@ impl Fleet {
         }
     }
 
-    async fn wait_for_active(&self, expected: &[usize]) {
+    pub(super) async fn wait_for_active(&self, expected: &[usize]) {
         while self
             .nodes
             .iter()
@@ -135,7 +148,7 @@ impl Fleet {
         self.app.apply_top_config(&config).await.unwrap();
     }
 
-    async fn frontend(&self) -> (u16, JoinHandle<()>) {
+    pub(super) async fn frontend(&self) -> (u16, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let router = crate::frontend::make_router(self.app.clone());
@@ -143,15 +156,15 @@ impl Fleet {
         (port, server)
     }
 }
-fn succeed(call: Incoming, result: Value) {
+pub(super) fn succeed(call: Incoming, result: Value) {
     let id = call.body["id"].clone();
     call.respond(json!({"jsonrpc":"2.0", "id":id, "result":result}));
 }
-fn fail(call: Incoming, code: i64, message: &str) {
+pub(super) fn fail(call: Incoming, code: i64, message: &str) {
     let id = call.body["id"].clone();
     call.respond(json!({"jsonrpc":"2.0", "id":id, "error":{"code":code,"message":message}}));
 }
-async fn result(task: JoinHandle<Web3ProxyResult<SingleResponse>>) -> Value {
+pub(super) async fn result(task: JoinHandle<Web3ProxyResult<SingleResponse>>) -> Value {
     let response = timeout(Duration::from_secs(2), task)
         .await
         .unwrap()
@@ -161,6 +174,50 @@ async fn result(task: JoinHandle<Web3ProxyResult<SingleResponse>>) -> Value {
         .await
         .unwrap();
     serde_json::from_str(&sonic_rs::to_string(&response).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn best_retries_internal_error() {
+    let mut fleet = Fleet::new(2, 2).await;
+    let mut request = fleet.request(1).await;
+    Arc::get_mut(&mut request).unwrap().proxy_mode = ProxyMode::Best;
+    let task = fleet.start(request);
+    fail(fleet.nodes[0].next().await, -32603, "Internal error");
+    succeed(fleet.nodes[1].next().await, json!("0x42"));
+    assert_eq!(
+        result(task).await,
+        json!({"jsonrpc":"2.0","id":7,"result":"0x42"})
+    );
+    assert_eq!(fleet.counts(), [1, 1]);
+    fleet.idle();
+}
+
+#[tokio::test]
+async fn best_retries_wrong_id_before_recording_success() {
+    let mut fleet = Fleet::new(2, 2).await;
+    let mut request = fleet.request(1).await;
+    Arc::get_mut(&mut request).unwrap().proxy_mode = ProxyMode::Best;
+    let task = fleet.start(request);
+    fleet.nodes[0]
+        .next()
+        .await
+        .respond(json!({"jsonrpc":"2.0","id":8,"result":"wrong"}));
+    succeed(fleet.nodes[1].next().await, json!("0x42"));
+    assert_eq!(
+        result(task).await,
+        json!({"jsonrpc":"2.0","id":7,"result":"0x42"})
+    );
+    assert_eq!(
+        fleet.nodes[0]
+            .rpc
+            .median_latency
+            .as_ref()
+            .unwrap()
+            .seconds(),
+        0.0
+    );
+    assert_eq!(fleet.counts(), [1, 1]);
+    fleet.idle();
 }
 
 #[tokio::test]
@@ -358,7 +415,7 @@ fn fastest_config_defaults_and_boundaries() {
     }
 }
 
-fn http_request(port: u16, path: &str, body: Value) -> JoinHandle<Value> {
+pub(super) fn http_request(port: u16, path: &str, body: Value) -> JoinHandle<Value> {
     let url = format!("http://127.0.0.1:{port}{path}");
     tokio::spawn(async move {
         let response = reqwest::Client::new()
@@ -374,8 +431,12 @@ fn http_request(port: u16, path: &str, body: Value) -> JoinHandle<Value> {
 }
 
 async fn websocket_client(port: u16) -> TcpStream {
+    websocket_client_at(port, "/fastest").await
+}
+
+pub(super) async fn websocket_client_at(port: u16, path: &str) -> TcpStream {
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    client.write_all(b"GET /fastest HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    client.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").as_bytes()).await.unwrap();
     let mut headers = Vec::new();
     while !headers.ends_with(b"\r\n\r\n") {
         headers.push(client.read_u8().await.unwrap());
@@ -384,7 +445,7 @@ async fn websocket_client(port: u16) -> TcpStream {
     client
 }
 
-async fn websocket_send(client: &mut TcpStream, body: &[u8]) {
+pub(super) async fn websocket_send(client: &mut TcpStream, body: &[u8]) {
     assert!(body.len() < 126);
     // Masked client text frame, with a deterministic all-zero mask.
     client
@@ -394,7 +455,7 @@ async fn websocket_send(client: &mut TcpStream, body: &[u8]) {
     client.write_all(body).await.unwrap();
 }
 
-async fn websocket_response(client: &mut TcpStream) -> Value {
+pub(super) async fn websocket_response(client: &mut TcpStream) -> Value {
     assert_eq!(client.read_u8().await.unwrap(), 0x81);
     let len = client.read_u8().await.unwrap();
     let len = match len {
@@ -411,7 +472,7 @@ async fn websocket_response(client: &mut TcpStream) -> Value {
 
 /// Keep Tokio time fixed while allowing socket I/O and ready tasks to run.
 /// The wall-clock bound only detects a hung test; it cannot fire the App retry timer.
-async fn without_advancing_time<T>(future: impl std::future::Future<Output = T>) -> T {
+pub(super) async fn without_advancing_time<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::pause();
     let frozen = Instant::now();
     let wall_start = std::time::Instant::now();

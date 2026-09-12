@@ -29,7 +29,6 @@ impl BatchCall {
                     .1
                 {
                     SingleResponse::Parsed(response) => response,
-                    SingleResponse::Stream(_) => unreachable!("local errors are parsed"),
                 }
             }
         };

@@ -35,7 +35,8 @@ pub enum ProxyMode {
     /// Race up to N synced eligible servers, using latency tiers. Zero means all.
     /// Return the first complete success or execution revert.
     Fastest(usize),
-    /// send to all servers for benchmarking. return the fastest non-error response
+    /// Return the first complete success or execution revert from consensus nodes.
+    /// Keep the selected attempts alive until completion or the request deadline.
     Versus,
 }
 

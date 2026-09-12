@@ -36,6 +36,8 @@ use tracing::{debug, error, info, trace, warn};
 /// A collection of web3 connections. Sends requests either the current best server or all servers.
 #[derive(From)]
 pub struct Web3Rpcs {
+    pub(crate) frontend_tasks: tokio_util::task::TaskTracker,
+    pub(crate) frontend_shutdown: watch::Receiver<bool>,
     pub(crate) name: Cow<'static, str>,
     pub(crate) chain_id: u64,
     /// if watch_head_block is some, Web3Rpc inside self will send blocks here when they get them
@@ -131,6 +133,8 @@ impl Web3Rpcs {
     pub async fn spawn(
         config: Web3RpcsSpawnConfig,
         name: Cow<'static, str>,
+        frontend_tasks: tokio_util::task::TaskTracker,
+        frontend_shutdown: watch::Receiver<bool>,
         watch_consensus_head_sender: Option<watch::Sender<Option<BlockHeader>>>,
         pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
     ) -> anyhow::Result<(
@@ -178,6 +182,8 @@ impl Web3Rpcs {
             block_interval.mul_f32((max_head_block_lag.to::<u64>() * 10) as f32);
 
         let connections = Arc::new(Self {
+            frontend_tasks,
+            frontend_shutdown,
             head_observation_publisher,
             block_hydration,
             blocks_by_hash,
@@ -436,7 +442,6 @@ impl Web3Rpcs {
 
         let response = self.request_with_metadata::<R>(&web3_request).await?;
 
-        // the response might support streaming. we need to parse it
         let parsed = response.parsed().await?;
 
         match parsed.payload {
@@ -475,7 +480,7 @@ impl Web3Rpcs {
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
         tokio::time::timeout_at(
             web3_request.expire_at(),
-            self.request_with(web3_request, OpenRequestHandle::request_parsed::<R>),
+            self.request_with(web3_request, OpenRequestHandle::request::<R>),
         )
         .await?
     }
@@ -611,15 +616,15 @@ impl Web3Rpcs {
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>>
     where
         R: JsonRpcResultData,
-        F: Fn(OpenRequestHandle) -> Fut,
-        Fut: Future<Output = Web3ProxyResult<jsonrpc::SingleResponse<R>>>,
+        F: Fn(OpenRequestHandle) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Web3ProxyResult<jsonrpc::SingleResponse<R>>> + Send,
     {
         let proxy_mode = web3_request.proxy_mode();
 
         match proxy_mode {
             ProxyMode::Best => self.request_with(web3_request, send).await,
             ProxyMode::Fastest(count) => self.fastest_with(web3_request, count, send).await,
-            ProxyMode::Versus => todo!("Versus"),
+            ProxyMode::Versus => self.versus_with(web3_request, send).await,
         }
     }
 }
