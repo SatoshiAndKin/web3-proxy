@@ -333,6 +333,125 @@ async fn versus_rechecks_queued_membership_without_adding_new_nodes() {
     .await;
 }
 
+async fn versus_accepts_failure_from_stale_consensus_node(replace: bool) {
+    for earlier_success in [true, false] {
+        let mut fleet = Fleet::new(2, 3).await;
+        let pool = fleet.app.balanced_rpcs.clone();
+        assert!(pool.watch_head_block.is_some());
+        let rankings = pool.watch_ranked_rpcs.subscribe();
+        let queued = fleet.nodes[1].rpc.clone();
+        let mut replacement = if replace {
+            Some(super::batch_tests::Harness::named(&queued.name, 4, 64).await)
+        } else {
+            None
+        };
+        let slots: Vec<_> = (0..queued.request_permits.max_concurrent_requests())
+            .map(|_| queued.request_permits.try_acquire().unwrap())
+            .collect();
+        let (port, server) = fleet.frontend().await;
+        let mut task = http_request(
+            port,
+            "/versus",
+            json!({"jsonrpc":"2.0","id":"stale-consensus-id","method":"eth_gasPrice","params":[]}),
+        );
+        let first = fleet.nodes[0].next().await;
+        fleet.nodes[1].quiet().await;
+        let winner = json!({"jsonrpc":"2.0","id":"stale-consensus-id","result":"0x42"});
+        let first = if earlier_success {
+            first.respond(winner.clone());
+            assert_eq!(
+                timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                winner
+            );
+            None
+        } else {
+            Some(first)
+        };
+        assert_eq!(fleet.app.frontend_tasks.len(), 1);
+        assert_eq!(fleet.counts(), [1, 0, 0]);
+
+        // Apply the membership and disconnect changes without publishing rankings.
+        // The selected node remains eligible in the consensus snapshot.
+        if let Some(replacement) = &replacement {
+            queued.disconnect_watch.as_ref().unwrap().send_replace(true);
+            let old = pool
+                .by_name
+                .write()
+                .insert(queued.name.clone(), replacement.rpc.clone())
+                .unwrap();
+            assert!(Arc::ptr_eq(&old, &queued));
+        } else {
+            let old = pool.by_name.write().remove(&queued.name).unwrap();
+            assert!(Arc::ptr_eq(&old, &queued));
+            queued.disconnect_watch.as_ref().unwrap().send_replace(true);
+        }
+        assert!(!rankings.has_changed().unwrap());
+        drop(slots);
+
+        // Submission to the original node is allowed. Its controlled failure must
+        // finish that attempt without replacing the winner or starting a new set.
+        let submitted = fleet.nodes[1].next().await;
+        assert_eq!(submitted.body["id"], "stale-consensus-id");
+        assert_eq!(submitted.body["method"], "eth_gasPrice");
+        assert_eq!(queued.active_requests.load(Ordering::SeqCst), 1);
+        let failure = json!({
+            "jsonrpc":"2.0",
+            "id":"stale-consensus-id",
+            "error":{
+                "code":-32602,
+                "message":"selected node unavailable",
+                "data":{"node":queued.name,"replaced":replace}
+            }
+        });
+        submitted.respond(failure.clone());
+        if let Some(first) = first {
+            // Make the stale node's error the first completed failure. The final
+            // failure must return that exact error through App without a retry.
+            timeout(Duration::from_secs(2), fleet.wait_for_active(&[1, 0, 0]))
+                .await
+                .unwrap();
+            assert!(!task.is_finished());
+            assert_eq!(fleet.app.frontend_tasks.len(), 1);
+            fail(first, -32603, "last completed failure");
+            assert_eq!(
+                timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                failure
+            );
+        }
+        drained(&fleet).await;
+        assert_eq!(fleet.app.frontend_tasks.len(), 0);
+        assert_eq!(fleet.counts(), [1, 1, 0]);
+        assert_eq!(queued.median_latency.as_ref().unwrap().seconds(), 0.0);
+        assert!(!rankings.has_changed().unwrap());
+        for node in &mut fleet.nodes {
+            node.quiet().await;
+        }
+        if let Some(replacement) = &mut replacement {
+            replacement.quiet().await;
+            assert_eq!(replacement.rpc.total_requests.load(Ordering::Relaxed), 0);
+            assert_eq!(replacement.rpc.active_requests.load(Ordering::SeqCst), 0);
+        }
+        drop(server);
+    }
+}
+
+#[tokio::test]
+async fn versus_accepts_removed_consensus_node_failure_with_stale_rankings() {
+    super::test_support::with_cleanup(versus_accepts_failure_from_stale_consensus_node(false))
+        .await;
+}
+
+#[tokio::test]
+async fn versus_accepts_replaced_consensus_node_failure_with_stale_rankings() {
+    super::test_support::with_cleanup(versus_accepts_failure_from_stale_consensus_node(true)).await;
+}
+
 #[tokio::test]
 async fn versus_waits_for_cooldown_before_submission_but_never_retries_an_attempt() {
     super::test_support::with_cleanup(async {

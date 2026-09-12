@@ -77,6 +77,7 @@ impl Fleet {
         for i in 0..total {
             let node = Harness::configured(&format!("node-{i}"), 4, 64, |rpc| {
                 rpc.backup = backups.contains(&i);
+                rpc.disconnect_watch = Some(watch::channel(false).0);
                 let mut header: Header = Header::default();
                 header.inner.number = 42;
                 rpc.head_block_sender =
