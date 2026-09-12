@@ -626,15 +626,8 @@ impl App {
 
         // sometimes we get an error that the transaction is already known by our nodes,
         // that's not really an error. Return the hash like a successful response would.
-        // TODO: move this to a helper function. probably part of try_send_protected
         if let ResponseData::RpcError { error_data, .. } = &response {
-            let acceptable_error_messages = [
-                "already known",
-                "ALREADY_EXISTS: already known",
-                "INTERNAL_ERROR: existing tx with same hash",
-                "",
-            ];
-            if acceptable_error_messages.contains(&error_data.message.as_ref()) {
+            if error_data.is_known_transaction() {
                 response = ResponseData::from(json!(txid));
             }
         }

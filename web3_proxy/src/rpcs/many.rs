@@ -398,29 +398,27 @@ impl Web3Rpcs {
         &self,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<RpcsForRequest> {
-        // TODO: by_name might include things that are on a forked
-        let ranked_rpcs: Arc<RankedRpcs> = match self.watch_ranked_rpcs.borrow().clone() {
-            Some(ranked_rpcs) => ranked_rpcs,
-            _ => {
-                if self.watch_head_block.is_some() {
-                    // if we are here, this set of rpcs is subscribed to newHeads. But we didn't get a RankedRpcs. that means something is wrong
-                    return Err(Web3ProxyError::NoServersSynced);
-                } else {
-                    trace!("watch_head_block is none");
+        self.rpcs_for_request(web3_request)
+    }
 
-                    // no RankedRpcs, but also no newHeads subscription. This is probably a set of "protected" rpcs or similar
-                    let rpcs = self.by_name.read().values().cloned().collect();
-
-                    // TODO: does this need the head_block? i don't think so
-                    let x = RankedRpcs::from_rpcs(
-                        rpcs,
-                        web3_request.head_block.clone(),
-                        self.watch_head_block.is_some(),
-                    );
-
-                    Arc::new(x)
-                }
-            }
+    /// Use the pool's current membership for selection and admission rechecks.
+    pub(super) fn rpcs_for_request(
+        &self,
+        web3_request: &Arc<ValidatedRequest>,
+    ) -> Web3ProxyResult<RpcsForRequest> {
+        let ranked_rpcs = if self.watch_head_block.is_some() {
+            self.watch_ranked_rpcs
+                .borrow()
+                .clone()
+                .ok_or(Web3ProxyError::NoServersSynced)?
+        } else {
+            // Protected and bundler pools have no consensus task. Their live
+            // membership is authoritative, including replacements by name.
+            Arc::new(RankedRpcs::from_rpcs(
+                self.by_name.read().values().cloned().collect(),
+                web3_request.head_block.clone(),
+                false,
+            ))
         };
 
         match ranked_rpcs.for_request(web3_request) {
@@ -602,7 +600,7 @@ impl Web3Rpcs {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn try_proxy_connection<R: JsonRpcResultData>(
-        &self,
+        self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
         self.try_proxy_connection_with(web3_request, OpenRequestHandle::request::<R>)
@@ -610,7 +608,7 @@ impl Web3Rpcs {
     }
 
     pub(crate) async fn try_proxy_connection_with<R, F, Fut>(
-        &self,
+        self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
         send: F,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>>

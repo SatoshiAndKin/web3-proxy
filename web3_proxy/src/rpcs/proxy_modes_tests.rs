@@ -51,24 +51,28 @@ async fn measured(fleet: &Fleet, indices: &[usize]) {
 
 #[tokio::test]
 async fn best_and_fastest_prefer_eligible_primary_over_backup() {
-    for mode in [ProxyMode::Best, ProxyMode::Fastest(1)] {
-        let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[0]).await;
-        fleet.nodes[1].rpc.tier.store(1, Ordering::SeqCst);
-        let task = fleet.start(request(&fleet, mode).await);
-        succeed(fleet.nodes[1].next().await, json!("primary"));
-        assert_eq!(result(task).await["result"], "primary");
-        assert_eq!(fleet.counts(), [0, 1]);
-        fleet.nodes[1].rpc.healthy.store(false, Ordering::SeqCst);
-        let task = fleet.start(request(&fleet, mode).await);
-        succeed(fleet.nodes[0].next().await, json!("backup"));
-        assert_eq!(result(task).await["result"], "backup");
-        assert_eq!(fleet.counts(), [1, 1]);
-        fleet.idle();
-    }
+    super::test_support::with_cleanup(async {
+        for mode in [ProxyMode::Best, ProxyMode::Fastest(1)] {
+            let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[0]).await;
+            fleet.nodes[1].rpc.tier.store(1, Ordering::SeqCst);
+            let task = fleet.start(request(&fleet, mode).await);
+            succeed(fleet.nodes[1].next().await, json!("primary"));
+            assert_eq!(result(task).await["result"], "primary");
+            assert_eq!(fleet.counts(), [0, 1]);
+            fleet.nodes[1].rpc.healthy.store(false, Ordering::SeqCst);
+            let task = fleet.start(request(&fleet, mode).await);
+            succeed(fleet.nodes[0].next().await, json!("backup"));
+            assert_eq!(result(task).await["result"], "backup");
+            assert_eq!(fleet.counts(), [1, 1]);
+            fleet.idle();
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn all_modes_compare_decoded_ids_and_reject_invalid_envelopes_without_samples() {
+    super::test_support::with_cleanup(async {
     for mode in [ProxyMode::Best, ProxyMode::Fastest(1), ProxyMode::Versus] {
         for bad in [
             r#"{"jsonrpc":"2.0","id":"other","result":"wrong"}"#,
@@ -121,266 +125,289 @@ async fn all_modes_compare_decoded_ids_and_reject_invalid_envelopes_without_samp
             assert_eq!(fleet.counts(), [1, 1]);
         }
     }
+    }).await;
 }
 
 #[tokio::test]
 async fn best_large_late_errors_and_wrong_ids_fail_over_after_complete_read() {
-    for late in ["internal", "id", "malformed"] {
-        let mut fleet = Fleet::new(2, 2).await;
-        let task = fleet.start(request(&fleet, ProxyMode::Best).await);
-        let first = fleet.nodes[0].next().await;
-        let (prefix, suffix) = match late {
-            "internal" => (
-                format!(
-                    r#"{{"jsonrpc":"2.0","id":7,"error":{{"message":"{}""#,
-                    "x".repeat(140_000)
+    super::test_support::with_cleanup(async {
+        for late in ["internal", "id", "malformed"] {
+            let mut fleet = Fleet::new(2, 2).await;
+            let task = fleet.start(request(&fleet, ProxyMode::Best).await);
+            let first = fleet.nodes[0].next().await;
+            let (prefix, suffix) = match late {
+                "internal" => (
+                    format!(
+                        r#"{{"jsonrpc":"2.0","id":7,"error":{{"message":"{}""#,
+                        "x".repeat(140_000)
+                    ),
+                    r#", "code":-32603}}"#,
                 ),
-                r#", "code":-32603}}"#,
-            ),
-            "id" => (
-                format!(r#"{{"jsonrpc":"2.0","result":"{}""#, "x".repeat(140_000)),
-                r#", "id":8}"#,
-            ),
-            _ => (
-                format!(
-                    r#"{{"jsonrpc":"2.0","id":7,"result":"{}""#,
-                    "x".repeat(140_000)
+                "id" => (
+                    format!(r#"{{"jsonrpc":"2.0","result":"{}""#, "x".repeat(140_000)),
+                    r#", "id":8}"#,
                 ),
-                "broken}",
-            ),
-        };
-        let sender = send_stalled_body(first, prefix).await;
-        fleet.nodes[1].quiet().await;
-        assert!(!task.is_finished());
-        assert_eq!(fleet.nodes[0].rpc.active_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            fleet.nodes[0]
-                .rpc
-                .median_latency
-                .as_ref()
-                .unwrap()
-                .seconds(),
-            0.0
-        );
-        sender
-            .send(Ok(axum::body::Bytes::from(suffix)))
-            .await
-            .unwrap();
-        drop(sender);
-        succeed(fleet.nodes[1].next().await, json!("valid"));
-        assert_eq!(result(task).await["result"], "valid");
-        assert_eq!(
-            fleet.nodes[0]
-                .rpc
-                .median_latency
-                .as_ref()
-                .unwrap()
-                .seconds(),
-            0.0
-        );
-        fleet.idle();
-    }
+                _ => (
+                    format!(
+                        r#"{{"jsonrpc":"2.0","id":7,"result":"{}""#,
+                        "x".repeat(140_000)
+                    ),
+                    "broken}",
+                ),
+            };
+            let sender = send_stalled_body(first, prefix).await;
+            fleet.nodes[1].quiet().await;
+            assert!(!task.is_finished());
+            assert_eq!(fleet.nodes[0].rpc.active_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fleet.nodes[0]
+                    .rpc
+                    .median_latency
+                    .as_ref()
+                    .unwrap()
+                    .seconds(),
+                0.0
+            );
+            sender
+                .send(Ok(axum::body::Bytes::from(suffix)))
+                .await
+                .unwrap();
+            drop(sender);
+            succeed(fleet.nodes[1].next().await, json!("valid"));
+            assert_eq!(result(task).await["result"], "valid");
+            assert_eq!(
+                fleet.nodes[0]
+                    .rpc
+                    .median_latency
+                    .as_ref()
+                    .unwrap()
+                    .seconds(),
+                0.0
+            );
+            fleet.idle();
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn best_large_stalled_body_uses_original_deadline_and_releases_permit() {
-    let mut fleet = Fleet::new(1, 1).await;
-    let mut request = request(&fleet, ProxyMode::Best).await;
-    Arc::get_mut(&mut request).unwrap().expire_timeout = Duration::from_secs(1);
-    let deadline = request.expire_at();
-    let task = fleet.start(request);
-    let sender = send_stalled_body(
-        fleet.nodes[0].next().await,
-        format!(
-            r#"{{"jsonrpc":"2.0","id":7,"result":"{}"#,
-            "x".repeat(140_000)
-        ),
-    )
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(1, 1).await;
+        let mut request = request(&fleet, ProxyMode::Best).await;
+        Arc::get_mut(&mut request).unwrap().expire_timeout = Duration::from_secs(1);
+        let deadline = request.expire_at();
+        let task = fleet.start(request);
+        let sender = send_stalled_body(
+            fleet.nodes[0].next().await,
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"result":"{}"#,
+                "x".repeat(140_000)
+            ),
+        )
+        .await;
+        super::batch_tests::advance_to(deadline).await;
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(Web3ProxyError::Timeout(_))
+        ));
+        drop(sender);
+        fleet.idle();
+        assert_eq!(
+            fleet.nodes[0]
+                .rpc
+                .median_latency
+                .as_ref()
+                .unwrap()
+                .seconds(),
+            0.0
+        );
+    })
     .await;
-    super::batch_tests::advance_to(deadline).await;
-    assert!(matches!(
-        task.await.unwrap(),
-        Err(Web3ProxyError::Timeout(_))
-    ));
-    drop(sender);
-    fleet.idle();
-    assert_eq!(
-        fleet.nodes[0]
-            .rpc
-            .median_latency
-            .as_ref()
-            .unwrap()
-            .seconds(),
-        0.0
-    );
 }
 
 #[tokio::test]
 async fn versus_returns_winner_then_finishes_selected_nodes_and_records_successes() {
-    let mut fleet = Fleet::new(3, 4).await;
-    let request = request(&fleet, ProxyMode::Versus).await;
-    let task = fleet.start(request.clone());
-    let fast = fleet.nodes[0].next().await;
-    let slow = fleet.nodes[1].next().await;
-    let revert = fleet.nodes[2].next().await;
-    succeed(fast, json!("winner"));
-    let answer = result(task).await;
-    assert_eq!(answer, json!({"jsonrpc":"2.0","id":7,"result":"winner"}));
-    request.set_response(answer.to_string().len() as u64);
-    let response_millis = request.response.lock().response_millis;
-    assert_eq!(fleet.app.frontend_tasks.len(), 1);
-    assert_eq!(fleet.counts(), [1, 1, 1, 0]);
-    fleet.wait_for_active(&[0, 1, 1, 0]).await;
-    assert_eq!(
-        fleet.nodes[1]
-            .rpc
-            .median_latency
-            .as_ref()
-            .unwrap()
-            .seconds(),
-        0.0
-    );
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    succeed(slow, json!("later"));
-    fail(revert, 3, "execution reverted");
-    drained(&fleet).await;
-    measured(&fleet, &[0, 1]).await;
-    assert_eq!(
-        fleet.nodes[2]
-            .rpc
-            .median_latency
-            .as_ref()
-            .unwrap()
-            .seconds(),
-        0.0
-    );
-    assert_eq!(request.response.lock().response_millis, response_millis);
-    assert_eq!(
-        request.response.lock().response_bytes,
-        answer.to_string().len() as u64
-    );
-    assert_eq!(fleet.counts(), [1, 1, 1, 0]);
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(3, 4).await;
+        let request = request(&fleet, ProxyMode::Versus).await;
+        let task = fleet.start(request.clone());
+        let fast = fleet.nodes[0].next().await;
+        let slow = fleet.nodes[1].next().await;
+        let revert = fleet.nodes[2].next().await;
+        succeed(fast, json!("winner"));
+        let answer = result(task).await;
+        assert_eq!(answer, json!({"jsonrpc":"2.0","id":7,"result":"winner"}));
+        request.set_response(answer.to_string().len() as u64);
+        let response_millis = request.response.lock().response_millis;
+        assert_eq!(fleet.app.frontend_tasks.len(), 1);
+        assert_eq!(fleet.counts(), [1, 1, 1, 0]);
+        fleet.wait_for_active(&[0, 1, 1, 0]).await;
+        assert_eq!(
+            fleet.nodes[1]
+                .rpc
+                .median_latency
+                .as_ref()
+                .unwrap()
+                .seconds(),
+            0.0
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        succeed(slow, json!("later"));
+        fail(revert, 3, "execution reverted");
+        drained(&fleet).await;
+        measured(&fleet, &[0, 1]).await;
+        assert_eq!(
+            fleet.nodes[2]
+                .rpc
+                .median_latency
+                .as_ref()
+                .unwrap()
+                .seconds(),
+            0.0
+        );
+        assert_eq!(request.response.lock().response_millis, response_millis);
+        assert_eq!(
+            request.response.lock().response_bytes,
+            answer.to_string().len() as u64
+        );
+        assert_eq!(fleet.counts(), [1, 1, 1, 0]);
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn versus_retains_queued_work_after_winner_and_client_drop() {
-    for disconnect in [false, true] {
-        let mut fleet = Fleet::new(2, 2).await;
-        let slots: Vec<_> = (0..4)
-            .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
-            .collect();
-        let task = fleet.start(request(&fleet, ProxyMode::Versus).await);
-        let fast = fleet.nodes[0].next().await;
-        if disconnect {
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            succeed(fast, json!("disconnected"));
-        } else {
-            succeed(fast, Value::Null);
-            assert_eq!(result(task).await["result"], Value::Null);
+    super::test_support::with_cleanup(async {
+        for disconnect in [false, true] {
+            let mut fleet = Fleet::new(2, 2).await;
+            let slots: Vec<_> = (0..4)
+                .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
+                .collect();
+            let task = fleet.start(request(&fleet, ProxyMode::Versus).await);
+            let fast = fleet.nodes[0].next().await;
+            if disconnect {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                succeed(fast, json!("disconnected"));
+            } else {
+                succeed(fast, Value::Null);
+                assert_eq!(result(task).await["result"], Value::Null);
+            }
+            assert_eq!(fleet.app.frontend_tasks.len(), 1);
+            assert_eq!(fleet.counts(), [1, 0]);
+            drop(slots);
+            let queued = fleet.nodes[1].next().await;
+            assert_eq!(fleet.nodes[1].rpc.active_requests.load(Ordering::SeqCst), 1);
+            succeed(queued, json!("queued"));
+            drained(&fleet).await;
+            measured(&fleet, &[0, 1]).await;
+            assert_eq!(fleet.counts(), [1, 1]);
         }
-        assert_eq!(fleet.app.frontend_tasks.len(), 1);
-        assert_eq!(fleet.counts(), [1, 0]);
-        drop(slots);
-        let queued = fleet.nodes[1].next().await;
-        assert_eq!(fleet.nodes[1].rpc.active_requests.load(Ordering::SeqCst), 1);
-        succeed(queued, json!("queued"));
-        drained(&fleet).await;
-        measured(&fleet, &[0, 1]).await;
-        assert_eq!(fleet.counts(), [1, 1]);
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn versus_rechecks_queued_membership_without_adding_new_nodes() {
-    let mut fleet = Fleet::new(2, 3).await;
-    let slots: Vec<_> = (0..4)
-        .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
-        .collect();
-    let task = fleet.start(request(&fleet, ProxyMode::Versus).await);
-    succeed(fleet.nodes[0].next().await, json!("winner"));
-    assert_eq!(result(task).await["result"], "winner");
-    fleet.sync(1);
-    fleet.app.frontend_tasks.close();
-    timeout(Duration::from_secs(2), fleet.app.frontend_tasks.wait())
-        .await
-        .unwrap();
-    fleet.sync(3);
-    drop(slots);
-    for node in &mut fleet.nodes {
-        node.quiet().await;
-    }
-    assert_eq!(fleet.counts(), [1, 0, 0]);
-}
-
-#[tokio::test]
-async fn versus_waits_for_cooldown_before_submission_but_never_retries_an_attempt() {
-    let mut fleet = Fleet::new(2, 2).await;
-    let cooldown = Instant::now() + Duration::from_secs(12);
-    fleet.nodes[0]
-        .rpc
-        .hard_limit_until
-        .as_ref()
-        .unwrap()
-        .send_replace(cooldown);
-    let task = fleet.start(request(&fleet, ProxyMode::Versus).await);
-    let slower = fleet.nodes[1].next().await;
-    super::batch_tests::advance_to(cooldown).await;
-    fail(fleet.nodes[0].next().await, -32005, "rate limit exceeded");
-    fleet.wait_for_active(&[0, 1]).await;
-    super::batch_tests::advance_to(cooldown + Duration::from_secs(2)).await;
-    fleet.nodes[0].quiet().await;
-    succeed(slower, json!("only success"));
-    assert_eq!(result(task).await["result"], "only success");
-    drained(&fleet).await;
-    assert_eq!(fleet.counts(), [1, 1]);
-}
-
-#[tokio::test]
-async fn versus_deadline_and_shutdown_end_running_and_queued_work() {
-    for shutdown in [false, true] {
-        let mut fleet = Fleet::new(3, 3).await;
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(2, 3).await;
         let slots: Vec<_> = (0..4)
-            .map(|_| fleet.nodes[2].rpc.request_permits.try_acquire().unwrap())
+            .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
             .collect();
-        let request = request(&fleet, ProxyMode::Versus).await;
-        let deadline = request.expire_at();
-        let task = fleet.start(request);
+        let task = fleet.start(request(&fleet, ProxyMode::Versus).await);
         succeed(fleet.nodes[0].next().await, json!("winner"));
-        let stalled = fleet.nodes[1].next().await;
         assert_eq!(result(task).await["result"], "winner");
-        let cutoff = if shutdown {
-            fleet.app.frontend_shutdown.send_replace(true);
-            fleet.app.frontend_tasks.close();
-            // Give the tracked task a chance to observe shutdown before advancing time.
-            without_advancing_time(async {
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
-            Instant::now() + Duration::from_secs(20)
-        } else {
-            deadline
-        };
-        super::batch_tests::advance_to(cutoff - Duration::from_secs(1)).await;
-        assert_eq!(fleet.app.frontend_tasks.len(), 1);
-        assert_eq!(fleet.nodes[1].rpc.active_requests.load(Ordering::SeqCst), 1);
-        super::batch_tests::advance_to(cutoff + Duration::from_millis(1)).await;
+        fleet.sync(1);
         fleet.app.frontend_tasks.close();
         timeout(Duration::from_secs(2), fleet.app.frontend_tasks.wait())
             .await
             .unwrap();
+        fleet.sync(3);
         drop(slots);
-        drop(stalled);
-        fleet.idle();
-        assert_eq!(fleet.counts(), [1, 1, 0]);
-        fleet.nodes[2].quiet().await;
-    }
+        for node in &mut fleet.nodes {
+            node.quiet().await;
+        }
+        assert_eq!(fleet.counts(), [1, 0, 0]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn versus_waits_for_cooldown_before_submission_but_never_retries_an_attempt() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(2, 2).await;
+        let cooldown = Instant::now() + Duration::from_secs(12);
+        fleet.nodes[0]
+            .rpc
+            .hard_limit_until
+            .as_ref()
+            .unwrap()
+            .send_replace(cooldown);
+        let task = fleet.start(request(&fleet, ProxyMode::Versus).await);
+        let slower = fleet.nodes[1].next().await;
+        super::batch_tests::advance_to(cooldown).await;
+        fail(fleet.nodes[0].next().await, -32005, "rate limit exceeded");
+        fleet.wait_for_active(&[0, 1]).await;
+        super::batch_tests::advance_to(cooldown + Duration::from_secs(2)).await;
+        fleet.nodes[0].quiet().await;
+        succeed(slower, json!("only success"));
+        assert_eq!(result(task).await["result"], "only success");
+        drained(&fleet).await;
+        assert_eq!(fleet.counts(), [1, 1]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn versus_deadline_and_shutdown_end_running_and_queued_work() {
+    super::test_support::with_cleanup(async {
+        for shutdown in [false, true] {
+            let mut fleet = Fleet::new(3, 3).await;
+            let slots: Vec<_> = (0..4)
+                .map(|_| fleet.nodes[2].rpc.request_permits.try_acquire().unwrap())
+                .collect();
+            let request = request(&fleet, ProxyMode::Versus).await;
+            let deadline = request.expire_at();
+            let task = fleet.start(request);
+            succeed(fleet.nodes[0].next().await, json!("winner"));
+            let stalled = fleet.nodes[1].next().await;
+            assert_eq!(result(task).await["result"], "winner");
+            let cutoff = if shutdown {
+                fleet.app.frontend_shutdown.send_replace(true);
+                fleet.app.frontend_tasks.close();
+                // Give the tracked task a chance to observe shutdown before advancing time.
+                without_advancing_time(async {
+                    for _ in 0..10 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                Instant::now() + Duration::from_secs(20)
+            } else {
+                deadline
+            };
+            super::batch_tests::advance_to(cutoff - Duration::from_secs(1)).await;
+            assert_eq!(fleet.app.frontend_tasks.len(), 1);
+            assert_eq!(fleet.nodes[1].rpc.active_requests.load(Ordering::SeqCst), 1);
+            super::batch_tests::advance_to(cutoff + Duration::from_millis(1)).await;
+            fleet.app.frontend_tasks.close();
+            timeout(Duration::from_secs(2), fleet.app.frontend_tasks.wait())
+                .await
+                .unwrap();
+            drop(slots);
+            drop(stalled);
+            fleet.idle();
+            assert_eq!(fleet.counts(), [1, 1, 0]);
+            fleet.nodes[2].quiet().await;
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn versus_all_failed_preserves_first_completion_and_timeout_overrides_failures() {
+    super::test_support::with_cleanup(async {
     for times_out in [false, true] {
         let mut fleet = Fleet::new(2, 2).await;
         let request = request(&fleet, ProxyMode::Versus).await;
@@ -412,47 +439,51 @@ async fn versus_all_failed_preserves_first_completion_and_timeout_overrides_fail
         drained(&fleet).await;
         assert_eq!(fleet.counts(), [1, 1]);
     }
+    }).await;
 }
 
 #[tokio::test]
 async fn versus_app_keeps_null_transactions_and_reverts_without_restarting_comparison() {
-    for (method, params, reply) in [
-        (
-            "eth_getTransactionByHash",
-            json!([format!("0x{}", "11".repeat(32))]),
-            json!({"result":null}),
-        ),
-        (
-            "eth_getTransactionReceipt",
-            json!([format!("0x{}", "11".repeat(32))]),
-            json!({"result":null}),
-        ),
-        (
-            "eth_estimateGas",
-            json!([{"to":"0x0000000000000000000000000000000000000000"}]),
-            json!({"error":{"code":3,"message":"execution reverted","data":"0xab"}}),
-        ),
-    ] {
-        let mut fleet = Fleet::new(2, 2).await;
-        let (port, server) = fleet.frontend().await;
-        let task = http_request(
-            port,
-            "/versus",
-            json!({"jsonrpc":"2.0","id":"client","method":method,"params":params}),
-        );
-        let first = fleet.nodes[0].next().await;
-        let slow = fleet.nodes[1].next().await;
-        let mut expected = reply.clone();
-        expected["jsonrpc"] = json!("2.0");
-        expected["id"] = json!("client");
-        first.respond(expected.clone());
-        assert_eq!(without_advancing_time(task).await.unwrap(), expected);
-        fleet.sync(2);
-        succeed(slow, json!("0x5208"));
-        drained(&fleet).await;
-        assert_eq!(fleet.counts(), [1, 1]);
-        server.abort();
-    }
+    super::test_support::with_cleanup(async {
+        for (method, params, reply) in [
+            (
+                "eth_getTransactionByHash",
+                json!([format!("0x{}", "11".repeat(32))]),
+                json!({"result":null}),
+            ),
+            (
+                "eth_getTransactionReceipt",
+                json!([format!("0x{}", "11".repeat(32))]),
+                json!({"result":null}),
+            ),
+            (
+                "eth_estimateGas",
+                json!([{"to":"0x0000000000000000000000000000000000000000"}]),
+                json!({"error":{"code":3,"message":"execution reverted","data":"0xab"}}),
+            ),
+        ] {
+            let mut fleet = Fleet::new(2, 2).await;
+            let (port, server) = fleet.frontend().await;
+            let task = http_request(
+                port,
+                "/versus",
+                json!({"jsonrpc":"2.0","id":"client","method":method,"params":params}),
+            );
+            let first = fleet.nodes[0].next().await;
+            let slow = fleet.nodes[1].next().await;
+            let mut expected = reply.clone();
+            expected["jsonrpc"] = json!("2.0");
+            expected["id"] = json!("client");
+            first.respond(expected.clone());
+            assert_eq!(without_advancing_time(task).await.unwrap(), expected);
+            fleet.sync(2);
+            succeed(slow, json!("0x5208"));
+            drained(&fleet).await;
+            assert_eq!(fleet.counts(), [1, 1]);
+            drop(server);
+        }
+    })
+    .await;
 }
 
 async fn exhausted_versus_app_method(method: &str, params: Value) {
@@ -496,44 +527,57 @@ async fn exhausted_versus_app_method(method: &str, params: Value) {
         assert_eq!(fleet.counts(), [1, 1, 0]);
         assert_eq!(fleet.app.frontend_tasks.len(), 0);
         fleet.idle();
-        server.abort();
+        drop(server);
     }
 }
 
 #[tokio::test]
 async fn exhausted_versus_app_returns_without_retry_on_rankings() {
-    exhausted_versus_app_method("eth_gasPrice", json!([])).await;
+    super::test_support::with_cleanup(async {
+        exhausted_versus_app_method("eth_gasPrice", json!([])).await;
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn exhausted_versus_app_gas_estimate_preserves_error_without_retry() {
-    exhausted_versus_app_method(
-        "eth_estimateGas",
-        json!([{"to":"0x0000000000000000000000000000000000000000"}]),
-    )
+    super::test_support::with_cleanup(async {
+        exhausted_versus_app_method(
+            "eth_estimateGas",
+            json!([{"to":"0x0000000000000000000000000000000000000000"}]),
+        )
+        .await;
+    })
     .await;
 }
 
 #[tokio::test]
 async fn exhausted_versus_app_transaction_does_not_retry_archive() {
-    exhausted_versus_app_method(
-        "eth_getTransactionByHash",
-        json!([format!("0x{}", "11".repeat(32))]),
-    )
+    super::test_support::with_cleanup(async {
+        exhausted_versus_app_method(
+            "eth_getTransactionByHash",
+            json!([format!("0x{}", "11".repeat(32))]),
+        )
+        .await;
+    })
     .await;
 }
 
 #[tokio::test]
 async fn exhausted_versus_app_receipt_does_not_retry_archive() {
-    exhausted_versus_app_method(
-        "eth_getTransactionReceipt",
-        json!([format!("0x{}", "11".repeat(32))]),
-    )
+    super::test_support::with_cleanup(async {
+        exhausted_versus_app_method(
+            "eth_getTransactionReceipt",
+            json!([format!("0x{}", "11".repeat(32))]),
+        )
+        .await;
+    })
     .await;
 }
 
 #[tokio::test]
 async fn best_and_versus_batches_keep_duplicate_ids_order_and_pinned_blocks() {
+    super::test_support::with_cleanup(async {
     for (mode, path) in [(ProxyMode::Best, "/"), (ProxyMode::Versus, "/versus")] {
         let mut fleet = Fleet::new(2, 2).await;
         let (port, server) = fleet.frontend().await;
@@ -577,121 +621,65 @@ async fn best_and_versus_batches_keep_duplicate_ids_order_and_pinned_blocks() {
         }
         drained(&fleet).await;
         assert_eq!(fleet.counts(), [3, 3]);
-        server.abort();
+        drop(server);
     }
+    }).await;
 }
 
 #[tokio::test]
 async fn versus_websocket_disconnect_keeps_comparison_and_local_responses_use_no_backend() {
-    let mut fleet = Fleet::new(2, 2).await;
-    let (port, server) = fleet.frontend().await;
-    let mut client = websocket_client_at(port, "/versus").await;
-    websocket_send(
-        &mut client,
-        br#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#,
-    )
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(2, 2).await;
+        let (port, server) = fleet.frontend().await;
+        let mut client = websocket_client_at(port, "/versus").await;
+        websocket_send(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#,
+        )
+        .await;
+        assert_eq!(
+            websocket_response(&mut client).await,
+            json!({"jsonrpc":"2.0","id":1,"result":"0x1"})
+        );
+        assert_eq!(fleet.counts(), [0, 0]);
+        websocket_send(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":"ws\u002did","method":"eth_gasPrice","params":[]}"#,
+        )
+        .await;
+        let fast = fleet.nodes[0].next().await;
+        let slow = fleet.nodes[1].next().await;
+        fail(fast, 3, "execution reverted");
+        assert_eq!(
+            websocket_response(&mut client).await,
+            json!({"jsonrpc":"2.0","id":"ws-id","error":{"code":3,"message":"execution reverted"}})
+        );
+        drop(client);
+        succeed(slow, json!("0x12"));
+        drained(&fleet).await;
+        measured(&fleet, &[1]).await;
+        assert_eq!(fleet.counts(), [1, 1]);
+        drop(server);
+    })
     .await;
-    assert_eq!(
-        websocket_response(&mut client).await,
-        json!({"jsonrpc":"2.0","id":1,"result":"0x1"})
-    );
-    assert_eq!(fleet.counts(), [0, 0]);
-    websocket_send(
-        &mut client,
-        br#"{"jsonrpc":"2.0","id":"ws\u002did","method":"eth_gasPrice","params":[]}"#,
-    )
-    .await;
-    let fast = fleet.nodes[0].next().await;
-    let slow = fleet.nodes[1].next().await;
-    fail(fast, 3, "execution reverted");
-    assert_eq!(
-        websocket_response(&mut client).await,
-        json!({"jsonrpc":"2.0","id":"ws-id","error":{"code":3,"message":"execution reverted"}})
-    );
-    drop(client);
-    succeed(slow, json!("0x12"));
-    drained(&fleet).await;
-    measured(&fleet, &[1]).await;
-    assert_eq!(fleet.counts(), [1, 1]);
-    server.abort();
 }
 
 #[tokio::test]
 async fn versus_websocket_backend_accepts_jsonrpc_2_response_and_preserves_client_id() {
-    let fleet = Fleet::new(1, 1).await;
-    let mut ws = super::batch_tests::WebSocketHarness::new(1).await;
-    fleet
-        .app
-        .balanced_rpcs
-        .watch_ranked_rpcs
-        .send_replace(Some(Arc::new(super::consensus::RankedRpcs::from_rpcs(
-            vec![ws.rpc.clone()],
-            fleet.app.balanced_rpcs.head_block(),
-            false,
-        ))));
-    let call: SingleRequest = sonic_rs::from_str(
-        r#"{"jsonrpc":"2.0","id":"client\u002did","method":"eth_call","params":[{},"latest"]}"#,
-    )
-    .unwrap();
-    let request = ValidatedRequest::new_with_app(
-        &fleet.app,
-        ProxyMode::Versus,
-        None,
-        call.into(),
-        fleet.app.balanced_rpcs.head_block(),
-        None,
-    )
-    .await
-    .unwrap();
-    let task = fleet.start(request);
-    let incoming = ws.next().await;
-    let id = incoming.body["id"].clone();
-    incoming.respond(json!({"jsonrpc":"2.0", "id":id, "result":"0x42"}));
-    assert_eq!(
-        result(task).await,
-        json!({"jsonrpc":"2.0","id":"client-id","result":"0x42"})
-    );
-    drained(&fleet).await;
-    ws.quiet().await;
-    assert_eq!(ws.rpc.total_requests.load(Ordering::Relaxed), 1);
-    assert_eq!(ws.rpc.active_requests.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn versus_waits_past_connection_window_for_first_cooled_node() {
-    let mut fleet = Fleet::new(1, 1).await;
-    let request = request(&fleet, ProxyMode::Versus).await;
-    let cooldown = request.connect_timeout_at() + Duration::from_secs(1);
-    fleet.nodes[0]
-        .rpc
-        .hard_limit_until
-        .as_ref()
-        .unwrap()
-        .send_replace(cooldown);
-    let task = fleet.start(request);
-    // Start the comparison while every selected node is cooling down.
-    without_advancing_time(async {
-        while fleet.app.frontend_tasks.is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    super::batch_tests::advance_to(cooldown).await;
-    succeed(fleet.nodes[0].next().await, json!("cooled"));
-    assert_eq!(result(task).await["result"], "cooled");
-    drained(&fleet).await;
-    assert_eq!(fleet.counts(), [1]);
-}
-
-#[tokio::test]
-async fn versus_rechecks_queued_health_and_history_before_submission() {
-    for change in ["health", "history"] {
-        let mut fleet = Fleet::new(2, 2).await;
-        let slots: Vec<_> = (0..4)
-            .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
-            .collect();
+    super::test_support::with_cleanup(async {
+        let fleet = Fleet::new(1, 1).await;
+        let mut ws = super::batch_tests::WebSocketHarness::new(1).await;
+        fleet
+            .app
+            .balanced_rpcs
+            .watch_ranked_rpcs
+            .send_replace(Some(Arc::new(super::consensus::RankedRpcs::from_rpcs(
+                vec![ws.rpc.clone()],
+                fleet.app.balanced_rpcs.head_block(),
+                false,
+            ))));
         let call: SingleRequest = sonic_rs::from_str(
-            r#"{"jsonrpc":"2.0","id":7,"method":"eth_call","params":[{},"0x1"]}"#,
+            r#"{"jsonrpc":"2.0","id":"client\u002did","method":"eth_call","params":[{},"latest"]}"#,
         )
         .unwrap();
         let request = ValidatedRequest::new_with_app(
@@ -705,93 +693,168 @@ async fn versus_rechecks_queued_health_and_history_before_submission() {
         .await
         .unwrap();
         let task = fleet.start(request);
-        succeed(fleet.nodes[0].next().await, json!("winner"));
-        assert_eq!(result(task).await["result"], "winner");
-        if change == "health" {
-            fleet.nodes[1].rpc.healthy.store(false, Ordering::SeqCst);
-        } else {
-            fleet.nodes[1]
-                .rpc
-                .block_data_limit
-                .store(1, Ordering::SeqCst);
-        }
-        drop(slots);
+        let incoming = ws.next().await;
+        let id = incoming.body["id"].clone();
+        incoming.respond(json!({"jsonrpc":"2.0", "id":id, "result":"0x42"}));
+        assert_eq!(
+            result(task).await,
+            json!({"jsonrpc":"2.0","id":"client-id","result":"0x42"})
+        );
         drained(&fleet).await;
-        assert_eq!(fleet.counts(), [1, 0]);
-        fleet.nodes[1].quiet().await;
-    }
+        ws.quiet().await;
+        assert_eq!(ws.rpc.total_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(ws.rpc.active_requests.load(Ordering::SeqCst), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn versus_waits_past_connection_window_for_first_cooled_node() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(1, 1).await;
+        let request = request(&fleet, ProxyMode::Versus).await;
+        let cooldown = request.connect_timeout_at() + Duration::from_secs(1);
+        fleet.nodes[0]
+            .rpc
+            .hard_limit_until
+            .as_ref()
+            .unwrap()
+            .send_replace(cooldown);
+        let task = fleet.start(request);
+        // Start the comparison while every selected node is cooling down.
+        without_advancing_time(async {
+            while fleet.app.frontend_tasks.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        super::batch_tests::advance_to(cooldown).await;
+        succeed(fleet.nodes[0].next().await, json!("cooled"));
+        assert_eq!(result(task).await["result"], "cooled");
+        drained(&fleet).await;
+        assert_eq!(fleet.counts(), [1]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn versus_rechecks_queued_health_and_history_before_submission() {
+    super::test_support::with_cleanup(async {
+        for change in ["health", "history"] {
+            let mut fleet = Fleet::new(2, 2).await;
+            let slots: Vec<_> = (0..4)
+                .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
+                .collect();
+            let call: SingleRequest = sonic_rs::from_str(
+                r#"{"jsonrpc":"2.0","id":7,"method":"eth_call","params":[{},"0x1"]}"#,
+            )
+            .unwrap();
+            let request = ValidatedRequest::new_with_app(
+                &fleet.app,
+                ProxyMode::Versus,
+                None,
+                call.into(),
+                fleet.app.balanced_rpcs.head_block(),
+                None,
+            )
+            .await
+            .unwrap();
+            let task = fleet.start(request);
+            succeed(fleet.nodes[0].next().await, json!("winner"));
+            assert_eq!(result(task).await["result"], "winner");
+            if change == "health" {
+                fleet.nodes[1].rpc.healthy.store(false, Ordering::SeqCst);
+            } else {
+                fleet.nodes[1]
+                    .rpc
+                    .block_data_limit
+                    .store(1, Ordering::SeqCst);
+            }
+            drop(slots);
+            drained(&fleet).await;
+            assert_eq!(fleet.counts(), [1, 0]);
+            fleet.nodes[1].quiet().await;
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn versus_cache_hit_adds_no_backend_samples_or_comparison_tasks() {
-    use super::blockchain::{BlockResponseCacheKey, CachedBlockResponse};
-    use alloy::primitives::B256;
-    let mut fleet = Fleet::new(2, 2).await;
-    let hash = B256::with_last_byte(42);
-    let block = json!({"hash":hash, "number":"0x2a", "transactions":[], "uncles":[]});
-    let raw = Arc::new(sonic_rs::from_str::<sonic_rs::OwnedLazyValue>(&block.to_string()).unwrap());
-    let (full, _) = CachedBlockResponse::from_full(raw, hash).unwrap();
-    fleet
-        .app
-        .balanced_rpcs
-        .block_responses
-        .insert(BlockResponseCacheKey::new(hash, true), full)
-        .await;
-    let (port, server) = fleet.frontend().await;
-    let reply = http_request(
+    super::test_support::with_cleanup(async {
+        use super::blockchain::{BlockResponseCacheKey, CachedBlockResponse};
+        use alloy::primitives::B256;
+        let mut fleet = Fleet::new(2, 2).await;
+        let hash = B256::with_last_byte(42);
+        let block = json!({"hash":hash, "number":"0x2a", "transactions":[], "uncles":[]});
+        let raw =
+            Arc::new(sonic_rs::from_str::<sonic_rs::OwnedLazyValue>(&block.to_string()).unwrap());
+        let (full, _) = CachedBlockResponse::from_full(raw, hash).unwrap();
+        fleet
+            .app
+            .balanced_rpcs
+            .block_responses
+            .insert(BlockResponseCacheKey::new(hash, true), full)
+            .await;
+        let (port, server) = fleet.frontend().await;
+        let reply = http_request(
         port,
         "/versus",
         json!({"jsonrpc":"2.0","id":"cached","method":"eth_getBlockByHash","params":[hash,true]}),
     )
     .await
     .unwrap();
-    assert_eq!(reply, json!({"jsonrpc":"2.0","id":"cached","result":block}));
-    assert_eq!(fleet.counts(), [0, 0]);
-    assert!(fleet.app.frontend_tasks.is_empty());
-    for node in &mut fleet.nodes {
-        node.quiet().await;
-        assert_eq!(node.rpc.median_latency.as_ref().unwrap().seconds(), 0.0);
-    }
-    server.abort();
+        assert_eq!(reply, json!({"jsonrpc":"2.0","id":"cached","result":block}));
+        assert_eq!(fleet.counts(), [0, 0]);
+        assert!(fleet.app.frontend_tasks.is_empty());
+        for node in &mut fleet.nodes {
+            node.quiet().await;
+            assert_eq!(node.rpc.median_latency.as_ref().unwrap().seconds(), 0.0);
+        }
+        drop(server);
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn versus_websocket_subscription_stays_local_and_preserves_acknowledgement_order() {
-    let mut fleet = Fleet::new(2, 2).await;
-    let (port, server) = fleet.frontend().await;
-    let mut client = websocket_client_at(port, "/versus").await;
-    websocket_send(
-        &mut client,
-        br#"{"jsonrpc":"2.0","id":"sub","method":"eth_subscribe","params":["newHeads"]}"#,
-    )
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(2, 2).await;
+        let (port, server) = fleet.frontend().await;
+        let mut client = websocket_client_at(port, "/versus").await;
+        websocket_send(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":"sub","method":"eth_subscribe","params":["newHeads"]}"#,
+        )
+        .await;
+        let ack = websocket_response(&mut client).await;
+        assert_eq!(ack, json!({"jsonrpc":"2.0","id":"sub","result":"0x1"}));
+        let notification = websocket_response(&mut client).await;
+        assert_eq!(notification["method"], "eth_subscription");
+        assert_eq!(notification["params"]["subscription"], "0x1");
+        assert_eq!(notification["params"]["result"]["number"], "0x2a");
+        websocket_send(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":"unsub","method":"eth_unsubscribe","params":["0x1"]}"#,
+        )
+        .await;
+        assert_eq!(
+            websocket_response(&mut client).await,
+            json!({"jsonrpc":"2.0","id":"unsub","result":true})
+        );
+        assert_eq!(fleet.counts(), [0, 0]);
+        for node in &mut fleet.nodes {
+            node.quiet().await;
+        }
+        drop(client);
+        fleet.app.frontend_shutdown.send_replace(true);
+        drained(&fleet).await;
+        drop(server);
+    })
     .await;
-    let ack = websocket_response(&mut client).await;
-    assert_eq!(ack, json!({"jsonrpc":"2.0","id":"sub","result":"0x1"}));
-    let notification = websocket_response(&mut client).await;
-    assert_eq!(notification["method"], "eth_subscription");
-    assert_eq!(notification["params"]["subscription"], "0x1");
-    assert_eq!(notification["params"]["result"]["number"], "0x2a");
-    websocket_send(
-        &mut client,
-        br#"{"jsonrpc":"2.0","id":"unsub","method":"eth_unsubscribe","params":["0x1"]}"#,
-    )
-    .await;
-    assert_eq!(
-        websocket_response(&mut client).await,
-        json!({"jsonrpc":"2.0","id":"unsub","result":true})
-    );
-    assert_eq!(fleet.counts(), [0, 0]);
-    for node in &mut fleet.nodes {
-        node.quiet().await;
-    }
-    drop(client);
-    fleet.app.frontend_shutdown.send_replace(true);
-    drained(&fleet).await;
-    server.abort();
 }
 
-#[tokio::test]
-async fn versus_transaction_submission_keeps_single_private_backend_selection() {
+fn signed_transaction() -> (alloy::primitives::Bytes, alloy::primitives::B256) {
     use alloy::network::TxSignerSync;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::{
@@ -810,30 +873,298 @@ async fn versus_transaction_submission_keeps_single_private_backend_selection() 
     let signed = transaction.into_signed(signature);
     let expected_hash = *signed.hash();
     let encoded = Bytes::from(signed.encoded_2718());
-    let mut fleet = Fleet::new(2, 2).await;
+    (encoded, expected_hash)
+}
+
+#[tokio::test]
+async fn known_transaction_replies_keep_hash_id_and_pending_notification_on_all_routes() {
+    super::test_support::with_cleanup(async {
+    for path in ["/", "/fastest", "/versus"] {
+        for private in [true, false] {
+            for message in [
+                "already known",
+                "ALREADY_EXISTS: already known",
+                "INTERNAL_ERROR: existing tx with same hash",
+                "",
+            ] {
+                let (encoded, hash) = signed_transaction();
+                let mut fleet = Fleet::with_secondary_pool(3, |app| &mut app.protected_rpcs).await;
+                if !private {
+                    fleet.app.protected_rpcs.by_name.write().clear();
+                }
+                let mut pending = fleet.app.pending_txid_firehose.subscribe();
+                let (port, server) = fleet.frontend().await;
+                let task = http_request(
+                    port,
+                    path,
+                    json!({"jsonrpc":"2.0","id":"transaction-id","method":"eth_sendRawTransaction","params":[encoded]}),
+                );
+                let index = usize::from(private);
+                let call = fleet.nodes[index].next().await;
+                assert_eq!(call.body["params"], json!([encoded]));
+                fail(call, -32603, message);
+                assert_eq!(
+                    without_advancing_time(task).await.unwrap(),
+                    json!({"jsonrpc":"2.0","id":"transaction-id","result":hash})
+                );
+                assert_eq!(pending.try_recv().unwrap(), hash);
+                assert_eq!(
+                    pending.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                );
+                drained(&fleet).await;
+                for node in &mut fleet.nodes {
+                    node.quiet().await;
+                }
+                assert_eq!(fleet.counts(), if private { [0, 1, 0] } else { [1, 0, 0] });
+                // The backend returned an RPC error. App conversion does not
+                // turn that response into a backend success timing sample.
+                assert_eq!(
+                    fleet.nodes[index]
+                        .rpc
+                        .median_latency
+                        .as_ref()
+                        .unwrap()
+                        .seconds(),
+                    0.0
+                );
+                drop(server);
+            }
+        }
+    }
+    }).await;
+}
+
+#[tokio::test]
+async fn unknown_transaction_error_is_preserved_without_pending_notification() {
+    super::test_support::with_cleanup(async {
+    for path in ["/", "/fastest", "/versus"] {
+        let (encoded, _) = signed_transaction();
+        let mut fleet = Fleet::with_secondary_pool(3, |app| &mut app.protected_rpcs).await;
+        let mut pending = fleet.app.pending_txid_firehose.subscribe();
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(
+            port,
+            path,
+            json!({"jsonrpc":"2.0","id":"unknown-tx","method":"eth_sendRawTransaction","params":[encoded]}),
+        );
+        fail(
+            fleet.nodes[1].next().await,
+            -32000,
+            "already known: different transaction",
+        );
+        assert_eq!(
+            task.await.unwrap(),
+            json!({"jsonrpc":"2.0","id":"unknown-tx","error":{"code":-32000,"message":"already known: different transaction"}})
+        );
+        assert_eq!(
+            pending.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        );
+        assert_eq!(fleet.counts(), [0, 1, 0]);
+        fleet.idle();
+        drop(server);
+    }
+    }).await;
+}
+
+#[tokio::test]
+async fn ordinary_transaction_internal_error_retries_before_publishing_pending_hash() {
+    super::test_support::with_cleanup(async {
+        for path in ["/", "/fastest", "/versus"] {
+            let (encoded, hash) = signed_transaction();
+            let mut fleet = Fleet::with_secondary_pool(3, |app| &mut app.protected_rpcs).await;
+            let mut pending = fleet.app.pending_txid_firehose.subscribe();
+            let (port, server) = fleet.frontend().await;
+            let task = http_request(port, path, json!({"jsonrpc":"2.0","id":"retry-tx","method":"eth_sendRawTransaction","params":[encoded]}));
+            fail(fleet.nodes[1].next().await, -32603, "unknown transaction error");
+            let retry = fleet.nodes[2].next().await;
+            assert_eq!(pending.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty));
+            succeed(retry, json!(hash));
+            assert_eq!(task.await.unwrap(), json!({"jsonrpc":"2.0","id":"retry-tx","result":hash}));
+            assert_eq!(pending.try_recv().unwrap(), hash);
+            assert_eq!(pending.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty));
+            assert_eq!(fleet.counts(), [0, 1, 1]);
+            fleet.idle();
+            drop(server);
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn known_transaction_text_on_another_method_remains_retryable() {
+    super::test_support::with_cleanup(async {
+        for path in ["/", "/fastest", "/versus"] {
+            let mut fleet = Fleet::new(2, 2).await;
+            let mut pending = fleet.app.pending_txid_firehose.subscribe();
+            let (port, server) = fleet.frontend().await;
+            let task = http_request(
+                port,
+                path,
+                json!({"jsonrpc":"2.0","id":"gas-id","method":"eth_gasPrice","params":[]}),
+            );
+            fail(fleet.nodes[0].next().await, -32603, "already known");
+            succeed(fleet.nodes[1].next().await, json!("0x42"));
+            assert_eq!(
+                task.await.unwrap(),
+                json!({"jsonrpc":"2.0","id":"gas-id","result":"0x42"})
+            );
+            drained(&fleet).await;
+            assert_eq!(fleet.counts(), [1, 1]);
+            assert_eq!(
+                pending.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            );
+            drop(server);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn versus_bundler_pool_without_rankings_finishes_selected_queued_work() {
+    super::test_support::with_cleanup(async {
+    let mut fleet = Fleet::with_secondary_pool(4, |app| &mut app.bundler_4337_rpcs).await;
+    let pool = fleet.app.bundler_4337_rpcs.clone();
+    pool.by_name.write().remove(&fleet.nodes[3].rpc.name);
+    assert!(pool.watch_ranked_rpcs.borrow().is_none());
+    let slots: Vec<_> = (0..4)
+        .map(|_| fleet.nodes[2].rpc.request_permits.try_acquire().unwrap())
+        .collect();
     let (port, server) = fleet.frontend().await;
     let task = http_request(
         port,
         "/versus",
-        json!({"jsonrpc":"2.0","id":7,"method":"eth_sendRawTransaction","params":[encoded]}),
+        json!({"jsonrpc":"2.0","id":"bundler-id","method":"eth_supportedEntryPoints","params":[]}),
     );
-    let call = fleet.nodes[0].next().await;
-    assert_eq!(call.body["method"], "eth_sendRawTransaction");
-    assert_eq!(call.body["params"], json!([encoded]));
-    succeed(call, json!(expected_hash));
+    let entries = json!(["0x0000000000000000000000000000000000000001"]);
+    succeed(fleet.nodes[1].next().await, entries.clone());
     assert_eq!(
         task.await.unwrap(),
-        json!({"jsonrpc":"2.0","id":7,"result":expected_hash})
+        json!({"jsonrpc":"2.0","id":"bundler-id","result":entries})
     );
-    assert_eq!(fleet.counts(), [1, 0]);
-    assert!(fleet.app.frontend_tasks.is_empty());
-    fleet.nodes[1].quiet().await;
-    fleet.idle();
-    server.abort();
+    assert_eq!(fleet.app.frontend_tasks.len(), 1);
+    pool.by_name
+        .write()
+        .insert(fleet.nodes[3].rpc.name.clone(), fleet.nodes[3].rpc.clone());
+    drop(slots);
+    succeed(fleet.nodes[2].next().await, entries);
+    drained(&fleet).await;
+    assert_eq!(fleet.counts(), [0, 1, 1, 0]);
+    assert!(pool.watch_ranked_rpcs.borrow().is_none());
+    drop(server);
+    }).await;
+}
+
+#[tokio::test]
+async fn versus_bundler_rechecks_identity_and_health_before_admission() {
+    super::test_support::with_cleanup(async {
+    for change in ["remove", "replace", "unhealthy"] {
+        let mut fleet = Fleet::with_secondary_pool(4, |app| &mut app.bundler_4337_rpcs).await;
+        let pool = fleet.app.bundler_4337_rpcs.clone();
+        pool.by_name.write().remove(&fleet.nodes[3].rpc.name);
+        let mut replacement =
+            super::batch_tests::Harness::named(&fleet.nodes[2].rpc.name, 4, 64).await;
+        let slots: Vec<_> = (0..4)
+            .map(|_| fleet.nodes[2].rpc.request_permits.try_acquire().unwrap())
+            .collect();
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(
+            port,
+            "/versus",
+            json!({"jsonrpc":"2.0","id":"bundler-id","method":"eth_supportedEntryPoints","params":[]}),
+        );
+        let first = fleet.nodes[1].next().await;
+        fleet.nodes[2].quiet().await;
+        let queued = &fleet.nodes[2].rpc;
+        match change {
+            "remove" => {
+                pool.by_name.write().remove(&queued.name);
+            }
+            "replace" => {
+                pool.by_name
+                    .write()
+                    .insert(queued.name.clone(), replacement.rpc.clone());
+            }
+            "unhealthy" => queued.healthy.store(false, Ordering::SeqCst),
+            _ => unreachable!(),
+        }
+        succeed(first, json!([]));
+        assert_eq!(
+            task.await.unwrap(),
+            json!({"jsonrpc":"2.0","id":"bundler-id","result":[]})
+        );
+        drop(slots);
+        drained(&fleet).await;
+        assert_eq!(fleet.counts(), [0, 1, 0, 0]);
+        replacement.quiet().await;
+        assert_eq!(replacement.rpc.total_requests.load(Ordering::Relaxed), 0);
+        assert!(pool.watch_ranked_rpcs.borrow().is_none());
+        drop(server);
+    }
+    }).await;
+}
+
+#[tokio::test]
+async fn exhausted_versus_bundler_pool_returns_terminal_error_without_restart() {
+    super::test_support::with_cleanup(async {
+    let mut fleet = Fleet::with_secondary_pool(3, |app| &mut app.bundler_4337_rpcs).await;
+    let (port, server) = fleet.frontend().await;
+    let task = http_request(
+        port,
+        "/versus",
+        json!({"jsonrpc":"2.0","id":"bundler-id","method":"eth_supportedEntryPoints","params":[]}),
+    );
+    fail(fleet.nodes[1].next().await, -32602, "first bundler failure");
+    fleet.wait_for_active(&[0, 0, 1]).await;
+    fail(fleet.nodes[2].next().await, -32603, "last bundler failure");
+    assert_eq!(
+        without_advancing_time(task).await.unwrap(),
+        json!({"jsonrpc":"2.0","id":"bundler-id","error":{"code":-32602,"message":"first bundler failure"}})
+    );
+    drained(&fleet).await;
+    assert_eq!(fleet.counts(), [0, 1, 1]);
+    assert!(fleet
+        .app
+        .bundler_4337_rpcs
+        .watch_ranked_rpcs
+        .borrow()
+        .is_none());
+    drop(server);
+    }).await;
+}
+
+#[tokio::test]
+async fn versus_transaction_submission_keeps_single_private_backend_selection() {
+    super::test_support::with_cleanup(async {
+        let (encoded, expected_hash) = signed_transaction();
+        let mut fleet = Fleet::new(2, 2).await;
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(
+            port,
+            "/versus",
+            json!({"jsonrpc":"2.0","id":7,"method":"eth_sendRawTransaction","params":[encoded]}),
+        );
+        let call = fleet.nodes[0].next().await;
+        assert_eq!(call.body["method"], "eth_sendRawTransaction");
+        assert_eq!(call.body["params"], json!([encoded]));
+        succeed(call, json!(expected_hash));
+        assert_eq!(
+            task.await.unwrap(),
+            json!({"jsonrpc":"2.0","id":7,"result":expected_hash})
+        );
+        assert_eq!(fleet.counts(), [1, 0]);
+        assert!(fleet.app.frontend_tasks.is_empty());
+        fleet.nodes[1].quiet().await;
+        fleet.idle();
+        drop(server);
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn versus_websocket_reconnect_resends_within_one_pipeline_invocation() {
+    super::test_support::with_cleanup(async {
     let mut fleet = Fleet::new(1, 2).await;
     let mut ws = super::batch_tests::WebSocketHarness::new(1).await;
     let publish = |nodes| {
@@ -920,25 +1251,29 @@ async fn versus_websocket_reconnect_resends_within_one_pipeline_invocation() {
     let permit = ws.rpc.request_permits.try_acquire().unwrap();
     assert!(ws.rpc.request_permits.try_acquire().is_err());
     drop(permit);
+    }).await;
 }
 
 #[tokio::test]
 async fn versus_null_gas_estimate_is_an_accepted_answer() {
-    let mut fleet = Fleet::new(2, 2).await;
-    let (port, server) = fleet.frontend().await;
-    let task = http_request(
-        port,
-        "/versus",
-        json!({"jsonrpc":"2.0","id":7,"method":"eth_estimateGas","params":[{}]}),
-    );
-    let slow = fleet.nodes[0].next().await;
-    succeed(fleet.nodes[1].next().await, Value::Null);
-    assert_eq!(
-        without_advancing_time(task).await.unwrap(),
-        json!({"jsonrpc":"2.0","id":7,"result":null})
-    );
-    succeed(slow, json!("0x5208"));
-    drained(&fleet).await;
-    assert_eq!(fleet.counts(), [1, 1]);
-    server.abort();
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(2, 2).await;
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(
+            port,
+            "/versus",
+            json!({"jsonrpc":"2.0","id":7,"method":"eth_estimateGas","params":[{}]}),
+        );
+        let slow = fleet.nodes[0].next().await;
+        succeed(fleet.nodes[1].next().await, Value::Null);
+        assert_eq!(
+            without_advancing_time(task).await.unwrap(),
+            json!({"jsonrpc":"2.0","id":7,"result":null})
+        );
+        succeed(slow, json!("0x5208"));
+        drained(&fleet).await;
+        assert_eq!(fleet.counts(), [1, 1]);
+        drop(server);
+    })
+    .await;
 }

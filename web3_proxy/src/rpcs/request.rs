@@ -404,7 +404,6 @@ impl BackendRequest {
             });
         } else {
             // only save reverts for some types of calls
-            // TODO: do something special for eth_sendRawTransaction too
             // we do **NOT** use self.error_handler here because it might have been modified
             let error_handler = self.error_handler;
 
@@ -420,7 +419,13 @@ impl BackendRequest {
                     ResponsePayload::Error { error } => {
                         trace!(?error, "jsonrpc error data");
 
-                        if let Some(history_error) =
+                        if self.web3_request.inner.method() == "eth_sendRawTransaction"
+                            && error.is_known_transaction()
+                        {
+                            // Preserve the reply for App's decoded transaction hash
+                            // and pending notification, without a success sample.
+                            ResponseType::Error
+                        } else if let Some(history_error) =
                             history_error_for_request(&self.web3_request, error)
                         {
                             response = Err(history_error);

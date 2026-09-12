@@ -1,6 +1,5 @@
-//! Compare a fixed set of consensus backends without cancelling slower attempts.
+//! Compare a fixed set of eligible backends without cancelling slower attempts.
 use super::{
-    consensus::RankedRpcs,
     many::Web3Rpcs,
     one::Web3Rpc,
     request::{OpenRequestHandle, OpenRequestResult},
@@ -12,25 +11,17 @@ use crate::{
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::{future::Future, sync::Arc};
 use tokio::{
-    sync::{oneshot, watch},
+    sync::oneshot,
     time::{sleep, sleep_until, Duration},
 };
 
-fn eligible(
-    rankings: &watch::Receiver<Option<Arc<RankedRpcs>>>,
-    request: &Arc<ValidatedRequest>,
-    rpc: &Arc<Web3Rpc>,
-) -> bool {
-    rankings
-        .borrow()
-        .as_ref()
-        .and_then(|ranked| ranked.for_request(request))
-        .is_some_and(|candidates| {
-            candidates
-                .connections()
-                .iter()
-                .any(|node| Arc::ptr_eq(node, rpc))
-        })
+fn eligible(pool: &Web3Rpcs, request: &Arc<ValidatedRequest>, rpc: &Arc<Web3Rpc>) -> bool {
+    pool.rpcs_for_request(request).is_ok_and(|candidates| {
+        candidates
+            .connections()
+            .iter()
+            .any(|node| Arc::ptr_eq(node, rpc))
+    })
 }
 
 /// Admission can wait and recheck state. Invoke this node's transport once;
@@ -38,7 +29,7 @@ fn eligible(
 async fn attempt<R, F, Fut>(
     rpc: Arc<Web3Rpc>,
     request: &Arc<ValidatedRequest>,
-    mut rankings: watch::Receiver<Option<Arc<RankedRpcs>>>,
+    pool: &Web3Rpcs,
     send: &F,
 ) -> Web3ProxyResult<SingleResponse<R>>
 where
@@ -46,11 +37,12 @@ where
     F: Fn(OpenRequestHandle) -> Fut,
     Fut: Future<Output = Web3ProxyResult<SingleResponse<R>>>,
 {
+    let mut rankings = pool.watch_ranked_rpcs.subscribe();
     loop {
         if request.expired() {
             return Err(Web3ProxyError::Timeout(None));
         }
-        if !eligible(&rankings, request, &rpc) {
+        if !eligible(pool, request, &rpc) {
             return Err(Web3ProxyError::NoServersSynced);
         }
         let handle = match rpc.try_request_handle(request, None, false).await? {
@@ -75,7 +67,7 @@ where
                 return Err(Web3ProxyError::NoServersSynced);
             }
         };
-        if !eligible(&rankings, request, &rpc) {
+        if !eligible(pool, request, &rpc) {
             return Err(Web3ProxyError::NoServersSynced);
         }
         if !rpc.can_submit(request, false) {
@@ -96,7 +88,7 @@ where
 
 impl Web3Rpcs {
     pub(super) async fn versus_with<R, F, Fut>(
-        &self,
+        self: &Arc<Self>,
         request: &Arc<ValidatedRequest>,
         send: F,
     ) -> Web3ProxyResult<SingleResponse<R>>
@@ -107,8 +99,8 @@ impl Web3Rpcs {
     {
         // Capture membership once. A later ranking update can remove candidates,
         // but it cannot add a new node to this comparison.
-        let selected = self.try_rpcs_for_request(request).await?.connections();
-        let rankings = self.watch_ranked_rpcs.subscribe();
+        let selected = self.rpcs_for_request(request)?.connections();
+        let pool = self.clone();
         let request = request.clone();
         let mut shutdown = self.frontend_shutdown.clone();
         let (reply, response) = oneshot::channel();
@@ -117,7 +109,7 @@ impl Web3Rpcs {
             let mut first_error = None;
             let mut pending: FuturesUnordered<_> = selected
                 .into_iter()
-                .map(|rpc| attempt(rpc, &request, rankings.clone(), &send))
+                .map(|rpc| attempt(rpc, &request, &pool, &send))
                 .collect();
             let drain = async {
                 let _ = shutdown.wait_for(|closing| *closing).await;
