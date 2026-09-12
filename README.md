@@ -6,15 +6,25 @@ Web3_proxy is a fast load-balancing proxy for web3 (Ethereum or similar) JSON-RP
 
 Signed transactions `(eth_sendRawTransaction)` are sent in parallel to the configured private RPCs (Flashbots, etc.).
 
-The normal `/` route uses Best mode. It selects eligible RPC servers with the existing latency tiers and load-aware ranking.
+The normal `/` route uses Best mode. It selects eligible RPC servers with the existing latency tiers and load-aware ranking. Eligible primary nodes precede backups. Best retries malformed responses, wrong response IDs, and `-32603 Internal error` on another eligible node within the original deadline. Its other RPC error rules remain in place.
+
+HTTP backend responses are read completely into memory before the proxy accepts or returns them. This includes responses larger than 128 KiB. The proxy validates the JSON-RPC envelope and decoded response ID before recording a successful latency sample. The backend permit stays held through the body read and validation. Large replies therefore use memory proportional to their complete size; an incomplete or stalled body cannot become a client response.
 
 Use `/fastest` for HTTP or WebSocket tests that should race multiple fast nodes. Set `app.fastest_rpcs` in the TOML config (default `2`). Fastest uses the same latency tiers, then load-weighted latency within each tier. It starts requests on the best available synced nodes. With one synced node, it sends one request. With three synced nodes and a count of two, it selects the top two. Set the count to `1` for one node, or `0` for all synced eligible nodes.
 
 Fastest returns the first complete valid result, including `null` or an execution revert. A transport failure, malformed response, or other RPC error does not beat a valid response. Fastest fills failed attempt slots from the remaining eligible nodes, within the original deadline. The count limits concurrent attempts, not the total number of retries. It cancels losing attempts and releases their request slots. Requests that already entered transport still count as backend attempts.
 
-Config reloads apply the new count to new HTTP requests and new messages on existing WebSocket connections. Active requests keep their original count. Fastest preserves local and cached responses, transaction broadcast rules, subscriptions, client IDs, and batch response order. It does not change `/` or implement `/versus`.
+Config reloads apply the new count to new HTTP requests and new messages on existing WebSocket connections. Active requests keep their original count. Fastest preserves local and cached responses, transaction broadcast rules, subscriptions, client IDs, and batch response order.
 
 Use `http://127.0.0.1:8544/fastest` or `ws://127.0.0.1:8544/fastest` as the default RPC URL in selected tests. Expect more RPC traffic and possible provider charges. The race can reduce latency, but it cannot guarantee the fastest answer across all nodes and network conditions.
+
+Use `/versus` over HTTP or WebSocket to compare the eligible consensus nodes. Each comparison captures its node set and uses the same validated request and pinned block on every selected node. It waits for normal backend permits and cooldowns, then rechecks eligibility before submission. A Versus attempt is one pipeline invocation of a selected node's transport. Alloy can retry that call on the same backend, including resending it after a WebSocket reconnect. The Versus pipeline does not invoke a selected node again, replace failed nodes, add new nodes, or restart the comparison. This restriction applies to Versus; Best failover and Fastest retries retain their contracts above.
+
+Versus returns the first complete success, including `null`, or execution revert. Other RPC errors, transport failures, and invalid responses cannot win. After handing the answer to the client, the same tracked task continues the remaining selected work, including queued nodes. Client disconnection does not cancel it. The original request deadline still applies. Shutdown allows at most 20 seconds to drain request work. Each attempt holds its permit until it finishes or expires.
+
+Later successful completions update the existing median and peak backend latency metrics. They do not change the client answer or its recorded response time. RPC errors, including accepted reverts, do not produce successful latency samples. Local replies and cache hits start no comparison and add no backend timing samples. Transaction submission rules, subscriptions, client IDs, and batch order stay in place. A completed comparison cannot restart through application retries, gas-estimate error handling, or transaction/receipt archive fallback. If every node fails, Versus returns the first completed failure; if the deadline expires, it reports timeout.
+
+Backend WebSocket calls keep Alloy's existing transport, response parsing, and reconnect behavior. Alloy handles backend response IDs, and the proxy returns the original client ID. HTTP backends, including requests from WebSocket clients, use the complete-response validation path described above.
 
 Each server has different limits that can be configured. The `soft_limit` is the number of parallel active requests where a server starts to slow down, while the `hard_limit` is where a server starts giving rate limits or other errors.
 

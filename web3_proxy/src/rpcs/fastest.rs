@@ -16,7 +16,6 @@ use tokio::time::{sleep_until, Instant};
 async fn complete<R, Fut>(
     rpc: Arc<Web3Rpc>,
     response: Fut,
-    request: &Arc<ValidatedRequest>,
 ) -> (Arc<Web3Rpc>, Web3ProxyResult<SingleResponse<R>>)
 where
     R: JsonRpcResultData,
@@ -24,12 +23,6 @@ where
 {
     let result = async {
         let response = response.await?.parsed().await?;
-        // Compare JSON identities, including escaped string IDs.
-        let actual: sonic_rs::Value = sonic_rs::from_str(&sonic_rs::to_string(&response.id)?)?;
-        let expected: sonic_rs::Value = sonic_rs::from_str(&sonic_rs::to_string(&request.id())?)?;
-        if actual != expected {
-            return Err(anyhow::anyhow!("backend response ID mismatch").into());
-        }
         if let ResponsePayload::Error { error } = &response.payload {
             if !error.is_execution_revert() {
                 return Err(Web3ProxyError::JsonRpcErrorData(error.clone()));
@@ -86,7 +79,7 @@ impl Web3Rpcs {
                             Ok(OpenRequestResult::Handle(handle)) => {
                                 opened_any = true;
                                 active.insert(rpc.name.clone());
-                                pending.push(complete(rpc, send(handle), request));
+                                pending.push(complete(rpc, send(handle)));
                             }
                             Ok(OpenRequestResult::Busy(wait)) => {
                                 opened_any = true;
@@ -138,7 +131,7 @@ impl Web3Rpcs {
                         });
                         if eligible && rpc.can_submit(request, false) {
                             active.insert(rpc.name.clone());
-                            pending.push(complete(rpc, send(handle), request));
+                            pending.push(complete(rpc, send(handle)));
                         }
                     }
                 }

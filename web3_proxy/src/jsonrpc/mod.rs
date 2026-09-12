@@ -9,9 +9,7 @@ use std::fmt;
 pub use self::error::JsonRpcErrorData;
 pub use self::id::LooseId;
 pub use self::request::{JsonRpcRequestEnum, SingleRequest};
-pub use self::response::{
-    ParsedResponse, Response, ResponseData, ResponsePayload, SingleResponse, StreamResponse,
-};
+pub use self::response::{ParsedResponse, Response, ResponseData, ResponsePayload, SingleResponse};
 pub use request_builder::{RequestOrMethod, ValidatedRequest};
 
 pub trait JsonRpcParams = fmt::Debug + serde::Serialize + Send + Sync + 'static;

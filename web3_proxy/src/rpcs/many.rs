@@ -36,6 +36,8 @@ use tracing::{debug, error, info, trace, warn};
 /// A collection of web3 connections. Sends requests either the current best server or all servers.
 #[derive(From)]
 pub struct Web3Rpcs {
+    pub(crate) frontend_tasks: tokio_util::task::TaskTracker,
+    pub(crate) frontend_shutdown: watch::Receiver<bool>,
     pub(crate) name: Cow<'static, str>,
     pub(crate) chain_id: u64,
     /// if watch_head_block is some, Web3Rpc inside self will send blocks here when they get them
@@ -131,6 +133,8 @@ impl Web3Rpcs {
     pub async fn spawn(
         config: Web3RpcsSpawnConfig,
         name: Cow<'static, str>,
+        frontend_tasks: tokio_util::task::TaskTracker,
+        frontend_shutdown: watch::Receiver<bool>,
         watch_consensus_head_sender: Option<watch::Sender<Option<BlockHeader>>>,
         pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
     ) -> anyhow::Result<(
@@ -178,6 +182,8 @@ impl Web3Rpcs {
             block_interval.mul_f32((max_head_block_lag.to::<u64>() * 10) as f32);
 
         let connections = Arc::new(Self {
+            frontend_tasks,
+            frontend_shutdown,
             head_observation_publisher,
             block_hydration,
             blocks_by_hash,
@@ -392,29 +398,27 @@ impl Web3Rpcs {
         &self,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<RpcsForRequest> {
-        // TODO: by_name might include things that are on a forked
-        let ranked_rpcs: Arc<RankedRpcs> = match self.watch_ranked_rpcs.borrow().clone() {
-            Some(ranked_rpcs) => ranked_rpcs,
-            _ => {
-                if self.watch_head_block.is_some() {
-                    // if we are here, this set of rpcs is subscribed to newHeads. But we didn't get a RankedRpcs. that means something is wrong
-                    return Err(Web3ProxyError::NoServersSynced);
-                } else {
-                    trace!("watch_head_block is none");
+        self.rpcs_for_request(web3_request)
+    }
 
-                    // no RankedRpcs, but also no newHeads subscription. This is probably a set of "protected" rpcs or similar
-                    let rpcs = self.by_name.read().values().cloned().collect();
-
-                    // TODO: does this need the head_block? i don't think so
-                    let x = RankedRpcs::from_rpcs(
-                        rpcs,
-                        web3_request.head_block.clone(),
-                        self.watch_head_block.is_some(),
-                    );
-
-                    Arc::new(x)
-                }
-            }
+    /// Use the pool's current membership for selection and admission rechecks.
+    pub(super) fn rpcs_for_request(
+        &self,
+        web3_request: &Arc<ValidatedRequest>,
+    ) -> Web3ProxyResult<RpcsForRequest> {
+        let ranked_rpcs = if self.watch_head_block.is_some() {
+            self.watch_ranked_rpcs
+                .borrow()
+                .clone()
+                .ok_or(Web3ProxyError::NoServersSynced)?
+        } else {
+            // Protected and bundler pools have no consensus task. Their live
+            // membership is authoritative, including replacements by name.
+            Arc::new(RankedRpcs::from_rpcs(
+                self.by_name.read().values().cloned().collect(),
+                web3_request.head_block.clone(),
+                false,
+            ))
         };
 
         match ranked_rpcs.for_request(web3_request) {
@@ -436,7 +440,6 @@ impl Web3Rpcs {
 
         let response = self.request_with_metadata::<R>(&web3_request).await?;
 
-        // the response might support streaming. we need to parse it
         let parsed = response.parsed().await?;
 
         match parsed.payload {
@@ -475,7 +478,7 @@ impl Web3Rpcs {
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
         tokio::time::timeout_at(
             web3_request.expire_at(),
-            self.request_with(web3_request, OpenRequestHandle::request_parsed::<R>),
+            self.request_with(web3_request, OpenRequestHandle::request::<R>),
         )
         .await?
     }
@@ -597,7 +600,7 @@ impl Web3Rpcs {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn try_proxy_connection<R: JsonRpcResultData>(
-        &self,
+        self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
         self.try_proxy_connection_with(web3_request, OpenRequestHandle::request::<R>)
@@ -605,21 +608,21 @@ impl Web3Rpcs {
     }
 
     pub(crate) async fn try_proxy_connection_with<R, F, Fut>(
-        &self,
+        self: &Arc<Self>,
         web3_request: &Arc<ValidatedRequest>,
         send: F,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>>
     where
         R: JsonRpcResultData,
-        F: Fn(OpenRequestHandle) -> Fut,
-        Fut: Future<Output = Web3ProxyResult<jsonrpc::SingleResponse<R>>>,
+        F: Fn(OpenRequestHandle) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Web3ProxyResult<jsonrpc::SingleResponse<R>>> + Send,
     {
         let proxy_mode = web3_request.proxy_mode();
 
         match proxy_mode {
             ProxyMode::Best => self.request_with(web3_request, send).await,
             ProxyMode::Fastest(count) => self.fastest_with(web3_request, count, send).await,
-            ProxyMode::Versus => todo!("Versus"),
+            ProxyMode::Versus => self.versus_with(web3_request, send).await,
         }
     }
 }

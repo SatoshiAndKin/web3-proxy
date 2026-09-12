@@ -1,12 +1,7 @@
 use super::JsonRpcErrorData;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
-use crate::jsonrpc::ValidatedRequest;
-use crate::rpcs::request::ActiveRequestGuard;
-use axum::body::Body;
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
-use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
 use serde::{de, Deserialize, Serialize};
 use sonic_rs::{JsonValueTrait, OwnedLazyValue, Value};
 use std::borrow::Cow;
@@ -255,7 +250,12 @@ where
                     }
                 }
 
-                let id = id.unwrap_or_default();
+                let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
+                if !(id.is_null() || id.is_str() || id.is_number()) {
+                    return Err(de::Error::custom(
+                        "response ID must be a string, number, or null",
+                    ));
+                }
 
                 // jsonrpc version must be present in all responses
                 let jsonrpc = jsonrpc
@@ -293,72 +293,9 @@ pub enum ResponsePayload<T> {
 }
 
 #[derive(Debug)]
-pub struct StreamResponse<T> {
-    pub(crate) request_permit: Option<ActiveRequestGuard>,
-    _t: PhantomData<T>,
-    buffer: Bytes,
-    num_bytes: Option<u64>,
-    response: reqwest::Response,
-    web3_request: Arc<ValidatedRequest>,
-}
-
-impl<T> StreamResponse<T> {
-    pub async fn read(self) -> Web3ProxyResult<ParsedResponse<T>>
-    where
-        T: de::DeserializeOwned,
-    {
-        let mut buffer = BytesMut::with_capacity(self.buffer.len());
-        buffer.extend(self.buffer);
-        buffer.extend(self.response.bytes().await?);
-        let parsed = sonic_rs::from_slice(&buffer)?;
-        Ok(parsed)
-    }
-}
-
-impl<T> IntoResponse for StreamResponse<T> {
-    fn into_response(self) -> axum::response::Response {
-        let Self {
-            buffer,
-            response,
-            web3_request,
-            request_permit,
-            ..
-        } = self;
-        let stream = async_stream::stream! {
-            let mut request_permit = request_permit;
-            let mut total_bytes = buffer.len() as u64;
-            web3_request.set_response(total_bytes);
-            yield Ok::<_, reqwest::Error>(buffer);
-            let upstream = response.bytes_stream();
-            tokio::pin!(upstream);
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(chunk) => {
-                        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
-                        web3_request.set_response(total_bytes);
-                        yield Ok(chunk);
-                    }
-                    Err(error) => {
-                        drop(request_permit.take());
-                        yield Err(error);
-                        break;
-                    }
-                }
-            }
-            drop(request_permit);
-        };
-        let body = Body::from_stream(stream);
-        body.into_response()
-    }
-}
-
-#[derive(Debug)]
 pub enum SingleResponse<T = Arc<OwnedLazyValue>> {
-    /// TODO: save the size here so we don't have to serialize again
-    /// TODO: before doing that, make sure we don't swap back and forth between parsed and stream and single and forwarded and end up serializing too many times
     /// TODO: save the size here so repeated serialization is not necessary.
     Parsed(ParsedResponse<T>),
-    Stream(StreamResponse<T>),
 }
 
 impl<T> SingleResponse<T>
@@ -368,71 +305,13 @@ where
     pub fn is_jsonrpc_err(&self) -> bool {
         match self {
             Self::Parsed(resp, ..) => matches!(resp.payload, ResponsePayload::Error { .. }),
-            Self::Stream(..) => false,
         }
     }
 
-    // TODO: threshold from configs
-    // TODO: error handling
-    // TODO: if a large stream's response's initial chunk "error" then we should buffer it
-    pub async fn read_if_short(
-        mut response: reqwest::Response,
-        nbytes: u64,
-        web3_request: &Arc<ValidatedRequest>,
-    ) -> Web3ProxyResult<SingleResponse<T>> {
-        match response.content_length() {
-            // short
-            Some(len) if len <= nbytes => Ok(Self::from_bytes(response.bytes().await?)?),
-            // long
-            Some(len) => Ok(Self::Stream(StreamResponse {
-                request_permit: None,
-                _t: PhantomData::<T>,
-                buffer: Bytes::new(),
-                num_bytes: Some(len),
-                response,
-                web3_request: web3_request.clone(),
-            })),
-            // unknown length. maybe compressed. maybe streaming. maybe both
-            None => {
-                // todo: this might over-allocate, but it's probably fine
-                let mut buffer = BytesMut::with_capacity(nbytes as usize);
-                while (buffer.len() as u64) < nbytes {
-                    match response.chunk().await? {
-                        Some(chunk) => {
-                            buffer.extend(chunk);
-                        }
-                        None => {
-                            // it was short
-                            return Ok(Self::from_bytes(buffer.freeze())?);
-                        }
-                    }
-                }
-
-                // we've read nbytes of the response, but there is more to come
-                let buffer = buffer.freeze();
-                Ok(Self::Stream(StreamResponse {
-                    request_permit: None,
-                    _t: PhantomData::<T>,
-                    buffer,
-                    num_bytes: None,
-                    response,
-                    web3_request: web3_request.clone(),
-                }))
-            }
-        }
-    }
-
-    fn from_bytes(buf: Bytes) -> Result<Self, sonic_rs::Error> {
-        let val = sonic_rs::from_slice(&buf)?;
-        Ok(Self::Parsed(val))
-    }
-
-    /// Read a streaming response into a parsed response.
+    /// Return the fully read and validated response.
     pub async fn parsed(self) -> Web3ProxyResult<ParsedResponse<T>> {
-        match self {
-            Self::Parsed(resp, ..) => Ok(resp),
-            Self::Stream(resp, ..) => resp.read().await,
-        }
+        let Self::Parsed(response) = self;
+        Ok(response)
     }
 
     pub fn num_bytes(&self) -> u64 {
@@ -440,7 +319,6 @@ where
             Self::Parsed(response) => sonic_rs::to_string(response)
                 .expect("this should always serialize")
                 .len() as u64,
-            Self::Stream(response) => response.num_bytes.unwrap_or(0),
         }
     }
 
@@ -448,9 +326,6 @@ where
         match self {
             SingleResponse::Parsed(x, ..) => {
                 x.id = id;
-            }
-            SingleResponse::Stream(..) => {
-                // stream responses will hopefully always have the right id already because we pass the orignal id all the way from the front to the back
             }
         }
     }
@@ -469,7 +344,6 @@ where
     fn into_response(self) -> axum::response::Response {
         match self {
             Self::Parsed(resp, ..) => json_response(StatusCode::OK, &resp),
-            Self::Stream(resp, ..) => resp.into_response(),
         }
     }
 }
@@ -484,7 +358,6 @@ impl Response<Arc<OwnedLazyValue>> {
     pub async fn to_json_string(self) -> Web3ProxyResult<String> {
         let x = match self {
             Self::Single(resp) => {
-                // TODO: handle streaming differently?
                 let parsed = resp.parsed().await?;
 
                 sonic_rs::to_string(&parsed)
@@ -518,42 +391,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedResponse, ResponseData, StreamResponse};
-    use crate::jsonrpc::{JsonRpcErrorData, ValidatedRequest};
-    use axum::{body::to_bytes, response::IntoResponse};
-    use bytes::Bytes;
-    use futures_util::stream;
+    use super::{ParsedResponse, ResponseData};
+    use crate::jsonrpc::JsonRpcErrorData;
     use sonic_rs::OwnedLazyValue;
-    use std::{marker::PhantomData, sync::Arc};
-
-    #[tokio::test]
-    async fn streamed_response_counts_all_bytes() {
-        let web3_request = ValidatedRequest::new_internal("test".into(), &(), None, None)
-            .await
-            .unwrap();
-        let upstream_body = reqwest::Body::wrap_stream(stream::iter([
-            Ok::<_, std::io::Error>(Bytes::from_static(b"defg")),
-            Ok(Bytes::from_static(b"hi")),
-        ]));
-        let upstream_response = http::Response::builder()
-            .body(upstream_body)
-            .unwrap()
-            .into();
-        let response = StreamResponse::<Arc<OwnedLazyValue>> {
-            request_permit: None,
-            _t: PhantomData,
-            buffer: Bytes::from_static(b"abc"),
-            num_bytes: None,
-            response: upstream_response,
-            web3_request: web3_request.clone(),
-        }
-        .into_response();
-
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-
-        assert_eq!(body, Bytes::from_static(b"abcdefghi"));
-        assert_eq!(web3_request.response.lock().response_bytes, 9);
-    }
+    use std::sync::Arc;
 
     #[test]
     fn parsed_success_converts_to_response_data() {

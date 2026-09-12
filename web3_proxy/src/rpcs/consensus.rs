@@ -46,7 +46,7 @@ impl RpcRanking {
         // TODO: should backup or tier be checked first? now that tiers are automated, backups should be more reliable, but still leave them last
         // while tier might give us better latency, giving requests to a server that is behind by a block will get in the way of it syncing. better to only query synced servers
         // TODO: should we include a random number in here?
-        (!self.backup, Reverse(self.consensus_head_num), self.tier)
+        (self.backup, Reverse(self.consensus_head_num), self.tier)
     }
 }
 
@@ -239,8 +239,15 @@ impl RankedRpcs {
 
         // max lag was already handled
         for rpc in self.inner.iter().cloned() {
-            if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_))
-                && !self.synced.contains(&rpc)
+            if matches!(
+                web3_request.proxy_mode(),
+                ProxyMode::Fastest(_) | ProxyMode::Versus
+            ) && !self.synced.contains(&rpc)
+            {
+                continue;
+            }
+            if matches!(web3_request.proxy_mode(), ProxyMode::Versus)
+                && !rpc.healthy.load(atomic::Ordering::SeqCst)
             {
                 continue;
             }
@@ -271,7 +278,10 @@ impl RankedRpcs {
         // TODO: use web3_request.start_instant? I think we want it to be as recent as possible
         let now = Instant::now();
 
-        let sort_mode = if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_)) {
+        let sort_mode = if matches!(
+            web3_request.proxy_mode(),
+            ProxyMode::Fastest(_) | ProxyMode::Versus
+        ) {
             SortMethod::Sort
         } else {
             self.sort_mode.clone()
@@ -1017,7 +1027,11 @@ fn best_rpc<'a>(rpc_a: &'a Arc<Web3Rpc>, rpc_b: &'a Arc<Web3Rpc>) -> &'a Arc<Web
 
 impl RpcsForRequest {
     pub(crate) fn connections(&self) -> Vec<Arc<Web3Rpc>> {
-        self.inner.iter().chain(&self.outer).cloned().collect()
+        if matches!(self.request.proxy_mode(), ProxyMode::Versus) {
+            self.inner.clone()
+        } else {
+            self.inner.iter().chain(&self.outer).cloned().collect()
+        }
     }
 
     pub fn to_stream(
@@ -1405,6 +1419,8 @@ mod tests {
         let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
 
         Web3Rpcs {
+            frontend_tasks: tokio_util::task::TaskTracker::new(),
+            frontend_shutdown: watch::channel(false).1,
             name: "test".into(),
             chain_id: 1,
             head_observation_publisher,

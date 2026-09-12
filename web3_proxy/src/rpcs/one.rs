@@ -342,7 +342,7 @@ impl Web3Rpc {
 
         let next_available = self.next_available(start_instant);
 
-        (next_available, !backup, Reverse(head_block), tier)
+        (next_available, backup, Reverse(head_block), tier)
     }
 
     /// sort with `sort_on` and then on `weighted_peak_latency`
@@ -1518,7 +1518,7 @@ impl Web3Rpc {
             .wait_for_request_handle(web3_request, error_handler, allow_unhealthy)
             .await?;
 
-        let response = handle.request_parsed().await?;
+        let response = handle.request().await?;
         let parsed = response.parsed().await?;
         match parsed.payload {
             jsonrpc::ResponsePayload::Success { result } => Ok(result),
@@ -1952,6 +1952,8 @@ mod tests {
         let (rpcs, _handle, _) = Web3Rpcs::spawn(
             Web3RpcsSpawnConfig::new(1, None, 0, 0, 1_000_000),
             "block-header-cache-through".into(),
+            tokio_util::task::TaskTracker::new(),
+            watch::channel(false).1,
             None,
             None,
         )
