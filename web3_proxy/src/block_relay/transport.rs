@@ -1,6 +1,6 @@
 //! Private, bounded HTTP transport. Never put URLs or remote response text in errors.
 use alloy::primitives::{Bytes, B256};
-use alloy_rpc_types_engine::{Claims, JwtSecret, PayloadStatus};
+use alloy::rpc::types::engine::{Claims, JwtSecret, PayloadStatus};
 use anyhow::{ensure, Result};
 use futures_util::StreamExt;
 use parking_lot::Mutex;

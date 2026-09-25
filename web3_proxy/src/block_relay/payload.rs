@@ -2,8 +2,8 @@
 use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::eips::eip4844::{kzg_to_versioned_hash, Blob, Bytes48};
 use alloy::primitives::{Bytes, B256};
-use alloy_rpc_types_beacon::block::{BeaconBlockBodyElectra, BlockResponse};
-use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadV3};
+use alloy::rpc::types::beacon::block::{BeaconBlockBodyElectra, BlockResponse};
+use alloy::rpc::types::engine::{ExecutionPayload, ExecutionPayloadV3};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ use super::config::Network;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BeaconPayload(
-    #[serde(with = "alloy_rpc_types_beacon::payload::beacon_payload")] pub ExecutionPayload,
+    #[serde(with = "alloy::rpc::types::beacon::payload::beacon_payload")] pub ExecutionPayload,
 );
 
 pub type BeaconResponse = BlockResponse<BeaconBlockBodyElectra<BeaconPayload>>;

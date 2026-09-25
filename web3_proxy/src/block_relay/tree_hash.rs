@@ -9,8 +9,8 @@ use alloy::eips::{
     eip7251::MAX_CONSOLIDATION_REQUESTS_PER_BLOCK,
 };
 use alloy::primitives::B256;
-use alloy_rpc_types_beacon::{block::*, header::BeaconBlockHeader};
-use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadV3};
+use alloy::rpc::types::beacon::{block::*, header::BeaconBlockHeader};
+use alloy::rpc::types::engine::{ExecutionPayload, ExecutionPayloadV3};
 use anyhow::{ensure, Result};
 use tree_hash::{merkle_root, mix_in_length};
 

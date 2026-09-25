@@ -6,7 +6,7 @@ use super::{
     Work,
 };
 use alloy::primitives::{B256, U64};
-use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
+use alloy::rpc::types::engine::{PayloadStatus, PayloadStatusEnum};
 use anyhow::{ensure, Result};
 use moka::future::Cache;
 use serde::Deserialize;

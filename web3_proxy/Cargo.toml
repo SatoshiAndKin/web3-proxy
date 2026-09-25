@@ -15,13 +15,15 @@ nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 
 # TODO: regex has several "perf" features that we might want to use
 anyhow = { version = "1.0.104", features = ["backtrace"] }
-alloy = { version = "2.4.1", default-features = false, features = [
+alloy = { version = "2.5.0", default-features = false, features = [
     "consensus",
     "eips",
     "kzg",
     "node-bindings",
     "provider-http",
     "provider-ws-ring",
+    "rpc-types-beacon",
+    "rpc-types-engine",
     "reqwest",
     "reqwest-rustls-tls",
     "rpc-types-eth",
@@ -29,8 +31,8 @@ alloy = { version = "2.4.1", default-features = false, features = [
     "signer-local",
     "std",
 ] }
-alloy-rpc-types-beacon = { version = "=2.4.1", features = ["ssz"] }
-alloy-rpc-types-engine = { version = "=2.4.1", features = ["jwt-aws-lc-rs"] }
+alloy-rpc-types-beacon = { version = "*", features = ["ssz"] }
+alloy-rpc-types-engine = { version = "*", features = ["jwt-aws-lc-rs"] }
 eventsource-stream = "0.2.3"
 tree_hash = "0.12"
 arc-swap = { version = "1.9.2" }
@@ -40,7 +42,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "http
 axum-macros = "0.5.1"
 base64 = "0.23.1"
 bytes = "1.12.1"
-jiff = { version = "0.2.35", default-features = false, features = ["std"] }
+jiff = { version = "0.2.37", default-features = false, features = ["std"] }
 derivative = "2.2.0"
 derive_more = { version = "2.1.1", features = ["display", "error", "from"] }
 fdlimit = "0.3.0"
@@ -57,20 +59,20 @@ nanorand = { version = "0.8.0", default-features = false, features = ["tls"] }
 once_cell = { version = "1.21.4" }
 ordered-float = {version = "5.5.0" }
 parking_lot = "0.12.5"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
-sentry = { version = "0.49.1", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls", "tracing"] }
-sentry-tracing = "0.49.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
+sentry = { version = "0.49.3", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls", "tracing"] }
+sentry-tracing = "0.49.3"
 serde = { version = "1.0.229", features = ["rc"] }
 serde-inline-default = "1.0.2"
 # Alloy requires this raw type for type-erased WebSocket requests.
 serde_json = { version = "1.0.151", default-features = false, features = ["raw_value"] }
 shellexpand = { version = "3.1.2", default-features = false, features = ["base-0"] }
-sonic-rs = "0.5.8"
+sonic-rs = "0.5.10"
 tokio = { version = "1.53.1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
 tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
-toml = "1.1.4"
-tower-http = { version = "0.7.0", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }
+toml = "1.1.6"
+tower-http = { version = "0.7.1", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tracing = { version = "0.1", default-features = false, features = ["std"] }

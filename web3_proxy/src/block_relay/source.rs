@@ -3,7 +3,7 @@ use super::{
     transport,
 };
 use alloy::primitives::B256;
-use alloy_rpc_types_beacon::{
+use alloy::rpc::types::beacon::{
     config::ForkScheduleResponse, genesis::GenesisResponse, header::HeaderResponse,
 };
 use anyhow::{ensure, Result};

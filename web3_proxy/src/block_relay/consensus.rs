@@ -8,7 +8,7 @@ use super::{
     Work,
 };
 use alloy::primitives::B256;
-use alloy_rpc_types_beacon::header::HeaderResponse;
+use alloy::rpc::types::beacon::header::HeaderResponse;
 use anyhow::{ensure, Result};
 use moka::future::Cache;
 use std::{
