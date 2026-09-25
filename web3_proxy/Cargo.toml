@@ -31,8 +31,8 @@ alloy = { version = "2.5.0", default-features = false, features = [
     "signer-local",
     "std",
 ] }
-alloy-rpc-types-beacon = { version = "*", features = ["ssz"] }
-alloy-rpc-types-engine = { version = "*", features = ["jwt-aws-lc-rs"] }
+alloy-rpc-types-beacon = { version = "2.5.0", features = ["ssz"] }
+alloy-rpc-types-engine = { version = "2.5.0", features = ["jwt-aws-lc-rs"] }
 eventsource-stream = "0.2.3"
 tree_hash = "0.12"
 arc-swap = { version = "1.9.2" }
