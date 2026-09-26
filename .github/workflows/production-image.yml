@@ -45,4 +45,30 @@ jobs:
         if: github.repository == 'SatoshiAndKin/web3-proxy'
         env:
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
-        run: printf 'Deploy `ghcr.io/satoshiandkin/web3-proxy@%s`\n' "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+        run: printf 'Deploy ghcr.io/satoshiandkin/web3-proxy@%s\n' "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Request production deployment
+    needs: image
+    if: github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Queue deployment on Tank
+        env:
+          DEPLOY_URL: ${{ vars.DEPLOY_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_URL:?DEPLOY_WEBHOOK_URL must be configured}"
+          : "${WEBHOOK_SECRET:?WEBHOOK_SECRET must be configured}"
+          payload=$(jq -cn --arg repository "$REPOSITORY" --arg commit "$COMMIT" \
+            '{repository: $repository, commit: $commit, targets: ["web3-proxy"]}')
+          receipt=$(curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 60 \
+            --header "X-Webhook-Secret: $WEBHOOK_SECRET" \
+            --header 'Content-Type: application/json' --data "$payload" "$DEPLOY_URL")
+          printf '%s\n' "$receipt"
+          printf 'Tank deployment receipt: %s\n\nThe worker records completion after NUC and Lambo health checks.\n' \
+            "$receipt" >> "$GITHUB_STEP_SUMMARY"
