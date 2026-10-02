@@ -1,6 +1,6 @@
 //! Private, bounded HTTP transport. Never put URLs or remote response text in errors.
 use alloy::primitives::{Bytes, B256};
-use alloy::rpc::types::engine::{Claims, JwtSecret, PayloadStatus};
+use alloy::rpc::types::engine::{BlobAndProofV2, Claims, JwtSecret, PayloadStatus};
 use anyhow::{ensure, Result};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -336,13 +336,7 @@ impl Rpc {
         self.send(payload.body.clone(), ENGINE_TIMEOUT).await
     }
     pub async fn get_blobs_v2(&self, hashes: &[B256]) -> Result<Option<Vec<Bytes>>> {
-        #[derive(Deserialize)]
-        struct Blob {
-            blob: Bytes,
-            #[serde(rename = "versionedHash")]
-            versioned_hash: B256,
-        }
-        let result: Option<Vec<Blob>> = self.call("engine_getBlobsV2", (hashes,)).await?;
+        let result: Option<Vec<BlobAndProofV2>> = self.call("engine_getBlobsV2", (hashes,)).await?;
         let Some(result) = result else {
             return Ok(None);
         };
@@ -350,13 +344,21 @@ impl Rpc {
             result.len() == hashes.len(),
             "incomplete engine blob response"
         );
-        for (item, expected) in result.iter().zip(hashes) {
+        for item in &result {
             ensure!(
-                item.versioned_hash == *expected,
-                "engine blob hash mismatch"
+                item.proofs.len() == alloy::eips::eip7594::CELLS_PER_EXT_BLOB,
+                "incomplete engine blob proofs"
             );
         }
-        Ok(Some(result.into_iter().map(|item| item.blob).collect()))
+        // V2 returns blob + cell proofs, without a versionedHash field. The
+        // bounded proof worker checks each blob against the block's ordered
+        // commitments before accepting it and regenerates its own proofs.
+        Ok(Some(
+            result
+                .into_iter()
+                .map(|item| Bytes::copy_from_slice(item.blob.as_slice()))
+                .collect(),
+        ))
     }
     pub async fn send<T: DeserializeOwned>(
         &self,

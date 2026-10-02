@@ -269,6 +269,8 @@ impl Drop for Server {
 #[derive(Default)]
 pub struct RpcState {
     pub known: BTreeMap<B256, u64>,
+    pub blobs: BTreeMap<B256, alloy_rpc_types_engine::BlobAndProofV2>,
+    pub blob_requests: Vec<Vec<B256>>,
     pub methods: Vec<String>,
     pub payloads: Vec<B256>,
     pub replies: BTreeMap<B256, VecDeque<&'static str>>,
@@ -340,6 +342,16 @@ async fn handle_rpc(State(rpc): State<MockRpc>, headers: HeaderMap, bytes: Bytes
         }
     }
     let result = match method {
+        "engine_getBlobsV2" => {
+            let hashes: Vec<B256> = sonic_rs::from_value(&request["params"][0]).unwrap();
+            let mut s = rpc.state.lock();
+            s.blob_requests.push(hashes.clone());
+            let blobs: Option<Vec<_>> = hashes
+                .iter()
+                .map(|hash| s.blobs.get(hash).cloned())
+                .collect();
+            sonic_rs::to_value(&blobs).unwrap()
+        }
         "eth_chainId" => json!(format!("0x{:x}", rpc.state.lock().chain_id)),
         "engine_exchangeCapabilities" => {
             if rpc.state.lock().supports_v4 {

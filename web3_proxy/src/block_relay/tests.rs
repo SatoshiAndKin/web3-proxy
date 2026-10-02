@@ -10,6 +10,7 @@ use tokio::{
 };
 
 mod consensus;
+mod cost;
 mod isolation;
 mod mocks;
 mod network;

@@ -159,6 +159,85 @@ async fn start_relay(
 }
 
 #[tokio::test]
+async fn standard_engine_blobs_avoid_paid_fetch_and_wrong_blobs_require_verified_fallback() {
+    for local_matches in [true, false] {
+        let network = network();
+        let (block, blobs) = blob_block(&network, "electra");
+        let payload = decode(&block, &network);
+        let hashes = payload.versioned_hashes();
+        let source = MockBeacon::new(network.clone());
+        let source_server = Server::beacon(source.clone()).await;
+        let root = source.add(&block);
+        source
+            .state
+            .lock()
+            .blobs
+            .insert(root, sonic_rs::to_vec(&json!({"data": blobs})).unwrap());
+        let engine = MockRpc::new();
+        let engine_server = Server::rpc(engine.clone()).await;
+        let mut local_bytes = blobs[0].to_vec();
+        if !local_matches {
+            local_bytes[31] = 1;
+        }
+        let local_blob: &Blob = local_bytes.as_slice().try_into().unwrap();
+        let (_, proofs) = EnvKzgSettings::Default
+            .get()
+            .compute_cells_and_kzg_proofs(local_blob.as_ckzg())
+            .unwrap();
+        engine.state.lock().blobs.insert(
+            hashes[0],
+            alloy_rpc_types_engine::BlobAndProofV2 {
+                blob: Box::new(*local_blob),
+                proofs: proofs
+                    .into_iter()
+                    .map(|proof| Bytes48::from_ckzg(proof.to_bytes()))
+                    .collect(),
+            },
+        );
+        let target = MockBeacon::new(network.clone());
+        let target_server = Server::beacon(target.clone()).await;
+        let mut config = relay_config(
+            network,
+            &[("alchemy", &source_server.url)],
+            &[("el", &engine_server.url)],
+        );
+        config.sources.get_mut("alchemy").unwrap().cost_class = config::CostClass::Metered;
+        config.rpc.metered_fallback_delay_ms = 0;
+        config
+            .consensus_targets
+            .insert("cl".into(), target_config(&target_server.url));
+        config.mode = config::Mode::Inject;
+        let (relay, stop, run) = start_relay(&config).await;
+        until(|| source.events.receiver_count() == 1).await;
+        source.announce("block_gossip", root, block.data.message.slot);
+        until(|| target.state.lock().publications.len() == 1).await;
+        stop.send(()).unwrap();
+        run.await.unwrap();
+        assert_eq!(engine.state.lock().blob_requests, vec![hashes]);
+        assert_eq!(engine.state.lock().bad_jwt, 0);
+        assert_eq!(
+            source.state.lock().blob_reads,
+            if local_matches {
+                Vec::new()
+            } else {
+                vec![root]
+            }
+        );
+        let state = target.state.lock();
+        assert_eq!(state.publications[0].0, root);
+        assert_eq!(
+            state.publications[0].2["signed_block"],
+            sonic_rs::to_value(&block.data).unwrap()
+        );
+        assert_eq!(
+            state.publications[0].2["blobs"],
+            sonic_rs::to_value(&blobs).unwrap()
+        );
+        assert_eq!(relay.snapshot()["consensus_acquired"].as_u64(), Some(1));
+    }
+}
+
+#[tokio::test]
 async fn two_forwarders_send_to_all_three_execution_and_consensus_targets() {
     let network = network();
     let source = MockBeacon::new(network.clone());
