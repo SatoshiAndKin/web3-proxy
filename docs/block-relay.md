@@ -83,6 +83,11 @@ sources wait for `block_relay.rpc.metered_fallback_delay_ms` (500 ms by default)
 and receive at most two dispatched attempts per resource. A source that lacks the
 `blob` resource is never asked for complete blobs.
 
+Local `engine_getBlobsV2` responses contain `blob` and `proofs`. The relay checks
+their shape, then checks blob commitments in order and regenerates proofs on the
+bounded proof pool. A complete, matching local response avoids the Beacon blob
+fetch; missing or invalid local blobs leave the verified Beacon fallback enabled.
+
 The relay checks the complete Beacon root, execution block hash, payload
 timestamp, and transaction/blob-commitment order. It includes the parent Beacon
 root and SSZ-encoded, type-prefixed execution requests. Empty request types stay

@@ -479,6 +479,7 @@ async fn acquire(
     notify: Arc<Notify>,
     decoders: Arc<tokio::sync::Semaphore>,
     stats: Shared,
+    metered_delay: Duration,
 ) -> Result<(Arc<RelayPayload>, String)> {
     let deadline = announcement.at + Duration::from_secs(network.seconds_per_slot);
     race_sources(
@@ -486,7 +487,7 @@ async fn acquire(
         deadline,
         &notify,
         Resource::Block,
-        Duration::ZERO,
+        metered_delay,
         |source| {
             let network = network.clone();
             let decoders = decoders.clone();
@@ -656,9 +657,10 @@ async fn run_generation(
                 let sources = prepared.sources.clone(); let network = prepared.config.network.clone();
                 let decoders = prepared.decoders.clone();
                 let acquisition_stats = stats.clone();
+                let metered_delay = Duration::from_millis(prepared.config.rpc.metered_fallback_delay_ms);
                 let started_mode_epoch = stats.lock().telemetry.mode_epoch;
                 acquisitions.spawn(async move {
-                    let result = acquire(sources, network, event.clone(), notify, decoders, acquisition_stats).await;
+                    let result = acquire(sources, network, event.clone(), notify, decoders, acquisition_stats, metered_delay).await;
                     (event, started_mode_epoch, result)
                 });
             }
