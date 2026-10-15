@@ -9,6 +9,7 @@ use crate::{
     jsonrpc::{JsonRpcResultData, ResponsePayload, SingleResponse, ValidatedRequest},
 };
 use futures::{stream::FuturesUnordered, StreamExt};
+use hashbrown::HashSet;
 use std::{future::Future, sync::Arc};
 use tokio::{
     sync::oneshot,
@@ -99,7 +100,13 @@ impl Web3Rpcs {
     {
         // Capture membership once. A later ranking update can remove candidates,
         // but it cannot add a new node to this comparison.
-        let selected = self.rpcs_for_request(request)?.connections();
+        let candidates = self.rpcs_for_request(request)?;
+        let backup = candidates.prefer_backup(&HashSet::new(), None, None);
+        let selected: Vec<_> = candidates
+            .connections()
+            .into_iter()
+            .filter(|rpc| rpc.backup == backup)
+            .collect();
         let pool = self.clone();
         let request = request.clone();
         let mut shutdown = self.frontend_shutdown.clone();

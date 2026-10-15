@@ -65,6 +65,10 @@ impl RequestPermits {
         self.semaphore.clone().acquire_owned().await
     }
 
+    pub(super) fn has_capacity(&self) -> bool {
+        self.semaphore.available_permits() > 0
+    }
+
     pub(super) fn max_backend_batch_items(&self) -> usize {
         self.max_backend_batch_items
     }
@@ -1337,7 +1341,7 @@ impl Web3Rpc {
     }
 
     /// Recheck mutable backend state while holding the reserved slot.
-    pub(super) fn can_submit(&self, request: &ValidatedRequest, allow_unhealthy: bool) -> bool {
+    pub(crate) fn can_submit(&self, request: &ValidatedRequest, allow_unhealthy: bool) -> bool {
         let now = Instant::now();
         self.next_available(now) <= now
             && (allow_unhealthy
@@ -2008,7 +2012,7 @@ mod tests {
     async fn faster_announcer_wins_shared_hydration_race() {
         let block_hash = B256::with_last_byte(0x42);
         let cache = moka::future::Cache::new(16);
-        let coordinator = BlockHydrationCoordinator::new(cache.clone());
+        let coordinator = BlockHydrationCoordinator::new(cache.clone(), std::sync::Weak::new());
         let slow = hydration_stub("slow", full_block(block_hash, "slow")).await;
         let fast = hydration_stub("fast", full_block(block_hash, "fast")).await;
 
@@ -2043,7 +2047,7 @@ mod tests {
     async fn invalid_hydration_results_do_not_cancel_a_valid_announcer() {
         let block_hash = B256::with_last_byte(0x42);
         let cache = moka::future::Cache::new(16);
-        let coordinator = BlockHydrationCoordinator::new(cache.clone());
+        let coordinator = BlockHydrationCoordinator::new(cache.clone(), std::sync::Weak::new());
         let valid = hydration_stub("valid", full_block(block_hash, "valid")).await;
         let invalid_results = [
             serde_json::Value::Null,
@@ -2083,7 +2087,7 @@ mod tests {
     async fn failed_announcer_can_retry_after_another_announcement() {
         let block_hash = B256::with_last_byte(0x42);
         let cache = moka::future::Cache::new(16);
-        let coordinator = BlockHydrationCoordinator::new(cache.clone());
+        let coordinator = BlockHydrationCoordinator::new(cache.clone(), std::sync::Weak::new());
         let retrying = hydration_stub("retrying", serde_json::Value::Null).await;
 
         coordinator.announce(retrying.rpc.clone(), block_hash).await;
@@ -2228,7 +2232,8 @@ mod tests {
         let (head_observation_sender, mut head_observation_receiver) = mpsc::unbounded_channel();
         let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
         let block_response_cache = moka::future::Cache::new(16);
-        let block_hydration = BlockHydrationCoordinator::new(block_response_cache.clone());
+        let block_hydration =
+            BlockHydrationCoordinator::new(block_response_cache.clone(), std::sync::Weak::new());
         let rpc = Arc::new(Web3Rpc {
             name: "websocket-stub".into(),
             block_map: Some(moka::future::Cache::new(16)),

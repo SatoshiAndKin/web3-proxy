@@ -4,6 +4,10 @@ This is stale. Now that there is more than one dev, important things are tracked
 
 One day I'll go through this and make sure everything is done, moved to an issue, or otherwise handled.
 
+## Backup routing follow-up
+
+- [ ] Wait for the next local head when a backup reports it first and primary lag remains within `app.max_head_block_lag`. Reuse the existing head-change notifications and request deadlines; do not add a scheduler or a grace timer. Today the proxy serves the primary consensus head within that limit. The existing minimum-block check can reject the newer pinned block before the lag wait, and Fastest/Versus filter out waiting nodes. Address those paths together, keep backup traffic blocked during the wait, preserve consensus thresholds and Versus's fixed selection, and test catch-up, outage, deadline, and archive behavior.
+
 ## MVP
 
 These are roughly in order of completition

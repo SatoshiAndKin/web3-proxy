@@ -9,7 +9,7 @@ use crate::{
     jsonrpc::{JsonRpcResultData, ResponsePayload, SingleResponse, ValidatedRequest},
 };
 use futures::{stream::FuturesUnordered, StreamExt};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use std::{future::Future, sync::Arc};
 use tokio::time::{sleep_until, Instant};
 
@@ -50,7 +50,7 @@ impl Web3Rpcs {
         let mut updates = self.watch_ranked_rpcs.subscribe();
         let mut watching = true;
         let mut pending = FuturesUnordered::new();
-        let mut active = HashSet::new();
+        let mut active: HashMap<String, Arc<Web3Rpc>> = HashMap::new();
         let mut exhausted = HashSet::new();
         let mut first_error = None;
         let mut opened_any = !request.backend_rpcs_used().is_empty();
@@ -72,13 +72,20 @@ impl Web3Rpcs {
                         if pending.len() >= limit {
                             break;
                         }
-                        if active.contains(&rpc.name) || exhausted.contains(&rpc.name) {
+                        if active.contains_key(&rpc.name)
+                            || !candidates.can_use(
+                                &rpc,
+                                &exhausted,
+                                active.values().next().map(|node| node.backup),
+                                None,
+                            )
+                        {
                             continue;
                         }
                         match rpc.try_request_handle(request, None, false).await {
                             Ok(OpenRequestResult::Handle(handle)) => {
                                 opened_any = true;
-                                active.insert(rpc.name.clone());
+                                active.insert(rpc.name.clone(), rpc.clone());
                                 pending.push(complete(rpc, send(handle)));
                             }
                             Ok(OpenRequestResult::Busy(wait)) => {
@@ -128,9 +135,10 @@ impl Web3Rpcs {
                         let rpc = handle.clone_connection();
                         let eligible = self.try_rpcs_for_request(request).await.ok().is_some_and(|candidates| {
                             candidates.connections().iter().any(|candidate| Arc::ptr_eq(candidate, &rpc))
+                                && candidates.can_use(&rpc, &exhausted, active.values().next().map(|node| node.backup), Some(&rpc))
                         });
                         if eligible && rpc.can_submit(request, false) {
-                            active.insert(rpc.name.clone());
+                            active.insert(rpc.name.clone(), rpc.clone());
                             pending.push(complete(rpc, send(handle)));
                         }
                     }

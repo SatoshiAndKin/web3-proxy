@@ -89,12 +89,17 @@ enum SortMethod {
 pub struct RankedRpcs {
     pub head_block: Option<BlockHeader>,
     pub num_synced: usize,
+    /// Whether the selected consensus required backup votes, not request usage.
     pub backups_needed: bool,
     pub check_block_data: bool,
 
     pub(crate) inner: HashSet<Arc<Web3Rpc>>,
-    /// Consensus voters, before adding extra archive and lagging candidates.
+    /// Nodes proven to agree with the selected head, including standby backups.
     synced: HashSet<Arc<Web3Rpc>>,
+    /// Head eligibility floor; historical requests can use older healthy nodes.
+    min_head_block: Option<U64>,
+    /// Observed head numbers from the same ranking snapshot as membership.
+    head_numbers: HashMap<String, U64>,
 
     sort_mode: SortMethod,
 }
@@ -128,6 +133,8 @@ impl RankedRpcs {
             backups_needed,
             check_block_data,
             head_block,
+            min_head_block: None,
+            head_numbers: HashMap::new(),
             synced: rpcs.clone(),
             inner: rpcs,
             num_synced,
@@ -173,7 +180,7 @@ impl RankedRpcs {
 
             let backups_needed = best_rpcs.iter().any(|x| x.backup);
             let num_synced = best_rpcs.len();
-            let synced = best_rpcs.clone();
+            let mut synced = best_rpcs.clone();
 
             // add all the rpcs that are behind the ranked rpcs. these might be needed for serving archive requests
             for (x, x_head) in heads.iter() {
@@ -182,19 +189,12 @@ impl RankedRpcs {
                     continue;
                 }
 
-                // we only want to include backups if they voted for the head block
-                // TODO: think more about this. maybe have a config option about how easily to use backup rpcs
-                if x.backup && !backups_needed {
-                    continue;
+                if x.backup && x_head.hash() == best_block.hash() {
+                    synced.insert(x.clone());
                 }
 
-                if x_head.number() < max_lag_block {
-                    // server is too far behind
-                    continue;
-                }
-
-                // TODO: max age here too?
-
+                // Keep older nodes for explicit historical requests. Head
+                // admission still uses the consensus floor and voter set.
                 best_rpcs.insert(x.clone());
             }
 
@@ -210,6 +210,11 @@ impl RankedRpcs {
                 sort_mode,
                 inner: best_rpcs,
                 synced,
+                min_head_block: Some(max_lag_block),
+                head_numbers: heads
+                    .iter()
+                    .map(|(rpc, head)| (rpc.name.clone(), head.number()))
+                    .collect(),
                 num_synced,
             };
 
@@ -237,12 +242,28 @@ impl RankedRpcs {
         let min_block_needed = web3_request.min_block_needed();
         let max_block_needed = web3_request.max_block_needed();
 
-        // max lag was already handled
+        // A latest request stays head-bound when rankings advance after it
+        // was pinned. Only blocks older than its own head are historical.
+        let historical = max_block_needed
+            .zip(web3_request.head_block.as_ref().map(|head| head.number()))
+            .is_some_and(|(needed, head)| needed < head);
+
         for rpc in self.inner.iter().cloned() {
+            // Head-bound backups must agree with consensus by hash or cached
+            // ancestry, including Best requests and batches.
+            if !historical && rpc.backup && !self.synced.contains(&rpc) {
+                continue;
+            }
+            let observed_head = self.head_numbers.get(&rpc.name).copied();
+            let lagging_archive = historical
+                && observed_head
+                    .zip(head_block_num)
+                    .is_some_and(|(rpc_head, head)| rpc_head < head);
             if matches!(
                 web3_request.proxy_mode(),
                 ProxyMode::Fastest(_) | ProxyMode::Versus
-            ) && !self.synced.contains(&rpc)
+            ) && !lagging_archive
+                && !self.synced.contains(&rpc)
             {
                 continue;
             }
@@ -251,9 +272,11 @@ impl RankedRpcs {
             {
                 continue;
             }
-            if rpc.backup && !self.backups_needed {
-                // this backup check was already done, but
-                // TODO: push these into `backup_for_request` Vec?
+            if !historical
+                && observed_head
+                    .zip(self.min_head_block)
+                    .is_some_and(|(head, floor)| head < floor)
+            {
                 continue;
             }
 
@@ -311,7 +334,7 @@ impl RankedRpcs {
             }
         }
 
-        if inner_for_request.is_empty() {
+        if inner_for_request.is_empty() && outer_for_request.is_empty() {
             warn!(?inner_for_request, ?outer_for_request, %web3_request, head_block=%MaybeBlockNum(&head_block_num), "no rpcs for request");
             None
         } else {
@@ -658,6 +681,7 @@ impl ConsensusFinder {
             }
         }
 
+        web3_rpcs.block_hydration.announce_backups().await;
         Ok(true)
     }
 
@@ -982,13 +1006,22 @@ impl ConsensusFinder {
         }
 
         // we finished processing all tiers. check for primary results (if anything but the last tier found consensus, we already returned above)
-        if let Some(consensus) = RankedRpcs::from_votes(
+        if let Some(mut consensus) = RankedRpcs::from_votes(
             web3_rpcs.min_synced_rpcs,
             web3_rpcs.min_sum_soft_limit,
             max_lag_block_number,
             primary_votes,
             self.rpc_heads.clone(),
         ) {
+            if let Some((voters, _)) = consensus
+                .head_block
+                .as_ref()
+                .and_then(|head| backup_votes.get(head))
+            {
+                consensus
+                    .synced
+                    .extend(voters.iter().map(|rpc| Arc::clone(rpc)));
+            }
             return Ok(Some(consensus));
         }
 
@@ -1032,6 +1065,76 @@ fn best_rpc<'a>(rpc_a: &'a Arc<Web3Rpc>, rpc_b: &'a Arc<Web3Rpc>) -> &'a Arc<Web
 */
 
 impl RpcsForRequest {
+    /// Choose one class of backends. A reserved handle counts as available
+    /// even when it holds that node's last permit. Active attempts keep their
+    /// class so Fastest never fills a primary race with backup requests.
+    pub(crate) fn prefer_backup(
+        &self,
+        exhausted: &HashSet<String>,
+        active_backup: Option<bool>,
+        reserved: Option<&Web3Rpc>,
+    ) -> bool {
+        if let Some(backup) = active_backup {
+            return backup;
+        }
+        let eligible = |rpc: &&Arc<Web3Rpc>| {
+            !exhausted.contains(&rpc.name) && rpc.can_submit(&self.request, false)
+        };
+        let available = |rpc: &&Arc<Web3Rpc>| {
+            eligible(rpc)
+                && (rpc.request_permits.has_capacity()
+                    || reserved.is_some_and(|node| std::ptr::eq(node, rpc.as_ref())))
+        };
+        if self
+            .inner
+            .iter()
+            .chain(&self.outer)
+            .any(|rpc| !rpc.backup && available(&rpc))
+        {
+            false
+        } else if self
+            .inner
+            .iter()
+            .chain(&self.outer)
+            .any(|rpc| rpc.backup && available(&rpc))
+        {
+            true
+        } else if self
+            .inner
+            .iter()
+            .chain(&self.outer)
+            .any(|rpc| !rpc.backup && eligible(&rpc))
+        {
+            false
+        } else if self
+            .inner
+            .iter()
+            .chain(&self.outer)
+            .any(|rpc| rpc.backup && eligible(&rpc))
+        {
+            true
+        } else {
+            // Keep cooldown and health recovery waits when neither class can
+            // currently serve the request.
+            !self
+                .inner
+                .iter()
+                .chain(&self.outer)
+                .any(|rpc| !rpc.backup && !exhausted.contains(&rpc.name))
+        }
+    }
+
+    pub(crate) fn can_use(
+        &self,
+        rpc: &Web3Rpc,
+        exhausted: &HashSet<String>,
+        active_backup: Option<bool>,
+        reserved: Option<&Web3Rpc>,
+    ) -> bool {
+        !exhausted.contains(&rpc.name)
+            && rpc.backup == self.prefer_backup(exhausted, active_backup, reserved)
+    }
+
     pub(crate) fn connections(&self) -> Vec<Arc<Web3Rpc>> {
         if matches!(self.request.proxy_mode(), ProxyMode::Versus) {
             self.inner.clone()
@@ -1048,19 +1151,26 @@ impl RpcsForRequest {
             let mut opened_any = !self.request.backend_rpcs_used().is_empty();
             let mut watching = true;
             let mut exhausted = HashSet::new();
-            while if opened_any { !self.request.expired() } else { !self.request.connect_timeout() } {
+            'admission: while if opened_any { !self.request.expired() } else { !self.request.connect_timeout() } {
                 let mut earliest_retry_at: Option<Instant> = None;
                 let mut wait_for_sync = Vec::new();
                 let mut wait_for_capacity = Vec::new();
                 for rpc in self.inner.iter().chain(&self.outer) {
-                    if exhausted.contains(&rpc.name) { continue; }
+                    if !self.can_use(rpc, &exhausted, None, None) { continue; }
                     match rpc.try_request_handle(&self.request, None, false).await {
                         Ok(OpenRequestResult::Handle(handle)) => {
                             opened_any = true;
                             let submitted = self.request.backend_rpcs_used().len();
                             yield handle;
-                            if self.request.backend_rpcs_used().len() > submitted && rpc.can_submit(&self.request, false) {
+                            let attempted = self.request.backend_rpcs_used().len() > submitted;
+                            if attempted && rpc.can_submit(&self.request, false) {
                                 exhausted.insert(rpc.name.clone());
+                            }
+                            // A failed attempt can expose primaries skipped earlier
+                            // in this pass. Rebuild admission and capacity waits after
+                            // progress or a class change, retaining the same deadline.
+                            if attempted || rpc.backup != self.prefer_backup(&exhausted, None, None) {
+                                continue 'admission;
                             }
                             let now = Instant::now();
                             let retry_at = rpc.next_available(now);
@@ -1090,11 +1200,15 @@ impl RpcsForRequest {
                     handle = async { select_all(wait_for_capacity).await.0 }, if !wait_for_capacity.is_empty() => {
                         if let Ok(handle) = handle {
                             let rpc = handle.clone_connection();
+                            if !self.can_use(&rpc, &exhausted, None, Some(&rpc)) || !rpc.can_submit(&self.request, false) {
+                                continue;
+                            }
                             let submitted = self.request.backend_rpcs_used().len();
                             yield handle;
                             if self.request.backend_rpcs_used().len() > submitted && rpc.can_submit(&self.request, false) {
                                 exhausted.insert(rpc.name.clone());
                             }
+                            // The next admission pass also rescans after a queued attempt.
                         }
                     }
                     _ = async { select_all(wait_for_sync).await }, if !wait_for_sync.is_empty() => {}
@@ -1422,7 +1536,8 @@ mod tests {
         let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
         let (watch_ranked_rpcs, _) = watch::channel(None);
         let block_responses = Cache::new(16);
-        let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
+        let block_hydration =
+            BlockHydrationCoordinator::new(block_responses.clone(), std::sync::Weak::new());
 
         Web3Rpcs {
             frontend_tasks: tokio_util::task::TaskTracker::new(),
