@@ -444,7 +444,13 @@ impl ConsensusFinder {
                     rpc_block_sender.send_replace(new_block);
                 }
 
-                return Ok(false);
+                // Cached consensus is no longer usable. Publish the loss so
+                // readiness and waiting requests cannot retain the old head.
+                let changed = web3_rpcs.watch_ranked_rpcs.send_replace(None).is_some();
+                if let Some(head) = &web3_rpcs.watch_head_block {
+                    head.send_replace(None);
+                }
+                return Ok(changed);
             }
             Some(x) => x,
         };
@@ -1482,6 +1488,45 @@ mod tests {
         let logs = String::from_utf8(output).expect("debug logs should be valid UTF-8");
 
         (ranked_rpcs, logs)
+    }
+
+    #[tokio::test]
+    async fn losing_all_healthy_votes_clears_published_consensus_and_head() {
+        let mut rpcs = web3_rpcs(Cache::new(16), 1);
+        let (head_sender, _head_receiver) = watch::channel(None);
+        rpcs.watch_head_block = Some(head_sender);
+        let mut header: Header = Header::default();
+        header.inner.number = 42;
+        header.inner.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let head = BlockHeader::new(Arc::new(header));
+        let rpc = Arc::new(Web3Rpc {
+            name: "primary".into(),
+            healthy: AtomicBool::new(true),
+            soft_limit: 1,
+            ..Default::default()
+        });
+        let mut finder = ConsensusFinder::new(Some(Duration::from_secs(60)), U64::from(1));
+        finder.rpc_heads.insert(rpc.clone(), head.clone());
+        assert!(finder.refresh(&rpcs, None, None).await.unwrap());
+        assert!(rpcs.synced());
+        assert!(rpcs.head_block().is_some());
+        rpc.healthy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(finder.refresh(&rpcs, None, None).await.unwrap());
+        assert!(!rpcs.synced());
+        assert!(rpcs.watch_ranked_rpcs.borrow().is_none());
+        assert!(rpcs.head_block().is_none());
+        rpc.healthy.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(finder.refresh(&rpcs, None, None).await.unwrap());
+        assert!(rpcs.synced());
+        assert!(rpcs.head_block().is_some());
+        finder.rpc_heads.clear();
+        assert!(finder.refresh(&rpcs, None, None).await.unwrap());
+        assert!(!rpcs.synced());
+        assert!(rpcs.head_block().is_none());
     }
 
     #[tokio::test(start_paused = true)]
