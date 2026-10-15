@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # This image contains application code only. Production endpoints and secrets
 # belong in the operator's private deployment repository.
-FROM rust:slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS build
+FROM rust:slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS build
 WORKDIR /app
 RUN apt-get update && apt-get install --no-install-recommends -y \
     build-essential clang cmake pkg-config libssl-dev ca-certificates
@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p web3_proxy_cli && \
     install -m 0755 target/release/web3_proxy_cli /usr/local/bin/web3_proxy_cli
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates curl libssl3 && \
     useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin web3proxy && \
     install -d -o web3proxy -g web3proxy /var/lib/web3-proxy
