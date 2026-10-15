@@ -1,33 +1,4 @@
-FROM debian:bullseye-slim as mold
-
-ENV SHELL /bin/bash
-SHELL [ "/bin/bash", "-c" ]
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    set -eux -o pipefail; \
-    \
-    apt-get update; \
-    apt-get install --no-install-recommends --yes \
-    ca-certificates \
-    git \
-    ;
-
-RUN { set -eux; \
-    \
-    git clone https://github.com/rui314/mold.git; \
-    mkdir mold/build; \
-    cd mold/build; \
-    git checkout v2.3.3; \
-    ../install-build-deps.sh; \
-    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=c++ ..; \
-    cmake --build . -j $(nproc); \
-    cmake --build . --target install; \
-    }
-
-COPY ./docker/cargo-config.toml /root/.cargo/config.toml
-
-FROM debian:bullseye-slim as rust
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 as rust_base
 
 WORKDIR /app
 # sccache cannot cache incrementals, but we use --mount=type=cache and import caches so it should be helpful
@@ -84,9 +55,29 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     cp ./rust-toolchain.toml /app/target/rust-toolchain.toml; \
     cp ./rust-toolchain.toml /app/target_test/rust-toolchain.toml
 
-# install mold (a faster linker)
-COPY --link --from=mold /usr/local/bin/mold /usr/local/bin/mold
-COPY --link --from=mold /root/.cargo/config.toml /root/.cargo/config.toml
+# mold 3 uses Cargo instead of CMake.
+FROM rust_base as mold
+
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/mold-target \
+    set -eux -o pipefail; \
+    \
+    git clone --depth 1 --branch v3.0.0 https://github.com/rui314/mold.git /mold; \
+    cd /mold; \
+    test "$(git rev-parse HEAD)" = 8de38c35a2df16a25f7ff87ac3ad07156a925beb; \
+    CARGO_TARGET_DIR=/mold-target cargo build --locked --release --jobs 2; \
+    CARGO_TARGET_DIR=/mold-target ./install-mold.sh; \
+    mold --version; \
+    printf 'int main(void) { return 0; }\n' >/tmp/mold-smoke.c; \
+    cc -fuse-ld=mold /tmp/mold-smoke.c -o /tmp/mold-smoke; \
+    /tmp/mold-smoke
+
+FROM rust_base as rust
+
+# Install the linker, wrapper library, and helper links from upstream's installer.
+COPY --link --from=mold /usr/local/ /usr/local/
+COPY ./docker/cargo-config.toml /root/.cargo/config.toml
 
 # cargo binstall makes it fast to install binaries
 RUN --mount=type=cache,target=/root/.cargo/git \
@@ -198,7 +189,7 @@ COPY --link --from=build_tests /test_success /
 #
 # We do not need the Rust toolchain or any deps to run the binary!
 #
-FROM debian:bullseye-slim AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 # Create llama user to avoid running container with root
 RUN set -eux; \
