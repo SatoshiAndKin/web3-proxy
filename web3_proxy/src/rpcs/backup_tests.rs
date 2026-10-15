@@ -2,7 +2,7 @@
 use super::{
     blockchain::BlockHeader,
     consensus::ConsensusFinder,
-    fastest_tests::{fail, result, succeed, Fleet},
+    fastest_tests::{fail, http_request, result, succeed, Fleet},
 };
 use crate::{
     config::AppConfig,
@@ -193,13 +193,17 @@ fn head(number: u64) -> BlockHeader {
 
 async fn rank(fleet: &Fleet, primary: u64, backup: u64, lag: u64) {
     let pool = &fleet.app.balanced_rpcs;
-    let mut finder = ConsensusFinder::new(None, U64::from(lag));
     for number in primary.saturating_sub(lag)..=backup {
         let head = head(number);
         pool.blocks_by_hash.insert(*head.hash(), head).await;
     }
-    for (index, number) in [primary, backup].into_iter().enumerate() {
-        let head = head(number);
+    rank_heads(fleet, [head(primary), head(backup)], lag).await;
+}
+
+async fn rank_heads(fleet: &Fleet, heads: [BlockHeader; 2], lag: u64) {
+    let pool = &fleet.app.balanced_rpcs;
+    let mut finder = ConsensusFinder::new(None, U64::from(lag));
+    for (index, head) in heads.into_iter().enumerate() {
         fleet.nodes[index]
             .rpc
             .head_block_sender
@@ -222,6 +226,31 @@ async fn rank(fleet: &Fleet, primary: u64, backup: u64, lag: u64) {
         .unwrap()
         .send_replace(ranking.head_block.clone());
     pool.watch_ranked_rpcs.send_replace(Some(Arc::new(ranking)));
+}
+
+fn fork_head(number: u64) -> BlockHeader {
+    let mut header = head(number).0.as_ref().clone();
+    header.hash = B256::repeat_byte(0xff);
+    BlockHeader::new(Arc::new(header))
+}
+
+async fn latest_code_request(fleet: &Fleet, mode: ProxyMode) -> Arc<ValidatedRequest> {
+    let call = SingleRequest::new(
+        9u64.into(),
+        "eth_getCode".into(),
+        sonic_rs::json!(["0x0000000000000000000000000000000000000000", "latest"]),
+    )
+    .unwrap();
+    ValidatedRequest::new_with_app(
+        &fleet.app,
+        mode,
+        None,
+        call.into(),
+        fleet.app.balanced_rpcs.head_block(),
+        None,
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -542,6 +571,121 @@ async fn consensus_refresh_starts_deferred_backup_cache_fetch_on_outage() {
         assert_eq!(cached(&fleet, 106).await["number"], "0x6a");
         fleet.idle();
         assert_eq!(fleet.counts(), [0, 1]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn review_divergent_backup_receives_no_head_bound_best_or_batch_calls() {
+    super::test_support::with_cleanup(async {
+        for batched in [false, true] {
+            let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[1]).await;
+            rank_heads(&fleet, [head(100), fork_head(100)], 5).await;
+            let primary_hash = *head(100).hash();
+            assert_eq!(fleet.app.balanced_rpcs.head_block().unwrap().hash(), &primary_hash);
+            let held: Vec<_> = (0..4).map(|_| fleet.nodes[0].rpc.request_permits.try_acquire().unwrap()).collect();
+            let (port, server) = fleet.frontend().await;
+            let body = if batched {
+                json!([
+                    {"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x0000000000000000000000000000000000000000","data":"0x00"},"latest"]},
+                    {"jsonrpc":"2.0","id":2,"method":"eth_call","params":[{"to":"0x0000000000000000000000000000000000000000","data":"0x00"},"latest"]}
+                ])
+            } else {
+                json!({"jsonrpc":"2.0","id":9,"method":"eth_getCode","params":["0x0000000000000000000000000000000000000000","latest"]})
+            };
+            let task = http_request(port, "/", body);
+            fleet.nodes[1].quiet().await;
+            assert!(!task.is_finished());
+            drop(held);
+            let primary = fleet.nodes[0].next().await;
+            if batched {
+                answer_packet(primary);
+            } else {
+                assert_eq!(primary.body["params"][1], "0x64");
+                succeed(primary, json!("0xbeef"));
+            }
+            let response = timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+            if batched {
+                assert_eq!(response, json!([
+                    {"jsonrpc":"2.0","id":1,"result":"0x00"},
+                    {"jsonrpc":"2.0","id":2,"result":"0x00"}
+                ]));
+            } else {
+                assert_eq!(response, json!({"jsonrpc":"2.0","id":9,"result":"0xbeef"}));
+            }
+            assert_eq!(fleet.counts(), if batched { [2, 0] } else { [1, 0] });
+            drained(&fleet).await;
+            drop(server);
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn review_divergent_backup_does_not_replace_a_failed_primary() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[1]).await;
+        rank_heads(&fleet, [head(100), fork_head(100)], 5).await;
+        let task = fleet.start(latest_code_request(&fleet, ProxyMode::Best).await);
+        fail(fleet.nodes[0].next().await, -32603, "primary failed");
+        fleet.nodes[1].quiet().await;
+        assert!(
+            matches!(timeout(Duration::from_secs(2), task).await.unwrap().unwrap(),
+            Err(Web3ProxyError::JsonRpcErrorData(error)) if error.code == -32603)
+        );
+        assert_eq!(fleet.counts(), [1, 0]);
+        fleet.idle();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn review_pinned_latest_keeps_head_agreement_after_rankings_advance() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[1]).await;
+        rank_heads(&fleet, [head(100), fork_head(100)], 5).await;
+        let request = latest_code_request(&fleet, ProxyMode::Best).await;
+        rank_heads(&fleet, [head(101), fork_head(100)], 5).await;
+        let held: Vec<_> = (0..4)
+            .map(|_| fleet.nodes[0].rpc.request_permits.try_acquire().unwrap())
+            .collect();
+        let task = fleet.start(request);
+        fleet.nodes[1].quiet().await;
+        assert!(!task.is_finished());
+        drop(held);
+        let primary = fleet.nodes[0].next().await;
+        assert_eq!(primary.body["params"][1], "0x64");
+        succeed(primary, json!("0xbeef"));
+        assert_eq!(
+            result(task).await,
+            json!({"jsonrpc":"2.0","id":9,"result":"0xbeef"})
+        );
+        assert_eq!(fleet.counts(), [1, 0]);
+        fleet.idle();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn review_descendant_backup_remains_eligible_for_head_bound_fallback() {
+    super::test_support::with_cleanup(async {
+        for mode in modes() {
+            let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[1]).await;
+            rank(&fleet, 100, 101, 5).await;
+            let held: Vec<_> = (0..4)
+                .map(|_| fleet.nodes[0].rpc.request_permits.try_acquire().unwrap())
+                .collect();
+            let task = fleet.start(latest_code_request(&fleet, mode).await);
+            let backup = fleet.nodes[1].next().await;
+            assert_eq!(backup.body["params"][1], "0x64");
+            succeed(backup, json!("0xbeef"));
+            assert_eq!(
+                result(task).await,
+                json!({"jsonrpc":"2.0","id":9,"result":"0xbeef"})
+            );
+            assert_eq!(fleet.counts(), [0, 1]);
+            drop(held);
+            drained(&fleet).await;
+        }
     })
     .await;
 }

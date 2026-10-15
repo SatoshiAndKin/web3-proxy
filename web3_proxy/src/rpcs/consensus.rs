@@ -242,11 +242,18 @@ impl RankedRpcs {
         let min_block_needed = web3_request.min_block_needed();
         let max_block_needed = web3_request.max_block_needed();
 
+        // A latest request stays head-bound when rankings advance after it
+        // was pinned. Only blocks older than its own head are historical.
         let historical = max_block_needed
-            .zip(head_block_num)
+            .zip(web3_request.head_block.as_ref().map(|head| head.number()))
             .is_some_and(|(needed, head)| needed < head);
 
         for rpc in self.inner.iter().cloned() {
+            // Head-bound backups must agree with consensus by hash or cached
+            // ancestry, including Best requests and batches.
+            if !historical && rpc.backup && !self.synced.contains(&rpc) {
+                continue;
+            }
             let observed_head = self.head_numbers.get(&rpc.name).copied();
             let lagging_archive = historical
                 && observed_head
