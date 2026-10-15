@@ -689,3 +689,103 @@ async fn review_descendant_backup_remains_eligible_for_head_bound_fallback() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn review_best_rescans_busy_primaries_after_backup_failure() {
+    super::test_support::with_cleanup(async {
+        for queued_backup in [false, true] {
+            for release_before_failure in [true, false] {
+                let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[1]).await;
+                let held: Vec<_> = (0..4)
+                    .map(|_| fleet.nodes[0].rpc.request_permits.try_acquire().unwrap())
+                    .collect();
+                let backup_held = if queued_backup {
+                    fleet.nodes[0].rpc.healthy.store(false, Ordering::SeqCst);
+                    (0..4)
+                        .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let task = fleet.start(request(&fleet, ProxyMode::Best).await);
+                if queued_backup {
+                    fleet.nodes[1].quiet().await;
+                    assert!(!task.is_finished());
+                }
+                drop(backup_held);
+                let backup = fleet.nodes[1].next().await;
+                fleet.nodes[0].rpc.healthy.store(true, Ordering::SeqCst);
+                let held = if release_before_failure {
+                    drop(held);
+                    None
+                } else {
+                    Some(held)
+                };
+                fail(backup, -32603, "backup failed");
+                if !release_before_failure {
+                    fleet.nodes[0].quiet().await;
+                    assert!(!task.is_finished(), "Best must wait for primary capacity");
+                }
+                drop(held);
+                let primary = fleet.nodes[0].next().await;
+                succeed(primary, json!("primary recovered"));
+                assert_eq!(
+                    result(task).await,
+                    json!({"jsonrpc":"2.0", "id":7, "result":"primary recovered"})
+                );
+                assert_eq!(fleet.counts(), [1, 1]);
+                drained(&fleet).await;
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn review_best_exhausts_each_class_once_after_backup_failure() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[1]).await;
+        let held: Vec<_> = (0..4)
+            .map(|_| fleet.nodes[0].rpc.request_permits.try_acquire().unwrap())
+            .collect();
+        let task = fleet.start(request(&fleet, ProxyMode::Best).await);
+        let backup = fleet.nodes[1].next().await;
+        drop(held);
+        fail(backup, -32603, "backup failed");
+        fail(fleet.nodes[0].next().await, -32603, "primary failed");
+        assert!(
+            matches!(timeout(Duration::from_secs(2), task).await.unwrap().unwrap(),
+            Err(Web3ProxyError::JsonRpcErrorData(error)) if error.code == -32603)
+        );
+        assert_eq!(fleet.counts(), [1, 1]);
+        fleet.nodes[0].quiet().await;
+        fleet.nodes[1].quiet().await;
+        fleet.idle();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn review_best_primary_capacity_wait_after_backup_failure_keeps_deadline() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::with_backups(2, 2, AppConfig::default(), &[1]).await;
+        let held: Vec<_> = (0..4)
+            .map(|_| fleet.nodes[0].rpc.request_permits.try_acquire().unwrap())
+            .collect();
+        let mut request = request(&fleet, ProxyMode::Best).await;
+        Arc::get_mut(&mut request).unwrap().expire_timeout = Duration::from_millis(150);
+        let task = fleet.start(request);
+        fail(fleet.nodes[1].next().await, -32603, "backup failed");
+        assert!(matches!(
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(Web3ProxyError::Timeout(_))
+        ));
+        assert_eq!(fleet.counts(), [0, 1]);
+        drop(held);
+        fleet.idle();
+    })
+    .await;
+}

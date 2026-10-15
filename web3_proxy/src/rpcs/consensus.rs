@@ -1151,7 +1151,7 @@ impl RpcsForRequest {
             let mut opened_any = !self.request.backend_rpcs_used().is_empty();
             let mut watching = true;
             let mut exhausted = HashSet::new();
-            while if opened_any { !self.request.expired() } else { !self.request.connect_timeout() } {
+            'admission: while if opened_any { !self.request.expired() } else { !self.request.connect_timeout() } {
                 let mut earliest_retry_at: Option<Instant> = None;
                 let mut wait_for_sync = Vec::new();
                 let mut wait_for_capacity = Vec::new();
@@ -1162,8 +1162,15 @@ impl RpcsForRequest {
                             opened_any = true;
                             let submitted = self.request.backend_rpcs_used().len();
                             yield handle;
-                            if self.request.backend_rpcs_used().len() > submitted && rpc.can_submit(&self.request, false) {
+                            let attempted = self.request.backend_rpcs_used().len() > submitted;
+                            if attempted && rpc.can_submit(&self.request, false) {
                                 exhausted.insert(rpc.name.clone());
+                            }
+                            // A failed attempt can expose primaries skipped earlier
+                            // in this pass. Rebuild admission and capacity waits after
+                            // progress or a class change, retaining the same deadline.
+                            if attempted || rpc.backup != self.prefer_backup(&exhausted, None, None) {
+                                continue 'admission;
                             }
                             let now = Instant::now();
                             let retry_at = rpc.next_available(now);
@@ -1201,6 +1208,7 @@ impl RpcsForRequest {
                             if self.request.backend_rpcs_used().len() > submitted && rpc.can_submit(&self.request, false) {
                                 exhausted.insert(rpc.name.clone());
                             }
+                            // The next admission pass also rescans after a queued attempt.
                         }
                     }
                     _ = async { select_all(wait_for_sync).await }, if !wait_for_sync.is_empty() => {}
