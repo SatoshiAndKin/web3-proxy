@@ -42,7 +42,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "http
 axum-macros = "0.5.1"
 base64 = "0.23.1"
 bytes = "1.12.1"
-jiff = { version = "0.2.37", default-features = false, features = ["std"] }
+jiff = { version = "0.2.38", default-features = false, features = ["std"] }
 derivative = "2.2.0"
 derive_more = { version = "2.1.1", features = ["display", "error", "from"] }
 fdlimit = "0.3.0"
@@ -63,15 +63,15 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls", 
 sentry = { version = "0.49.3", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls", "tracing"] }
 sentry-tracing = "0.49.3"
 serde = { version = "1.0.229", features = ["rc"] }
-serde-inline-default = "1.0.2"
+serde-inline-default = "1.0.3"
 # Alloy requires this raw type for type-erased WebSocket requests.
 serde_json = { version = "1.0.151", default-features = false, features = ["raw_value"] }
 shellexpand = { version = "3.1.2", default-features = false, features = ["base-0"] }
 sonic-rs = "0.5.10"
-tokio = { version = "1.53.1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
+tokio = { version = "1.53.2", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
 tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
-toml = "1.1.6"
+toml = "1.1.7"
 tower-http = { version = "0.7.1", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
@@ -85,5 +85,5 @@ url = { version = "2.5.8" }
 [dev-dependencies]
 tempfile = "3.27.0"
 test-log = { version = "0.2.21", default-features = false, features = ["trace"] }
-tokio = { version = "1.53.1", default-features = false, features = ["test-util"] }
+tokio = { version = "1.53.2", default-features = false, features = ["test-util"] }
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
