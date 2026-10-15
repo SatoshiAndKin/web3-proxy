@@ -9,6 +9,8 @@ pub mod request;
 mod versus;
 
 #[cfg(test)]
+mod backup_tests;
+#[cfg(test)]
 mod batch_tests;
 #[cfg(test)]
 mod fastest_tests;

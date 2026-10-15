@@ -4,10 +4,11 @@ use super::many::Web3Rpcs;
 use super::one::Web3Rpc;
 use crate::config::average_block_interval;
 use crate::errors::{Web3ProxyError, Web3ProxyResult};
-use crate::jsonrpc::{ParsedResponse, SingleRequest, SingleResponse};
+use crate::jsonrpc::{ParsedResponse, SingleRequest, SingleResponse, ValidatedRequest};
 use alloy::primitives::{B256, U64};
 use alloy::rpc::types::{Block, Header};
-use hashbrown::HashMap;
+use futures::{future::BoxFuture, FutureExt};
+use hashbrown::{HashMap, HashSet};
 use moka::future::{Cache, CacheBuilder};
 use parking_lot::Mutex as SyncMutex;
 use serde::ser::SerializeStruct;
@@ -16,7 +17,10 @@ use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, OwnedLazyValue};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    sync::{Arc, Weak},
+};
 use tokio::select;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
@@ -74,20 +78,23 @@ impl HeadObservationPublisher {
 
 #[derive(Default)]
 struct HydrationRace {
-    attempts: HashMap<String, AbortHandle>,
+    attempts: HashMap<String, (bool, AbortHandle)>,
+    failed: HashSet<String>,
     winner: Option<String>,
 }
 
 pub struct BlockHydrationCoordinator {
     block_responses: BlockResponseCache,
     races: Mutex<HashMap<B256, HydrationRace>>,
+    pool: Weak<Web3Rpcs>,
 }
 
 impl BlockHydrationCoordinator {
-    pub fn new(block_responses: BlockResponseCache) -> Arc<Self> {
+    pub fn new(block_responses: BlockResponseCache, pool: Weak<Web3Rpcs>) -> Arc<Self> {
         Arc::new(Self {
             block_responses,
             races: Mutex::new(HashMap::new()),
+            pool,
         })
     }
 
@@ -101,48 +108,136 @@ impl BlockHydrationCoordinator {
             return;
         }
 
+        if let Some(race) = self.races.lock().await.get_mut(&block_hash) {
+            race.failed.remove(&rpc.name);
+        }
         self.register_attempt(rpc, block_hash).await;
     }
 
-    async fn register_attempt(self: &Arc<Self>, rpc: Arc<Web3Rpc>, block_hash: B256) {
-        let rpc_name = rpc.name.clone();
-        let mut races = self.races.lock().await;
-        let race = match races.entry(block_hash) {
-            hashbrown::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            hashbrown::hash_map::Entry::Vacant(entry) => {
-                if self
-                    .block_responses
-                    .get(&BlockResponseCacheKey::new(block_hash, true))
-                    .await
-                    .is_some()
-                {
-                    return;
-                }
-                entry.insert(HydrationRace::default())
-            }
+    async fn backup_allowed(&self, rpc: &Web3Rpc, block_hash: B256, race: &HydrationRace) -> bool {
+        let Some(pool) = self.pool.upgrade() else {
+            return false;
         };
-        if race.winner.is_some() || race.attempts.contains_key(&rpc_name) {
-            return;
+        let Some(head) = pool.head_block() else {
+            return false;
+        };
+        // Headers can arrive ahead of local consensus. Prefetch only the
+        // selected head; a small backup lead must not trigger a paid fetch.
+        if *head.hash() != block_hash || !rpc.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
         }
+        let Ok(request) = ValidatedRequest::new_internal(
+            "eth_getBlockByHash".into(),
+            &(block_hash, true),
+            Some(head),
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        else {
+            return false;
+        };
+        pool.rpcs_for_request(&request).is_ok_and(|candidates| {
+            candidates
+                .connections()
+                .iter()
+                .any(|node| std::ptr::eq(node.as_ref(), rpc))
+                && candidates.can_use(
+                    rpc,
+                    &race.failed,
+                    race.attempts.values().next().map(|(backup, _)| *backup),
+                    None,
+                )
+                && rpc.can_submit(&request, false)
+        })
+    }
 
-        let coordinator = self.clone();
-        let attempt_rpc_name = rpc_name.clone();
-        let attempt = tokio::spawn(async move {
-            match rpc.fetch_full_block(block_hash).await {
-                Ok((full, hashes)) => {
-                    coordinator
-                        .accept(block_hash, attempt_rpc_name, rpc, full, hashes)
-                        .await;
-                }
-                Err(err) => {
-                    debug!(?err, %block_hash, "unable to hydrate block from {}", rpc);
-                    coordinator
-                        .finish_failed_attempt(block_hash, &attempt_rpc_name)
-                        .await;
-                }
+    fn register_attempt(
+        self: &Arc<Self>,
+        rpc: Arc<Web3Rpc>,
+        block_hash: B256,
+    ) -> BoxFuture<'_, ()> {
+        async move {
+            let rpc_name = rpc.name.clone();
+            let mut races = self.races.lock().await;
+            if self
+                .block_responses
+                .get(&BlockResponseCacheKey::new(block_hash, true))
+                .await
+                .is_some()
+            {
+                return;
             }
-        });
-        race.attempts.insert(rpc_name, attempt.abort_handle());
+            let mut race = races.remove(&block_hash).unwrap_or_default();
+            if race.winner.is_some()
+                || race.attempts.contains_key(&rpc_name)
+                || race.failed.contains(&rpc_name)
+            {
+                races.insert(block_hash, race);
+                return;
+            }
+            let allowed = if rpc.backup {
+                self.backup_allowed(&rpc, block_hash, &race).await
+            } else {
+                !race.attempts.values().any(|(backup, _)| *backup)
+            };
+            if !allowed {
+                if !race.attempts.is_empty() || !race.failed.is_empty() {
+                    races.insert(block_hash, race);
+                }
+                return;
+            }
+            let coordinator = self.clone();
+            let attempt_rpc_name = rpc_name.clone();
+            let backup = rpc.backup;
+            let attempt = tokio::spawn(async move {
+                match rpc.fetch_full_block(block_hash).await {
+                    Ok((full, hashes)) => {
+                        coordinator
+                            .accept(block_hash, attempt_rpc_name, rpc, full, hashes)
+                            .await;
+                    }
+                    Err(err) => {
+                        debug!(?err, %block_hash, "unable to hydrate block from {}", rpc);
+                        coordinator
+                            .finish_failed_attempt(block_hash, &attempt_rpc_name)
+                            .await;
+                    }
+                }
+            });
+            race.attempts
+                .insert(rpc_name, (backup, attempt.abort_handle()));
+            races.insert(block_hash, race);
+        }
+        .boxed()
+    }
+
+    /// Consensus publishes headers before asking the existing coordinator to
+    /// fill the cache. Only nodes that announced this exact hash can prefetch.
+    pub(super) async fn announce_backups(self: &Arc<Self>) {
+        let Some(pool) = self.pool.upgrade() else {
+            return;
+        };
+        let Some(head) = pool.head_block() else {
+            return;
+        };
+        let backups: Vec<_> = pool
+            .by_name
+            .read()
+            .values()
+            .filter(|rpc| {
+                rpc.backup
+                    && rpc.head_block_sender.as_ref().is_some_and(|sender| {
+                        sender
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|block| block.hash() == head.hash())
+                    })
+            })
+            .cloned()
+            .collect();
+        for rpc in backups {
+            self.register_attempt(rpc, *head.hash()).await;
+        }
     }
 
     async fn accept(
@@ -178,7 +273,7 @@ impl BlockHydrationCoordinator {
                 .remove(&block_hash)
                 .into_iter()
                 .flat_map(|race| race.attempts)
-                .filter_map(|(name, handle)| (name != rpc_name).then_some(handle))
+                .filter_map(|(name, (_, handle))| (name != rpc_name).then_some(handle))
                 .collect::<Vec<_>>()
         };
         for handle in loser_handles {
@@ -186,15 +281,20 @@ impl BlockHydrationCoordinator {
         }
     }
 
-    async fn finish_failed_attempt(&self, block_hash: B256, rpc_name: &str) {
+    async fn finish_failed_attempt(self: &Arc<Self>, block_hash: B256, rpc_name: &str) {
+        {
+            let mut races = self.races.lock().await;
+            if let Some(race) = races.get_mut(&block_hash) {
+                race.attempts.remove(rpc_name);
+                race.failed.insert(rpc_name.to_owned());
+            }
+        }
+        self.announce_backups().await;
         let mut races = self.races.lock().await;
-        let remove_race = if let Some(race) = races.get_mut(&block_hash) {
-            race.attempts.remove(rpc_name);
-            race.attempts.is_empty() && race.winner.is_none()
-        } else {
-            false
-        };
-        if remove_race {
+        if races
+            .get(&block_hash)
+            .is_some_and(|race| race.attempts.is_empty() && race.winner.is_none())
+        {
             races.remove(&block_hash);
         }
     }
@@ -723,7 +823,7 @@ mod tests {
         let head_observation_publisher = HeadObservationPublisher::new(head_observation_sender);
         let (watch_ranked_rpcs, _) = watch::channel(None);
         let block_responses = new_block_response_cache(block_cache_max_bytes);
-        let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
+        let block_hydration = BlockHydrationCoordinator::new(block_responses.clone(), Weak::new());
 
         Web3Rpcs {
             frontend_tasks: tokio_util::task::TaskTracker::new(),
@@ -785,7 +885,7 @@ mod tests {
     async fn cache_fill_during_announcement_gap_prevents_hydration_request() {
         let block_hash = B256::with_last_byte(0x42);
         let block_responses = Cache::new(16);
-        let coordinator = BlockHydrationCoordinator::new(block_responses.clone());
+        let coordinator = BlockHydrationCoordinator::new(block_responses.clone(), Weak::new());
         let rpc = Arc::new(Web3Rpc {
             name: "cached".into(),
             ..Default::default()

@@ -117,16 +117,20 @@ impl App {
                 // Read current rankings on every completion or readiness event.
                 // Pending packets have no fixed backend assignment.
                 updates.borrow_and_update();
-                let connections = match self.balanced_rpcs.try_rpcs_for_request(request).await {
-                    Ok(rpcs) => rpcs.connections(),
+                let candidates = match self.balanced_rpcs.try_rpcs_for_request(request).await {
+                    Ok(rpcs) => Some(rpcs),
                     Err(error) => {
                         let error = Arc::new(error);
                         for &index in &pending {
                             calls[index].last_error = Some(error.clone());
                         }
-                        Vec::new()
+                        None
                     }
                 };
+                let connections = candidates
+                    .as_ref()
+                    .map(|rpcs| rpcs.connections())
+                    .unwrap_or_default();
                 if !connections.is_empty() {
                     pending.retain(|&index| {
                         if connections
@@ -157,6 +161,18 @@ impl App {
                     else {
                         continue;
                     };
+                    if !candidates
+                        .as_ref()
+                        .expect("connections have candidates")
+                        .can_use(
+                            &rpc,
+                            &calls[index].exhausted,
+                            ready.first().map(|handle| handle.clone_connection().backup),
+                            None,
+                        )
+                    {
+                        continue;
+                    }
                     match rpc
                         .try_request_handle(&calls[index].request, None, false)
                         .await
@@ -178,11 +194,21 @@ impl App {
                 }
             }
 
+            let had_reservations = !ready.is_empty();
             ready.retain(|handle| {
-                pending
-                    .iter()
-                    .any(|&i| !calls[i].exhausted.contains(&handle.connection_name()))
+                let rpc = handle.clone_connection();
+                pending.iter().any(|&i| {
+                    self.balanced_rpcs
+                        .rpcs_for_request(&calls[i].request)
+                        .is_ok_and(|candidates| {
+                            candidates.can_use(&rpc, &calls[i].exhausted, None, Some(&rpc))
+                                && rpc.can_submit(&calls[i].request, false)
+                        })
+                })
             });
+            if had_reservations && ready.is_empty() {
+                continue;
+            }
             // Use ready HTTP capacity first. If HTTP cannot take the remaining
             // work, other transports take calls from this same queue, one per slot.
             if ready.iter().any(OpenRequestHandle::supports_batch) {

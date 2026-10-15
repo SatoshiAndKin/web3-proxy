@@ -94,7 +94,8 @@ pub struct AppConfig {
     /// percentage to increase eth_estimateGas results. 100 == 100%
     pub gas_increase_percent: Option<U256>,
 
-    /// do not serve any requests if the best known block is behind the best known block by more than this many blocks.
+    /// Maximum primary consensus lag behind the newest observed head. The boundary
+    /// is inclusive. Older healthy nodes can still serve historical requests.
     pub max_head_block_lag: Option<U64>,
 
     /// The soft limit prevents thundering herds as new blocks are seen.
@@ -250,7 +251,9 @@ impl From<BlockDataLimit> for AtomicU64 {
 #[serde_inline_default]
 #[derive(Clone, Deserialize, PartialEq)]
 pub struct Web3RpcConfig {
-    /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
+    /// Standby for client requests and full-block cache fetches. Prefer suitable
+    /// primaries, including their available capacity, while retaining backup
+    /// head observations and consensus votes.
     #[serde(default = "Default::default")]
     pub backup: bool,
     /// State-history limit. If unknown, the proxy queries it.

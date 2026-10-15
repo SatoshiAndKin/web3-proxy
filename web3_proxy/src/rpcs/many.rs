@@ -162,7 +162,6 @@ impl Web3Rpcs {
             .build();
 
         let block_responses = new_block_response_cache(config.block_cache_max_bytes);
-        let block_hydration = BlockHydrationCoordinator::new(block_responses.clone());
 
         let (watch_consensus_rpcs_sender, consensus_connections_watcher) =
             watch::channel(Default::default());
@@ -181,11 +180,11 @@ impl Web3Rpcs {
         let max_head_block_age =
             block_interval.mul_f32((max_head_block_lag.to::<u64>() * 10) as f32);
 
-        let connections = Arc::new(Self {
+        let connections = Arc::new_cyclic(|pool| Self {
             frontend_tasks,
             frontend_shutdown,
             head_observation_publisher,
-            block_hydration,
+            block_hydration: BlockHydrationCoordinator::new(block_responses.clone(), pool.clone()),
             blocks_by_hash,
             blocks_by_number,
             block_responses,
@@ -402,7 +401,7 @@ impl Web3Rpcs {
     }
 
     /// Use the pool's current membership for selection and admission rechecks.
-    pub(super) fn rpcs_for_request(
+    pub(crate) fn rpcs_for_request(
         &self,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<RpcsForRequest> {
