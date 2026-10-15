@@ -902,6 +902,18 @@ impl Web3Rpc {
             // TODO: if head block is none for too long, give an error
         }
 
+        // Head subscriptions can remain healthy while the HTTP request path fails.
+        // Use the normal transport and request deadline so health and recovery
+        // reflect the path used to serve clients, including HTTP-only backends.
+        let _: U64 = self
+            .internal_request(
+                "eth_blockNumber".into(),
+                &(),
+                error_handler,
+                Some(Duration::from_secs(5)),
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -2100,6 +2112,51 @@ mod tests {
             retrying.rpc.total_requests.load(atomic::Ordering::Relaxed),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn health_checks_request_transport_despite_fresh_head_and_allows_recovery() {
+        super::super::test_support::with_cleanup(async {
+            let mut fresh = header(
+                42,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+            fresh.hash = B256::with_last_byte(42);
+            let mut node = super::super::batch_tests::Harness::configured("health", 4, 64, |rpc| {
+                rpc.max_head_block_age = Duration::from_secs(60);
+                rpc.head_block_sender =
+                    Some(watch::channel(Some(BlockHeader::new(Arc::new(fresh)))).0);
+            })
+            .await;
+            for healthy in [true, false, true] {
+                let rpc = node.rpc.clone();
+                let check = super::super::test_support::spawn(async move {
+                    rpc.check_health(false, None).await
+                });
+                let request = node.next().await;
+                assert_eq!(request.body["method"], "eth_blockNumber");
+                if healthy {
+                    let id = request.body["id"].clone();
+                    request.respond(serde_json::json!({"jsonrpc":"2.0", "id":id, "result":"0x2a"}));
+                } else {
+                    request
+                        .reply
+                        .send(
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                                .body(axum::body::Body::from("unavailable"))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+                assert_eq!(check.await.unwrap().is_ok(), healthy);
+            }
+            assert_eq!(node.rpc.active_requests.load(atomic::Ordering::SeqCst), 0);
+        })
+        .await;
     }
 
     #[test]
