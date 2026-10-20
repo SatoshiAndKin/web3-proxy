@@ -249,6 +249,10 @@ impl RankedRpcs {
             .is_some_and(|(needed, head)| needed < head);
 
         for rpc in self.inner.iter().cloned() {
+            if !rpc.supports_request(web3_request) {
+                continue;
+            }
+
             // Head-bound backups must agree with consensus by hash or cached
             // ancestry, including Best requests and batches.
             if !historical && rpc.backup && !self.synced.contains(&rpc) {
@@ -1294,7 +1298,10 @@ mod tests {
     use moka::future::Cache;
     use parking_lot::RwLock;
     use std::io::{self, Write};
-    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
     use std::time::Duration;
     use tokio::sync::{mpsc, watch};
     use tokio::time::{timeout, Instant};
@@ -1407,6 +1414,51 @@ mod tests {
             .expect("a state-history backend should serve historical state");
         assert_eq!(state_rpcs.inner.len(), 1);
         assert_eq!(state_rpcs.inner[0].name, "state-archive");
+    }
+
+    #[test]
+    fn simulate_requests_use_only_capable_backends() {
+        let head = block(1_000, B256::repeat_byte(0x11), B256::ZERO);
+        let unsupported = rpc_with_history_limits("unsupported", &head, u64::MAX, u64::MAX);
+        let supported = rpc_with_history_limits("supported", &head, u64::MAX, u64::MAX);
+        supported.supports_simulate.store(true, Ordering::SeqCst);
+        let ranked = RankedRpcs::from_rpcs(
+            vec![unsupported.clone(), supported.clone()],
+            Some(head.clone()),
+            false,
+        );
+
+        let simulate_request = request(
+            "eth_simulateV1",
+            RequestBlocks::Point {
+                block_needed: BlockNumOrHash::Num(head.number()),
+            },
+        );
+        let simulate_rpcs = ranked
+            .for_request(&simulate_request)
+            .expect("the capable backend should serve simulation requests");
+        assert_eq!(simulate_rpcs.inner.len(), 1);
+        assert_eq!(simulate_rpcs.inner[0].name, "supported");
+
+        let ordinary_request = request(
+            "eth_call",
+            RequestBlocks::Point {
+                block_needed: BlockNumOrHash::Num(head.number()),
+            },
+        );
+        let ordinary_rpcs = ranked
+            .for_request(&ordinary_request)
+            .expect("both backends should serve ordinary requests");
+        let mut ordinary_rpc_names = ordinary_rpcs
+            .inner
+            .iter()
+            .map(|rpc| rpc.name.as_str())
+            .collect::<Vec<_>>();
+        ordinary_rpc_names.sort_unstable();
+        assert_eq!(ordinary_rpc_names, ["supported", "unsupported"]);
+
+        let unsupported_only = RankedRpcs::from_rpcs(vec![unsupported], Some(head), false);
+        assert!(unsupported_only.for_request(&simulate_request).is_none());
     }
 
     #[test_log::test(tokio::test)]

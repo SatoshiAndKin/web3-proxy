@@ -665,6 +665,14 @@ impl OpenRequestHandle {
             };
         }
         request.check_submission()?;
+        for item in &requests[1..] {
+            if item.expired() {
+                return Err(Web3ProxyError::Timeout(None));
+            }
+            if !request.rpc.can_submit(item, request.allow_unhealthy) {
+                return Err(Web3ProxyError::NoHandleReady);
+            }
+        }
         if Instant::now() >= deadline {
             return Err(Web3ProxyError::Timeout(None));
         }

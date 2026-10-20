@@ -210,6 +210,11 @@ impl Serialize for ValidatedRequest {
 
 impl ValidatedRequest {
     #[inline]
+    pub fn requires_simulate(&self) -> bool {
+        self.inner.method() == "eth_simulateV1"
+    }
+
+    #[inline]
     pub fn requires_log_history(&self) -> bool {
         self.inner.method() == "eth_getLogs"
     }

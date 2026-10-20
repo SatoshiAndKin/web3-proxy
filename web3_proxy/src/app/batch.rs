@@ -225,7 +225,9 @@ impl App {
                         let count = remaining.min(handle.batch_size());
                         let mut indices = Vec::with_capacity(count);
                         pending.retain(|&index| {
-                            if indices.len() < count && !calls[index].exhausted.contains(&rpc.name)
+                            if indices.len() < count
+                                && !calls[index].exhausted.contains(&rpc.name)
+                                && rpc.can_submit(&calls[index].request, false)
                             {
                                 indices.push(index);
                                 false

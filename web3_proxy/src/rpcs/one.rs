@@ -137,6 +137,8 @@ pub struct Web3Rpc {
     pub(super) block_data_limit: AtomicU64,
     /// Oldest log-query range relative to the current head.
     pub(super) log_data_limit: AtomicU64,
+    /// Whether this backend accepts `eth_simulateV1` requests.
+    pub(super) supports_simulate: AtomicBool,
     /// head_block is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) head_block_sender: Option<watch::Sender<Option<BlockHeader>>>,
     /// Track head block latency.
@@ -568,6 +570,39 @@ impl Web3Rpc {
         Ok(limit)
     }
 
+    async fn check_simulate_support(self: &Arc<Self>) -> anyhow::Result<bool> {
+        let probe: Web3ProxyResult<OwnedLazyValue> = self
+            .internal_request(
+                "eth_simulateV1".into(),
+                &json!([{
+                    "blockStateCalls": [{
+                        "calls": [{
+                            "to": Address::ZERO,
+                        }],
+                    }],
+                    "traceTransfers": false,
+                    "validation": false,
+                    "returnFullTransactions": false,
+                }, "latest"]),
+                Some(Level::TRACE.into()),
+                Some(Duration::from_secs(5)),
+            )
+            .await;
+
+        let supports_simulate = match probe {
+            Ok(_) => true,
+            Err(Web3ProxyError::MethodNotFound(_)) => false,
+            Err(Web3ProxyError::JsonRpcErrorData(error)) if error.code == -32601 => false,
+            Err(error) => return Err(error.into()),
+        };
+
+        self.supports_simulate
+            .store(supports_simulate, atomic::Ordering::SeqCst);
+        info!(rpc = %self, supports_simulate, "detected eth_simulateV1 support");
+
+        Ok(supports_simulate)
+    }
+
     /// TODO: this might be too simple. different nodes can prune differently. its possible we will have a block range
     pub fn block_data_limit(&self) -> U64 {
         U64::from_limbs([self.block_data_limit.load(atomic::Ordering::SeqCst)])
@@ -596,6 +631,10 @@ impl Web3Rpc {
         } else {
             self.has_block_data(needed_block_num)
         }
+    }
+
+    pub(super) fn supports_request(&self, request: &ValidatedRequest) -> bool {
+        !request.requires_simulate() || self.supports_simulate.load(atomic::Ordering::SeqCst)
     }
 
     fn has_data_with_limit(&self, needed_block_num: U64, data_limit: U64) -> bool {
@@ -692,6 +731,11 @@ impl Web3Rpc {
             .context(format!("failed @ {}", self))
             .into());
         }
+
+        self.check_simulate_support().await.context(format!(
+            "unable to check eth_simulateV1 support of {}",
+            self
+        ))?;
 
         // TODO: only do this for balanced_rpcs. this errors on 4337 rpcs
         self.check_block_data_limit()
@@ -1345,7 +1389,8 @@ impl Web3Rpc {
         let now = Instant::now();
         self.next_available(now) <= now
             && (allow_unhealthy
-                || (self.healthy.load(atomic::Ordering::SeqCst)
+                || (self.supports_request(request)
+                    && self.healthy.load(atomic::Ordering::SeqCst)
                     && (self.head_observation_publisher.is_none()
                         || [request.min_block_needed(), request.max_block_needed()]
                             .into_iter()
@@ -1362,6 +1407,10 @@ impl Web3Rpc {
         // TODO: if websocket is reconnecting, return an error?
 
         if !allow_unhealthy {
+            if !self.supports_request(web3_request) {
+                return Ok(OpenRequestResult::Failed);
+            }
+
             if !(self.healthy.load(atomic::Ordering::SeqCst)) {
                 return Ok(OpenRequestResult::RetryAt(
                     self.next_available(Instant::now() + Duration::from_secs(1)),
@@ -1586,7 +1635,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 17)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 18)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
@@ -1614,6 +1663,11 @@ impl Serialize for Web3Rpc {
                 state.serialize_field("log_data_limit", &log_data_limit)?;
             }
         }
+
+        state.serialize_field(
+            "supports_simulate",
+            &self.supports_simulate.load(atomic::Ordering::SeqCst),
+        )?;
 
         state.serialize_field("tier", &self.tier)?;
 
@@ -1697,6 +1751,11 @@ impl fmt::Debug for Web3Rpc {
         }
 
         f.field("backup", &self.backup);
+
+        f.field(
+            "supports_simulate",
+            &self.supports_simulate.load(atomic::Ordering::SeqCst),
+        );
 
         f.field("tier", &self.tier.load(atomic::Ordering::SeqCst));
 
@@ -2176,6 +2235,145 @@ mod tests {
 
         assert!(rpc.health_status(true));
         assert!(!rpc.health_status(false));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn first_provider_check_records_simulate_support() {
+        super::super::test_support::with_cleanup(async {
+            for supports_simulate in [true, false] {
+                let mut node = super::super::batch_tests::Harness::named(
+                    if supports_simulate {
+                        "simulate-supported"
+                    } else {
+                        "simulate-unsupported"
+                    },
+                    4,
+                    64,
+                )
+                .await;
+                let rpc = node.rpc.clone();
+                let check =
+                    super::super::test_support::spawn(async move { rpc.check_provider().await });
+
+                let client_version = node.next().await;
+                assert_eq!(client_version.body["method"], "web3_clientVersion");
+                let id = client_version.body["id"].clone();
+                client_version
+                    .respond(serde_json::json!({"jsonrpc":"2.0", "id":id, "result":"test-client"}));
+
+                let chain_id = node.next().await;
+                assert_eq!(chain_id.body["method"], "eth_chainId");
+                let id = chain_id.body["id"].clone();
+                chain_id.respond(serde_json::json!({"jsonrpc":"2.0", "id":id, "result":"0x0"}));
+
+                let simulate = node.next().await;
+                assert_eq!(simulate.body["method"], "eth_simulateV1");
+                assert_eq!(
+                    simulate.body["params"],
+                    serde_json::json!([{
+                        "blockStateCalls": [{
+                            "calls": [{
+                                "to": "0x0000000000000000000000000000000000000000"
+                            }]
+                        }],
+                        "traceTransfers": false,
+                        "validation": false,
+                        "returnFullTransactions": false
+                    }, "latest"])
+                );
+                let id = simulate.body["id"].clone();
+                if supports_simulate {
+                    simulate.respond(serde_json::json!({"jsonrpc":"2.0", "id":id, "result":[]}));
+                } else {
+                    simulate.respond(serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":id,
+                        "error":{
+                            "code":-32601,
+                            "message":"rpc method is not whitelisted"
+                        }
+                    }));
+                }
+
+                check.await.unwrap().unwrap();
+                assert_eq!(
+                    node.rpc.supports_simulate.load(atomic::Ordering::SeqCst),
+                    supports_simulate
+                );
+            }
+        })
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn unsupported_simulate_request_cannot_reserve_a_backend() {
+        let rpc = Arc::new(Web3Rpc {
+            name: "simulate-unsupported".to_owned(),
+            healthy: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal(
+            "eth_simulateV1".into(),
+            &json!([{"blockStateCalls": [{"calls": []}]}, "latest"]),
+            None,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            rpc.try_request_handle(&request, None, false).await.unwrap(),
+            OpenRequestResult::Failed
+        ));
+
+        rpc.supports_simulate.store(true, atomic::Ordering::SeqCst);
+        assert!(matches!(
+            rpc.try_request_handle(&request, None, false).await.unwrap(),
+            OpenRequestResult::Handle(_)
+        ));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn mixed_batch_cannot_send_simulate_to_unsupported_backend() {
+        super::super::test_support::with_cleanup(async {
+            let mut node =
+                super::super::batch_tests::Harness::named("simulate-unsupported", 4, 64).await;
+            let ordinary_request = ValidatedRequest::new_internal(
+                "eth_call".into(),
+                &json!([{"to": Address::ZERO}, "latest"]),
+                None,
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            let simulate_request = ValidatedRequest::new_internal(
+                "eth_simulateV1".into(),
+                &json!([{"blockStateCalls": [{"calls": []}]}, "latest"]),
+                None,
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            let handle = match node
+                .rpc
+                .try_request_handle(&ordinary_request, None, false)
+                .await
+                .unwrap()
+            {
+                OpenRequestResult::Handle(handle) => handle,
+                _ => panic!("ordinary request should reserve the backend"),
+            };
+
+            let error = handle
+                .request_batch(&[ordinary_request, simulate_request])
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, Web3ProxyError::NoHandleReady));
+            node.quiet().await;
+            assert_eq!(node.rpc.active_requests.load(atomic::Ordering::SeqCst), 0);
+        })
+        .await;
     }
 
     #[test_log::test(tokio::test)]
