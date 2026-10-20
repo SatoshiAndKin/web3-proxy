@@ -1,8 +1,9 @@
-//! Bounded private JSONL measurement storage. Never delete trial evidence automatically.
+//! Bounded private JSONL measurement storage with oldest-first retention.
 use super::stats::Sample;
 use anyhow::{ensure, Result};
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -12,7 +13,8 @@ use tokio::{
     sync::mpsc,
 };
 
-const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_FILES: usize = 4096;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) type Sender = mpsc::Sender<super::telemetry::Envelope>;
 
@@ -108,10 +110,20 @@ pub(super) enum Record {
     },
 }
 
+struct LogFile {
+    path: PathBuf,
+    bytes: u64,
+}
+
+struct ActiveFile {
+    log: LogFile,
+    writer: BufWriter<File>,
+}
+
 pub(super) struct Recording {
     directory: PathBuf,
-    file: BufWriter<File>,
-    file_bytes: u64,
+    active: Option<ActiveFile>,
+    completed: VecDeque<LogFile>,
     total_bytes: u64,
 }
 impl Recording {
@@ -127,63 +139,114 @@ impl Recording {
             .mode(0o700)
             .create(&directory)
             .await?;
-        let mut files = tokio::fs::read_dir(&directory).await?;
+        let mut entries = tokio::fs::read_dir(&directory).await?;
+        let mut files = Vec::new();
         let mut total_bytes = 0u64;
-        let mut count = 0;
-        while let Some(file) = files.next_entry().await? {
-            count += 1;
-            ensure!(count <= 4096, "too many measurement files");
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let recording_file = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".jsonl"))
+                .is_some_and(|stem| stem.parse::<ulid::Ulid>().is_ok());
+            if !recording_file || !entry.file_type().await?.is_file() {
+                continue;
+            }
+            let bytes = entry.metadata().await?.len();
+            if bytes == 0 {
+                tokio::fs::remove_file(entry.path()).await?;
+                continue;
+            }
             total_bytes = total_bytes
-                .checked_add(file.metadata().await?.len())
+                .checked_add(bytes)
                 .ok_or_else(|| anyhow::anyhow!("measurement size overflow"))?;
+            files.push(LogFile {
+                path: entry.path(),
+                bytes,
+            });
         }
-        ensure!(
-            total_bytes < MAX_TOTAL_BYTES,
-            "measurement storage limit reached"
-        );
-        let file = Self::file(&directory).await?;
-        Ok(Self {
+        // ULID names order completed logs by creation time. Only this writer's
+        // active file is excluded from retention until it has been flushed.
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut recording = Self {
             directory,
-            file,
-            file_bytes: 0,
+            active: None,
+            completed: files.into(),
             total_bytes,
-        })
+        };
+        recording.make_room(0).await?;
+        Ok(recording)
     }
-    async fn file(directory: &Path) -> Result<BufWriter<File>> {
-        let path = directory.join(format!("{}.jsonl", ulid::Ulid::generate()));
-        Ok(BufWriter::new(
+    async fn file(directory: &Path) -> Result<ActiveFile> {
+        let log = LogFile {
+            path: directory.join(format!("{}.jsonl", ulid::Ulid::generate())),
+            bytes: 0,
+        };
+        let writer = BufWriter::new(
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(path)
+                .open(&log.path)
                 .await?,
-        ))
+        );
+        Ok(ActiveFile { log, writer })
+    }
+    async fn make_room(&mut self, incoming_bytes: u64) -> Result<()> {
+        // Reserve one file for the active writer even before its first record.
+        while self.total_bytes + incoming_bytes > MAX_TOTAL_BYTES
+            || self.completed.len() >= MAX_FILES
+        {
+            let oldest = self
+                .completed
+                .front()
+                .ok_or_else(|| anyhow::anyhow!("measurement storage limit reached"))?;
+            tokio::fs::remove_file(&oldest.path).await?;
+            self.total_bytes -= oldest.bytes;
+            self.completed.pop_front();
+        }
+        Ok(())
     }
     async fn append(&mut self, record: &super::telemetry::Envelope) -> Result<()> {
         let mut bytes = sonic_rs::to_vec(record)?;
         bytes.push(b'\n');
         let size = u64::try_from(bytes.len())?;
         ensure!(
-            size <= MAX_FILE_BYTES && self.total_bytes + size <= MAX_TOTAL_BYTES,
-            "measurement storage limit reached"
+            size <= MAX_FILE_BYTES,
+            "measurement record exceeds file limit"
         );
-        if self.file_bytes + size > MAX_FILE_BYTES {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.log.bytes + size > MAX_FILE_BYTES)
+        {
             self.flush().await?;
-            self.file = Self::file(&self.directory).await?;
-            self.file_bytes = 0;
+            if let Some(active) = self.active.take() {
+                self.completed.push_back(active.log);
+            }
         }
-        self.file.write_all(&bytes).await?;
-        self.file_bytes += size;
+        // Check the serialized size and prune closed logs before opening a file.
+        // Idle retries and rejected records therefore cannot create empty files.
+        self.make_room(size).await?;
+        if self.active.is_none() {
+            self.active = Some(Self::file(&self.directory).await?);
+        }
+        let active = self
+            .active
+            .as_mut()
+            .expect("active recording file was opened");
+        active.writer.write_all(&bytes).await?;
+        active.log.bytes += size;
         self.total_bytes += size;
         Ok(())
     }
     async fn flush(&mut self) -> Result<()> {
-        self.file.flush().await?;
-        self.file.get_ref().sync_data().await?;
+        if let Some(active) = self.active.as_mut() {
+            active.writer.flush().await?;
+            active.writer.get_ref().sync_data().await?;
+        }
         Ok(())
     }
-    /// Disk work never runs on the forwarding task. Retain files and retry storage at
+    /// Disk work never runs on the forwarding task. Rotate logs and retry storage at
     /// a bounded rate; consume and count dropped records while storage is unavailable.
     pub async fn supervise(
         state_dir: PathBuf,
@@ -259,38 +322,224 @@ impl Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn records_flush_on_shutdown_and_storage_limits_preserve_existing_evidence() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut recording = Recording::open(directory.path()).await.unwrap();
-        let record = Record::AcquisitionFailed {
-            started_mode_epoch: 0,
-            root: alloy::primitives::B256::ZERO,
-            slot: 1,
-            consensus: false,
-        };
-        let record = super::super::telemetry::Envelope {
+
+    fn sample() -> super::super::telemetry::Envelope {
+        super::super::telemetry::Envelope {
             context: super::super::telemetry::Telemetry::default().context(Default::default()),
-            event: record,
-        };
-        recording.append(&record).await.unwrap();
-        recording.file_bytes = MAX_FILE_BYTES;
-        recording.append(&record).await.unwrap();
-        recording.total_bytes = MAX_TOTAL_BYTES;
-        assert!(recording.append(&record).await.is_err());
+            event: Record::AcquisitionFailed {
+                started_mode_epoch: 0,
+                root: alloy::primitives::B256::ZERO,
+                slot: 1,
+                consensus: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_and_flushing_idle_storage_creates_no_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for _ in 0..3 {
+            let mut recording = Recording::open(directory.path()).await.unwrap();
+            recording.flush().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("observations"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_removes_empty_recordings_and_preserves_other_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let observations = directory.path().join("observations");
+        std::fs::create_dir(&observations).unwrap();
+        for i in 0..4097 {
+            std::fs::write(observations.join(format!("{i:026}.jsonl")), "").unwrap();
+        }
+        let history = observations.join(format!("{:026}.jsonl", 5000));
+        std::fs::write(&history, "{\"history\":true}\n").unwrap();
+        let unrelated = observations.join("operator-notes.txt");
+        std::fs::write(&unrelated, "preserve").unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::write(&outside, "preserve outside").unwrap();
+        let link = observations.join(format!("{:026}.jsonl", 5001));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let nested = observations.join(format!("{:026}.jsonl", 5002));
+        std::fs::create_dir(&nested).unwrap();
+
+        let mut recording = Recording::open(directory.path()).await.unwrap();
+        assert_eq!(std::fs::read_dir(&observations).unwrap().count(), 4);
+        recording.append(&sample()).await.unwrap();
         recording.flush().await.unwrap();
-        let mut files = tokio::fs::read_dir(directory.path().join("observations"))
-            .await
+        assert_eq!(std::fs::read_dir(&observations).unwrap().count(), 5);
+        assert_eq!(
+            std::fs::read_to_string(history).unwrap(),
+            "{\"history\":true}\n"
+        );
+        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "preserve");
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "preserve outside"
+        );
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(nested.is_dir());
+    }
+
+    #[tokio::test]
+    async fn full_storage_prunes_oldest_recording_and_accepts_new_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let observations = directory.path().join("observations");
+        std::fs::create_dir(&observations).unwrap();
+        let limit = 1024 * 1024 * 1024;
+        for i in 0..limit / MAX_FILE_BYTES {
+            std::fs::File::create(observations.join(format!("{i:026}.jsonl")))
+                .unwrap()
+                .set_len(MAX_FILE_BYTES)
+                .unwrap();
+        }
+        let mut recording = Recording::open(directory.path()).await.unwrap();
+        let record = sample();
+        recording.append(&record).await.unwrap();
+        recording.append(&record).await.unwrap();
+        recording.flush().await.unwrap();
+        assert!(!observations.join(format!("{:026}.jsonl", 0)).exists());
+        for i in 1..limit / MAX_FILE_BYTES {
+            assert_eq!(
+                std::fs::metadata(observations.join(format!("{i:026}.jsonl")))
+                    .unwrap()
+                    .len(),
+                MAX_FILE_BYTES
+            );
+        }
+        let sizes: Vec<_> = std::fs::read_dir(&observations)
+            .unwrap()
+            .map(|file| file.unwrap().metadata().unwrap().len())
+            .collect();
+        assert!(sizes.iter().sum::<u64>() <= limit);
+        assert_eq!(sizes.len() as u64, limit / MAX_FILE_BYTES);
+        let newest = std::fs::read_dir(&observations)
+            .unwrap()
+            .map(|file| file.unwrap().path())
+            .max()
             .unwrap();
         let expected = format!("{}\n", sonic_rs::to_string(&record).unwrap());
-        let mut count = 0;
-        while let Some(file) = files.next_entry().await.unwrap() {
+        assert_eq!(std::fs::read_to_string(newest).unwrap(), expected.repeat(2));
+    }
+    #[tokio::test]
+    async fn rotation_flushes_completed_files_and_preserves_their_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut recording = Recording::open(directory.path()).await.unwrap();
+        let mut record = sample();
+        record.event = Record::Configured {
+            sources: vec!["x".repeat(MAX_FILE_BYTES as usize / 2)],
+            execution_targets: vec![],
+            consensus_targets: vec![],
+            genesis_time: 0,
+            seconds_per_slot: 12,
+        };
+        recording.append(&record).await.unwrap();
+        recording.append(&record).await.unwrap();
+        recording.flush().await.unwrap();
+        let expected = format!("{}\n", sonic_rs::to_string(&record).unwrap());
+        let files: Vec<_> = std::fs::read_dir(directory.path().join("observations"))
+            .unwrap()
+            .map(|file| file.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 2);
+        for file in files {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
             assert_eq!(
-                tokio::fs::read_to_string(file.path()).await.unwrap(),
-                expected
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
             );
-            count += 1;
         }
-        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_oversize_records_do_not_create_files_or_prune_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let observations = directory.path().join("observations");
+        std::fs::create_dir(&observations).unwrap();
+        let history = observations.join(format!("{:026}.jsonl", 1));
+        std::fs::write(&history, "{}\n").unwrap();
+        let mut recording = Recording::open(directory.path()).await.unwrap();
+        let mut record = sample();
+        record.event = Record::Configured {
+            sources: vec!["x".repeat(MAX_FILE_BYTES as usize)],
+            execution_targets: vec![],
+            consensus_targets: vec![],
+            genesis_time: 0,
+            seconds_per_slot: 12,
+        };
+        for _ in 0..3 {
+            assert!(recording
+                .append(&record)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("record exceeds file limit"));
+        }
+        recording.flush().await.unwrap();
+        assert_eq!(std::fs::read_dir(&observations).unwrap().count(), 1);
+        assert_eq!(std::fs::read_to_string(history).unwrap(), "{}\n");
+    }
+
+    #[tokio::test]
+    async fn partial_files_are_pruned_oldest_first_to_keep_the_file_count_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let observations = directory.path().join("observations");
+        std::fs::create_dir(&observations).unwrap();
+        for i in 0..MAX_FILES {
+            std::fs::write(observations.join(format!("{i:026}.jsonl")), "{}\n").unwrap();
+        }
+        let mut recording = Recording::open(directory.path()).await.unwrap();
+        assert!(!observations.join(format!("{:026}.jsonl", 0)).exists());
+        recording.append(&sample()).await.unwrap();
+        recording.flush().await.unwrap();
+        assert_eq!(std::fs::read_dir(&observations).unwrap().count(), MAX_FILES);
+        for i in 1..MAX_FILES {
+            assert_eq!(
+                std::fs::read_to_string(observations.join(format!("{i:026}.jsonl"))).unwrap(),
+                "{}\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_byte_limit_is_allowed_and_the_next_record_preserves_the_active_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let observations = directory.path().join("observations");
+        std::fs::create_dir(&observations).unwrap();
+        let record = sample();
+        let size = sonic_rs::to_vec(&record).unwrap().len() as u64 + 1;
+        let count = MAX_TOTAL_BYTES / MAX_FILE_BYTES;
+        for i in 0..count {
+            std::fs::File::create(observations.join(format!("{i:026}.jsonl")))
+                .unwrap()
+                .set_len(MAX_FILE_BYTES - if i == count - 1 { size } else { 0 })
+                .unwrap();
+        }
+        let mut recording = Recording::open(directory.path()).await.unwrap();
+        recording.append(&record).await.unwrap();
+        recording.flush().await.unwrap();
+        assert!(observations.join(format!("{:026}.jsonl", 0)).exists());
+        let total: u64 = std::fs::read_dir(&observations)
+            .unwrap()
+            .map(|file| file.unwrap().metadata().unwrap().len())
+            .sum();
+        assert_eq!(total, MAX_TOTAL_BYTES);
+        recording.append(&record).await.unwrap();
+        recording.flush().await.unwrap();
+        assert!(!observations.join(format!("{:026}.jsonl", 0)).exists());
+        let newest = std::fs::read_dir(&observations)
+            .unwrap()
+            .map(|file| file.unwrap().path())
+            .max()
+            .unwrap();
+        let expected = format!("{}\n", sonic_rs::to_string(&record).unwrap());
+        assert_eq!(std::fs::read_to_string(newest).unwrap(), expected.repeat(2));
     }
 }

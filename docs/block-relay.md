@@ -179,10 +179,14 @@ include source events, acquisition failures, blob readiness, and per-target
 observations with their mode, slot, root, and missing/ready bounds. Durations use
 a monotonic clock. Wall-clock timestamps only help join observer records.
 The writer has a bounded queue, syncs each second, rotates at 16 MiB, and caps
-storage at 512 MiB total. It never erases evidence. Full storage, queue overflow,
-and disk errors increment visible error/drop counters. The writer retries storage
-at a bounded rate while forwarding continues. The last unsynced records can be
-lost on a crash. Reconcile recorded roots against the chain before evaluating a trial.
+storage at 1 GiB total and 4,096 files. It removes the oldest completed logs as
+needed to stay within these limits, while preserving the active file. Startup
+removes empty recording files. Cleanup only handles regular files with ULID
+JSONL names; unrelated files, directories, and symlinks are left untouched. Files
+are opened only when a record fits, so idle or rejected writes do not create
+empty files. Queue overflow and disk errors increment visible error/drop counters.
+The writer retries storage at a bounded rate while forwarding continues. The
+last unsynced records can be lost on a crash. Reconcile recorded roots against the chain before evaluating a trial.
 
 Alternatively, add `[block_relay]` to the existing proxy config and use `proxyd`.
 The same service then appears under `block_relay` in `/status`. Its failure does
