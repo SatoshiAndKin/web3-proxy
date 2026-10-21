@@ -20,6 +20,7 @@ COPY latency/Cargo.toml latency/Cargo.toml
 COPY latency/src latency/src
 COPY web3_proxy/Cargo.toml web3_proxy/Cargo.toml
 COPY web3_proxy/src web3_proxy/src
+COPY web3_proxy/tests web3_proxy/tests
 COPY web3_proxy_cli/Cargo.toml web3_proxy_cli/Cargo.toml
 COPY web3_proxy_cli/src web3_proxy_cli/src
 COPY web3_proxy_cli/tests web3_proxy_cli/tests
@@ -42,6 +43,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates curl libssl3 && \
+    sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
+      -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' /etc/ca-certificates.conf && \
+    update-ca-certificates && \
     useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin web3proxy && \
     install -d -o web3proxy -g web3proxy /var/lib/web3-proxy
 COPY --from=binary /usr/local/bin/web3_proxy_cli /usr/local/bin/web3_proxy_cli
