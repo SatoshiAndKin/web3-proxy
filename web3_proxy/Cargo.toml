@@ -21,7 +21,7 @@ alloy = { version = "2.5.0", default-features = false, features = [
     "kzg",
     "node-bindings",
     "provider-http",
-    "provider-ws-ring",
+    "provider-ws",
     "rpc-types-beacon",
     "rpc-types-engine",
     "reqwest",
