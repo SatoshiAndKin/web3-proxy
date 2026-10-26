@@ -199,3 +199,32 @@ Run [ethspam](https://github.com/shazow/ethspam) and [versus](https://github.com
 Give `--stop-after` a total request count. The duration form, such as `--stop-after=10s`, has a timer bug in the current `versus` release. It exits with `context deadline exceeded` and does not print the test report.
 
 The `ethspam` `--rpc` endpoint supplies current chain data for generated requests. The final `versus` URL is the load-test target. To keep the initial `eth_getBlockByNumber` request out of the proxy results, give `ethspam` a direct RPC endpoint for the same chain. The `--method` option replaces the default method map, so specify each method that you want with a positive weight. Do not set `--ratelimit` for a throughput test because it can prevent `versus` from keeping all workers busy.
+
+### Repeatable proxy-overhead measurement
+
+Build the controlled-backend server and fixed-arrival-rate client in release mode:
+
+```sh
+cargo test --release --locked -p web3_proxy --lib --no-run
+cargo build --release --locked -p web3_proxy --example rpc_latency_load
+```
+
+Run the reported library test executable with the exact ignored test name:
+
+```sh
+W3P_BENCH_WORKERS=4 W3P_BENCH_BYTES=66 W3P_BENCH_READY=/path/outside/repo/ready.json \
+  /path/to/test-executable --exact rpcs::batch_tests::latency_bench::serve --ignored --nocapture
+```
+
+The ready file contains the loopback port and process ID. The server uses the production HTTP router, three controlled backends with 128/64/32 packet slots, and the production latency estimators. It starts no Ethereum clients and calls no external providers. Stop this benchmark process with SIGINT.
+
+In a separate process, use the reported port:
+
+```sh
+target/release/examples/rpc_latency_load --url http://127.0.0.1:PORT/ \
+  --rate 10000 --requests 100000 --concurrency 256 --bytes 66
+```
+
+Match `--bytes` to `W3P_BENCH_BYTES`. Every reply must have the expected JSON-RPC ID and result. The client reports scheduled-arrival latency, including generator backlog, active HTTP time, errors, and successful requests per second. Set `--rate 0` for a saturation run. Set `--hash-group-size 64` to send groups of calls against successive cold historical hashes. `W3P_BENCH_HEADER_DELAY_MS` controls the synthetic header-fetch delay.
+
+Warm up first. Compare separate baseline and candidate binaries in balanced repeated trials under the same worker count, host load, response size, and client placement. Keep client CPU outside the proxy when measuring deployment capacity. Colocated controlled-backend results measure proxy overhead plus mock/client contention; they do not establish execution-node throughput or public-route latency. Preserve the source and binary checksums with the results outside Git.
