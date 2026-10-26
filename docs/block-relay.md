@@ -7,8 +7,6 @@ work can make a node slower. Measure the whole fleet while forwarding runs.
 
 Use the existing Geth, Reth, and Lighthouse instances. Do not start more
 Ethereum clients for this feature. Keep their existing native peer connections.
-Full blob reconstruction may require a measured data-custody change on an
-existing consensus node. That change is a separate experiment from injection.
 
 ## Cross-client contract
 
@@ -23,11 +21,11 @@ of its execution node's chain head.
 Consensus targets receive the original signed Beacon block and complete blob
 contents through `POST /eth/v2/beacon/blocks?broadcast_validation=gossip`. The
 `Eth-Consensus-Version` header selects the fork. Electra uses blob proofs; Fulu
-uses cell proofs. The relay checks each blob against its commitment and generates
-the proofs with Ethereum's trusted KZG setup. Lighthouse still checks the proposer
-signature and consensus rules. The relay does not sign blocks or need validator keys.
+uses cell proofs. The relay forwards blob and proof bytes supplied by execution
+nodes. Destination nodes check commitments, proofs, signatures, execution, and
+consensus rules. The relay does not generate proofs or need validator keys.
 
-This implementation supports Electra/Fulu blocks with the mainnet SSZ preset.
+This implementation supports the Electra/Fulu Beacon and Engine request formats.
 It checks network genesis, slot duration, configured fork versions and epochs,
 the Engine chain ID, and target support for Engine V4. It rejects unknown
 block versions. A newly advertised fork requires a configuration review; a new
@@ -40,12 +38,12 @@ assume it works. The relay does not support PoW or arbitrary EVM chains.
 Existing local Lighthouse instances + external Beacon APIs
                    │ block_gossip / block events
                    ▼
-  Race full-block reads → verify roots and execution hash
+  Race full-block reads → format Engine request
                    │
          ┌─────────┴─────────────────┐
          ▼                           ▼
-  Engine V4 payload          Race blobs → verify commitments
-         │                           │ generate fork-correct proofs
+  Engine V4 payload          Fetch Engine blobs and proofs
+         │                           │ preserve source data
          ▼                           ▼
   All execution targets       All consensus targets
          │                           │
@@ -75,27 +73,31 @@ relay. [MEV-Boost design](https://boost.flashbots.net/).
 The source requests both `block_gossip` and `block`. It falls back to `block` if
 the server rejects the combined topics. A gossip event can precede full-block
 availability. An imported event wakes the pending fetch after a 404. Reads race
-all verified sources; the first **verified full block**, not the first HTTP
-response, wins. Retry ready sources while slower requests remain pending. A
-reconnect reconciles up to eight recent ancestors by root. Configure a source's
-`cost_class` and `resources` explicitly. Free sources start immediately. Metered
-sources wait for `block_relay.rpc.metered_fallback_delay_ms` (500 ms by default)
-and receive at most two dispatched attempts per resource. A source that lacks the
-`blob` resource is never asked for complete blobs.
+all network-compatible sources; the first complete, decodable block response
+wins. Retry ready sources while slower requests remain pending. A reconnect reconciles up to eight recent ancestors by root. Configure a source's
+`cost_class` explicitly. Free sources start immediately. Metered sources wait for
+`block_relay.rpc.metered_fallback_delay_ms` (500 ms by default) and receive at most
+two dispatched block-read attempts.
 
-Local `engine_getBlobsV2` responses contain `blob` and `proofs`. The relay checks
-their shape, then checks blob commitments in order and regenerates proofs on the
-bounded proof pool. A complete, matching local response avoids the Beacon blob
-fetch; missing or invalid local blobs leave the verified Beacon fallback enabled.
+Consensus delivery fetches blob and proof data from the configured execution
+nodes: `engine_getBlobsV1` for Electra, `engine_getBlobsV2` for Fulu. It preserves
+the supplied blob and proof bytes and their order. The Beacon `/blobs` endpoint
+returns no proofs, so the relay no longer uses it to construct publications. If
+no execution source supplies the data, consensus acquisition reports failure;
+execution delivery continues independently. Nodes retain their normal peer
+connections to obtain missing data.
 
-The relay checks the complete Beacon root, execution block hash, payload
-timestamp, and transaction/blob-commitment order. It includes the parent Beacon
-root and SSZ-encoded, type-prefixed execution requests. Empty request types stay
-absent. These checks bind the data to the announced root; they do **not** verify
-the proposer signature or consensus state. Execution delivery does not wait for
-blobs. Consensus delivery waits for complete, checked blobs and locally generated
-proofs. Configure trusted sources. Destination clients retain native validation.
+The relay formats the parent Beacon root, versioned blob hashes, and SSZ-encoded,
+type-prefixed execution requests for Engine V4. Empty request types stay absent.
+It keeps the source's signed block JSON. It does not recompute Beacon roots,
+execution block hashes, blob commitments, or KZG proofs. Destination nodes own
+Ethereum validation. Configure trusted sources.
 [Engine V4 parameters](https://github.com/ethereum/execution-apis/blob/main/src/engine/prague.md#engine_newpayloadv4).
+
+When upgrading an existing relay config, remove `block_relay.proof_workers` and
+source `resources` entries. The proof worker pool and separate Beacon blob fetch
+have been removed; all Beacon sources now supply blocks. JSON work uses the
+existing bounded decoder pool.
 
 Each target has one delivery worker. It prefers recent slots, retains competing
 hashes at the same slot, and tracks delivery by hash. One target cannot block
@@ -247,7 +249,7 @@ The same instrumentation runs in observe and inject:
 
 | Measurement | Evidence and limit |
 | --- | --- |
-| `acquired`, `blob_ready` | First source announcement, verified payload availability, complete blobs and valid proofs. Execution does not wait for blobs. |
+| `acquired`, `blob_ready` | First source announcement, decoded payload availability, source-supplied blobs and proofs. Execution does not wait for blobs. |
 | `head` | Independent execution `newHeads` notification, hash, height, block timestamp, observer time and connection ID. This includes network delivery delay. It does not gate or suppress injection. |
 | `submission_started`, `submission` | Unique attempt ID, layer, target, block, serialized request bytes, call start, result and elapsed time. A timeout stays `unknown`. A missing completion is missing evidence. |
 | `observation` | Import and canonical confirmation through direct RPC or Beacon reads, probe count/errors, first probe start, last missing query and first ready response. |
@@ -275,7 +277,7 @@ after a call does not prove that the call caused it. Native peers, Lighthouse an
 another forwarder can import the same block. `VALID` verifies validity and may
 describe an already-known block. Keep these categories separate.
 
-Compare verified payload time with the independent head observation on the same
+Compare decoded payload time with the independent head observation on the same
 process clock. A positive lead shows a possible delivery opportunity. A negative
 lead means the target's head arrived first. Neither value measures time saved.
 Block timestamp to head observation uses the wall clock; verify clock quality

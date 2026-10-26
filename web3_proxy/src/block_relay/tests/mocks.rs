@@ -97,7 +97,7 @@ impl MockBeacon {
         }
     }
     pub fn add(&self, block: &payload::BeaconResponse) -> B256 {
-        let root = tree_hash::block_root(&block.data.message).unwrap();
+        let root = fixture_root(&block.data.message);
         self.state
             .lock()
             .blocks
@@ -120,8 +120,15 @@ impl MockBeacon {
         canonical: bool,
     ) -> B256 {
         use alloy_rpc_types_beacon::header::{Header, HeaderData, HeaderResponse};
-        let message = tree_hash::block_header(&block.data.message).unwrap();
-        let root = tree_hash::header(&message);
+        let root = fixture_root(&block.data.message);
+        let block_message = &block.data.message;
+        let message = alloy_rpc_types_beacon::header::BeaconBlockHeader {
+            slot: block_message.slot,
+            proposer_index: block_message.proposer_index,
+            parent_root: block_message.parent_root,
+            state_root: block_message.state_root,
+            body_root: B256::ZERO,
+        };
         self.state.lock().headers.insert(
             root,
             HeaderResponse {
@@ -159,7 +166,7 @@ async fn handle_beacon(
             &json!({"version": fork, "data": contents["signed_block"].clone()}),
         )
         .unwrap();
-        let root = tree_hash::block_root(&block.data.message).unwrap();
+        let root = fixture_root(&block.data.message);
         let (gate, status, import) = {
             let mut state = beacon.state.lock();
             state.publications.push((root, fork, contents));
@@ -269,7 +276,7 @@ impl Drop for Server {
 #[derive(Default)]
 pub struct RpcState {
     pub known: BTreeMap<B256, u64>,
-    pub blobs: BTreeMap<B256, alloy_rpc_types_engine::BlobAndProofV2>,
+    pub blobs: BTreeMap<B256, sonic_rs::Value>,
     pub blob_requests: Vec<Vec<B256>>,
     pub methods: Vec<String>,
     pub payloads: Vec<B256>,
@@ -342,15 +349,23 @@ async fn handle_rpc(State(rpc): State<MockRpc>, headers: HeaderMap, bytes: Bytes
         }
     }
     let result = match method {
-        "engine_getBlobsV2" => {
+        "engine_getBlobsV1" | "engine_getBlobsV2" => {
             let hashes: Vec<B256> = sonic_rs::from_value(&request["params"][0]).unwrap();
             let mut s = rpc.state.lock();
             s.blob_requests.push(hashes.clone());
-            let blobs: Option<Vec<_>> = hashes
-                .iter()
-                .map(|hash| s.blobs.get(hash).cloned())
-                .collect();
-            sonic_rs::to_value(&blobs).unwrap()
+            if method == "engine_getBlobsV1" {
+                let blobs: Vec<_> = hashes
+                    .iter()
+                    .map(|hash| s.blobs.get(hash).cloned())
+                    .collect();
+                sonic_rs::to_value(&blobs).unwrap()
+            } else {
+                let blobs: Option<Vec<_>> = hashes
+                    .iter()
+                    .map(|hash| s.blobs.get(hash).cloned())
+                    .collect();
+                sonic_rs::to_value(&blobs).unwrap()
+            }
         }
         "eth_chainId" => json!(format!("0x{:x}", rpc.state.lock().chain_id)),
         "engine_exchangeCapabilities" => {

@@ -6345,7 +6345,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
- "tree_hash",
  "ulid",
  "url",
 ]

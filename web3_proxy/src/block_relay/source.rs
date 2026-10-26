@@ -1,5 +1,5 @@
 use super::{
-    config::{CostClass, Network, Resource, Source, SLOTS_PER_EPOCH},
+    config::{CostClass, Network, Source, SLOTS_PER_EPOCH},
     transport,
 };
 use alloy::primitives::B256;
@@ -24,7 +24,6 @@ pub(super) async fn race_sources<T, F, Fut>(
     sources: &[Arc<BeaconSource>],
     deadline: Instant,
     notify: &tokio::sync::Notify,
-    resource: Resource,
     metered_delay: Duration,
     read: F,
 ) -> Result<(T, String)>
@@ -45,7 +44,6 @@ where
             for (index, source) in sources.iter().enumerate() {
                 if in_flight[index]
                     || !source.verified.load(Ordering::Acquire)
-                    || !source.resources.contains(&resource)
                     || (source.cost_class == CostClass::Metered
                         && (metered_in_flight
                             || Instant::now() < started + metered_delay
@@ -96,7 +94,6 @@ pub struct BeaconSource {
     pub name: String,
     pub(super) http: transport::BeaconHttp,
     pub(super) cost_class: CostClass,
-    pub(super) resources: Vec<Resource>,
     pub verified: AtomicBool,
 }
 impl BeaconSource {
@@ -130,7 +127,6 @@ impl BeaconSource {
                 &config.headers,
             )?),
             cost_class: config.cost_class,
-            resources: config.resources.clone(),
             verified: AtomicBool::new(false),
         })
     }
