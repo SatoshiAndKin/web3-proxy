@@ -135,7 +135,7 @@ impl<'de> Deserialize<'de> for JsonRpcRequestEnum {
                 let mut batch: Vec<SingleRequest> =
                     Vec::with_capacity(seq.size_hint().unwrap_or(10));
 
-                while let Ok(Some(s)) = seq.next_element::<SingleRequest>() {
+                while let Some(s) = seq.next_element::<SingleRequest>()? {
                     batch.push(s);
                 }
 
@@ -237,6 +237,31 @@ mod tests {
         assert_eq!(requests[3].params, json!(null));
         assert_eq!(requests[4].id.as_str(), Some("7"));
         assert_eq!(requests[4].params, json!([]));
+    }
+
+    #[test]
+    fn invalid_batch_entries_do_not_discard_other_requests() {
+        let valid = r#"{"jsonrpc":"2.0","id":7,"method":"eth_call","params":[{},"latest"]}"#;
+        for invalid in [
+            "null",
+            "1",
+            "{}",
+            r#"{"jsonrpc":"2.0","id":8,"params":[]}"#,
+            r#"{"jsonrpc":"2.0","id":8,"method":42,"params":[]}"#,
+            r#"{"jsonrpc":"2.0","id":8,"id":9,"method":"eth_call","params":[]}"#,
+        ] {
+            for payload in [
+                format!("[{invalid}]"),
+                format!("[{valid},{invalid}]"),
+                format!("[{invalid},{valid}]"),
+                format!("[{valid},{invalid},{valid}]"),
+            ] {
+                assert!(
+                    sonic_rs::from_str::<JsonRpcRequestEnum>(&payload).is_err(),
+                    "invalid batch entry was discarded: {payload}"
+                );
+            }
+        }
     }
 
     #[test]
