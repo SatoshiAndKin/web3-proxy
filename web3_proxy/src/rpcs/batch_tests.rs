@@ -1289,6 +1289,59 @@ async fn batch_failure_uses_another_backend_without_changing_the_selected_block(
 }
 
 #[tokio::test]
+async fn batch_queued_deadline_expires_a_middle_call_and_preserves_later_calls() {
+    super::test_support::with_cleanup(async {
+        let mut h = Harness::new(1, 64).await;
+        let held = h.start(1);
+        let occupied = h.next().await;
+        let mut requests = Vec::new();
+        for (index, lifetime) in [60, 10, 60].into_iter().enumerate() {
+            requests.push(
+                ValidatedRequest::new_with_app(
+                    &h.app,
+                    ProxyMode::Best,
+                    Some(Duration::from_secs(lifetime)),
+                    client_call(index).into(),
+                    h.app.balanced_rpcs.head_block(),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let deadline = requests[1].expire_at();
+        let app = h.app.clone();
+        let task = super::test_support::spawn(async move {
+            app.proxy_eth_call_batch(requests).await.unwrap().0
+        });
+        h.quiet().await;
+        advance_to(deadline).await;
+        occupied.succeed();
+        assert_answers(held.await.unwrap(), 1);
+        let packet = h.next().await;
+        let data: Vec<_> = packet_params(&packet)
+            .iter()
+            .map(|params| params[0]["data"].clone())
+            .collect();
+        assert_eq!(data, vec![json!("0x0000"), json!("0x0002")]);
+        packet.succeed();
+        let response =
+            serde_json::from_str(&sonic_rs::to_string(&task.await.unwrap()).unwrap()).unwrap();
+        assert_timeout_responses(
+            response,
+            json!([
+                {"jsonrpc":"2.0", "id":0, "result":"0x0000"},
+                timeout_answer(json!(1)),
+                {"jsonrpc":"2.0", "id":0, "result":"0x0002"}
+            ]),
+        );
+        h.quiet().await;
+        h.idle();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn batch_earliest_deadline_expires_only_the_call_without_remaining_time() {
     super::test_support::with_cleanup(async {
         let mut h = Harness::new(1, 64).await;

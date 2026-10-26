@@ -5,7 +5,8 @@ use crate::rpcs::one::Web3Rpc;
 use crate::rpcs::request::{OpenRequestHandle, OpenRequestResult};
 use futures::{future::select_all, stream::FuturesUnordered, StreamExt};
 use hashbrown::HashSet;
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 use tokio::time::{sleep_until, Instant};
 
@@ -46,6 +47,97 @@ impl BatchCall {
     }
 }
 
+// Membership lets an expired call leave the queue without scanning unrelated
+// calls. Deadlines never change on retry: keep one heap entry per original call,
+// including submitted calls, until its deadline. Successful packets need no heap
+// removals, and a retry returns to the back of the common queue.
+struct PendingCalls {
+    indices: VecDeque<usize>,
+    queued: Vec<bool>,
+    deadlines: BinaryHeap<Reverse<(Instant, usize)>>,
+    len: usize,
+}
+
+impl PendingCalls {
+    fn new(calls: &[BatchCall]) -> Self {
+        Self {
+            indices: (0..calls.len()).collect(),
+            queued: vec![true; calls.len()],
+            deadlines: calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| Reverse((call.request.expire_at(), index)))
+                .collect(),
+            len: calls.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &usize> {
+        self.indices.iter().filter(|&&index| self.queued[index])
+    }
+
+    fn remove(&mut self, index: usize) -> bool {
+        if !self.queued[index] {
+            return false;
+        }
+        self.queued[index] = false;
+        self.len -= 1;
+        true
+    }
+
+    fn push_back(&mut self, index: usize) {
+        debug_assert!(!self.queued[index]);
+        self.queued[index] = true;
+        self.len += 1;
+        self.indices.push_back(index);
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines.peek().map(|entry| entry.0 .0)
+    }
+
+    fn expire(&mut self, now: Instant, calls: &mut [BatchCall]) {
+        while self.next_deadline().is_some_and(|deadline| deadline <= now) {
+            let Reverse((_, index)) = self.deadlines.pop().unwrap();
+            if self.remove(index) {
+                calls[index].finish(Err(Web3ProxyError::Timeout(None)));
+            }
+        }
+    }
+
+    fn take(&mut self, count: usize, mut eligible: impl FnMut(usize) -> bool) -> Vec<usize> {
+        let mut selected = Vec::with_capacity(count.min(self.len));
+        let mut skipped = Vec::new();
+        while selected.len() < count {
+            let Some(index) = self.indices.pop_front() else {
+                break;
+            };
+            if !self.queued[index] {
+                continue;
+            }
+            if eligible(index) {
+                self.remove(index);
+                selected.push(index);
+            } else {
+                skipped.push(index);
+            }
+        }
+        // Preserve the order of calls that cannot use this backend.
+        for index in skipped.into_iter().rev() {
+            self.indices.push_front(index);
+        }
+        selected
+    }
+}
+
 async fn send_packet(
     handle: OpenRequestHandle,
     indices: Vec<usize>,
@@ -61,7 +153,7 @@ async fn send_packet(
 }
 
 impl App {
-    pub(super) async fn proxy_eth_call_batch(
+    pub(crate) async fn proxy_eth_call_batch(
         self: &Arc<Self>,
         requests: Vec<Arc<ValidatedRequest>>,
     ) -> Web3ProxyResult<(Vec<ParsedResponse>, Vec<Arc<Web3Rpc>>)> {
@@ -74,7 +166,9 @@ impl App {
                 exhausted: HashSet::new(),
             })
             .collect::<Vec<_>>();
-        let mut pending: VecDeque<_> = (0..calls.len()).collect();
+        let batch_deadline = calls.iter().map(|call| call.request.expire_at()).max();
+        let mut pending = PendingCalls::new(&calls);
+        let mut exhausted_calls: HashSet<usize> = HashSet::new();
         let mut running = FuturesUnordered::new();
         let mut ready = Vec::new();
         let mut updates = self.balanced_rpcs.watch_ranked_rpcs.subscribe();
@@ -82,25 +176,19 @@ impl App {
         let mut found_backend = false;
 
         while !pending.is_empty() || !running.is_empty() {
-            pending.retain(|&index| {
-                if calls[index].request.expired() {
-                    calls[index].finish(Err(Web3ProxyError::Timeout(None)));
-                    false
-                } else {
-                    true
-                }
-            });
+            pending.expire(Instant::now(), &mut calls);
             if pending.is_empty() && running.is_empty() {
                 break;
             }
             let mut wait_for_capacity = Vec::new();
             let mut wait_for_sync = Vec::new();
-            let mut wake_at = pending.iter().map(|&i| calls[i].request.expire_at()).min();
+            let mut wake_at = pending.next_deadline();
 
-            if let Some(&first) = pending.front() {
+            let first = pending.iter().next().copied();
+            if let Some(first) = first {
                 let request = &calls[first].request;
                 if !found_backend && request.connect_timeout() {
-                    for index in pending.drain(..) {
+                    for index in pending.take(pending.len(), |_| true) {
                         let error = calls[index]
                             .last_error
                             .take()
@@ -121,7 +209,7 @@ impl App {
                     Ok(rpcs) => Some(rpcs),
                     Err(error) => {
                         let error = Arc::new(error);
-                        for &index in &pending {
+                        for &index in pending.iter() {
                             calls[index].last_error = Some(error.clone());
                         }
                         None
@@ -132,11 +220,15 @@ impl App {
                     .map(|rpcs| rpcs.connections())
                     .unwrap_or_default();
                 if !connections.is_empty() {
-                    pending.retain(|&index| {
+                    exhausted_calls.retain(|&index| {
+                        if !pending.queued[index] {
+                            return calls[index].response.is_none();
+                        }
                         if connections
                             .iter()
                             .all(|rpc| calls[index].exhausted.contains(&rpc.name))
                         {
+                            pending.remove(index);
                             let error = calls[index]
                                 .last_error
                                 .take()
@@ -214,7 +306,8 @@ impl App {
             if ready.iter().any(OpenRequestHandle::supports_batch) {
                 ready.retain(OpenRequestHandle::supports_batch);
             }
-            if !ready.is_empty() {
+            let dispatched = !ready.is_empty();
+            if dispatched {
                 let lengths = weighted_batch_lengths(
                     pending.len(),
                     ready.iter().map(OpenRequestHandle::batch_capacity),
@@ -223,17 +316,9 @@ impl App {
                     let rpc = handle.clone_connection();
                     while remaining > 0 {
                         let count = remaining.min(handle.batch_size());
-                        let mut indices = Vec::with_capacity(count);
-                        pending.retain(|&index| {
-                            if indices.len() < count
-                                && !calls[index].exhausted.contains(&rpc.name)
+                        let indices = pending.take(count, |index| {
+                            !calls[index].exhausted.contains(&rpc.name)
                                 && rpc.can_submit(&calls[index].request, false)
-                            {
-                                indices.push(index);
-                                false
-                            } else {
-                                true
-                            }
                         });
                         if indices.is_empty() {
                             break;
@@ -261,21 +346,15 @@ impl App {
                         }
                     }
                 }
-                // Reserve all immediately available slots before waiting. Packet
-                // futures own the reservations, including before their first poll.
-                continue;
             }
             if pending.is_empty() && running.is_empty() {
                 break;
             }
-            let deadline = wake_at.unwrap_or_else(|| {
-                calls
-                    .iter()
-                    .map(|call| call.request.expire_at())
-                    .max()
-                    .unwrap()
-            });
+            let deadline = wake_at.or(batch_deadline).expect("unfinished calls exist");
             tokio::select! {
+                // Start queued packets before another admission pass. Continue
+                // admission without blocking when no response is ready yet.
+                biased;
                 packet = running.next(), if !running.is_empty() => {
                     let (indices, rpc, result) = packet.expect("running packets exist");
                     let outcomes = match result {
@@ -287,15 +366,20 @@ impl App {
                     };
                     for (index, outcome) in indices.into_iter().zip(outcomes) {
                         match outcome {
-                            Ok(response) => calls[index].finish(Ok(response)),
+                            Ok(response) => {
+                                exhausted_calls.remove(&index);
+                                calls[index].finish(Ok(response));
+                            },
                             Err(error) => {
                                 if calls[index].request.expired() {
+                                    exhausted_calls.remove(&index);
                                     calls[index].finish(Err(Web3ProxyError::Timeout(None)));
                                 } else {
                                     let cause = match &error { Web3ProxyError::Arc(error) => error.as_ref(), error => error };
                                     if !matches!(cause, Web3ProxyError::NoHandleReady | Web3ProxyError::Timeout(_))
                                         && rpc.next_available(Instant::now()) <= Instant::now() {
                                         calls[index].exhausted.insert(rpc.name.clone());
+                                        exhausted_calls.insert(index);
                                     }
                                     calls[index].last_error = Some(Arc::new(error));
                                     pending.push_back(index);
@@ -304,6 +388,7 @@ impl App {
                         }
                     }
                 }
+                _ = std::future::ready(()), if dispatched => {}
                 handle = async { select_all(wait_for_capacity).await.0 }, if !wait_for_capacity.is_empty() => {
                     if let Ok(handle) = handle { ready.push(handle); }
                 }
