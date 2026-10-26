@@ -1,13 +1,10 @@
 //! Convert a complete Beacon block to a standard Engine request.
-use alloy::consensus::{Transaction, TxEnvelope};
-use alloy::eips::eip4844::{kzg_to_versioned_hash, Blob, Bytes48};
+use alloy::eips::eip4844::{kzg_to_versioned_hash, Bytes48};
 use alloy::primitives::{Bytes, B256};
 use alloy::rpc::types::beacon::block::{BeaconBlockBodyElectra, BlockResponse};
 use alloy::rpc::types::engine::{ExecutionPayload, ExecutionPayloadV3};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
-
-use super::config::Network;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -39,7 +36,7 @@ impl RelayPayload {
             .map(|commitment| kzg_to_versioned_hash(commitment.as_slice()))
             .collect()
     }
-    pub fn decode(bytes: &[u8], expected_root: B256, network: &Network) -> Result<Self> {
+    pub fn decode(bytes: &[u8], root: B256) -> Result<Self> {
         // Check the version before decoding a body whose format a future fork can change.
         #[derive(Deserialize)]
         struct Version {
@@ -62,27 +59,16 @@ impl RelayPayload {
             );
         }
         let response: BeaconResponse = sonic_rs::from_slice(bytes)?;
-        let message = &response.data.message;
-        ensure!(
-            network
-                .fork_at(message.slot)
-                .is_some_and(|f| f.name == version.version),
-            "fork schedule mismatch"
-        );
-        let ExecutionPayload::V3(payload) = &message.body.execution_payload.0 else {
-            anyhow::bail!("expected ExecutionPayloadV3");
-        };
-        ensure!(
-            payload.payload_inner.payload_inner.timestamp == network.timestamp(message.slot)?,
-            "payload timestamp mismatch"
-        );
-        let root = super::tree_hash::block_root(message)?;
-        ensure!(root == expected_root, "Beacon block root mismatch");
-        Self::from_beacon(response, root)
+        let signed_block =
+            bytes::Bytes::copy_from_slice(sonic_rs::get(bytes, ["data"])?.as_raw_str().as_bytes());
+        Self::from_beacon(response, root, signed_block)
     }
 
-    fn from_beacon(response: BeaconResponse, root: B256) -> Result<Self> {
-        let signed_block = sonic_rs::to_vec(&response.data)?.into();
+    fn from_beacon(
+        response: BeaconResponse,
+        root: B256,
+        signed_block: bytes::Bytes,
+    ) -> Result<Self> {
         let message = response.data.message;
         let ExecutionPayload::V3(payload) = message.body.execution_payload.0 else {
             anyhow::bail!("expected ExecutionPayloadV3");
@@ -94,7 +80,6 @@ impl RelayPayload {
             .iter()
             .map(|c| kzg_to_versioned_hash(c.as_slice()))
             .collect();
-        validate_execution(&payload, message.parent_root, &requests, &hashes)?;
         let inner = &payload.payload_inner.payload_inner;
         let hash = inner.block_hash;
         let parent_hash = inner.parent_hash;
@@ -134,7 +119,7 @@ impl RelayPayload {
     }
 }
 
-/// Complete, locally verified publication contents. Construct this off the async runtime.
+/// Publication contents assembled from source data without Ethereum validation.
 #[derive(Debug)]
 pub struct ConsensusPayload {
     pub block: std::sync::Arc<RelayPayload>,
@@ -142,41 +127,11 @@ pub struct ConsensusPayload {
 }
 
 impl ConsensusPayload {
-    pub fn from_blobs(block: std::sync::Arc<RelayPayload>, blobs: Vec<Bytes>) -> Result<Self> {
-        use alloy::eips::eip4844::{c_kzg, env_settings::EnvKzgSettings, AsAlloy, AsCkzg};
-        ensure!(
-            blobs.len() == block.blob_commitments.len(),
-            "blob count mismatch"
-        );
-        ensure!(
-            matches!(block.fork.as_str(), "electra" | "fulu"),
-            "unsupported Beacon fork"
-        );
-        let mut proofs = Vec::<Bytes48>::new();
-        for (blob, expected) in blobs.iter().zip(&block.blob_commitments) {
-            // Deserialize into heap-backed bytes, then borrow the fixed-size KZG type.
-            // Deserializing a 128-KiB inline array can overflow a Tokio worker's stack.
-            let blob: &Blob = blob
-                .as_ref()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid blob length"))?;
-            let settings = EnvKzgSettings::Default.get();
-            let commitment = settings.blob_to_kzg_commitment(blob.as_ckzg())?;
-            ensure!(
-                commitment.to_bytes().as_ref() == expected.as_slice(),
-                "blob commitment mismatch"
-            );
-            if block.fork == "fulu" {
-                let (_, cell_proofs) = settings.compute_cells_and_kzg_proofs(blob.as_ckzg())?;
-                proofs.extend_from_slice(c_kzg::KzgProof::slice_as_alloy(cell_proofs.as_ref()));
-            } else {
-                proofs.push(Bytes48::from_ckzg(
-                    settings
-                        .compute_blob_kzg_proof(blob.as_ckzg(), expected.as_ckzg())?
-                        .to_bytes(),
-                ));
-            }
-        }
+    pub fn from_blobs(
+        block: std::sync::Arc<RelayPayload>,
+        blobs: Vec<Bytes>,
+        proofs: Vec<Bytes48>,
+    ) -> Result<Self> {
         #[derive(Serialize)]
         struct Contents<'a> {
             signed_block: sonic_rs::LazyValue<'a>,
@@ -191,31 +146,4 @@ impl ConsensusPayload {
         let body = sonic_rs::to_vec(&contents)?.into();
         Ok(Self { block, body })
     }
-}
-
-fn validate_execution(
-    payload: &ExecutionPayloadV3,
-    parent_root: B256,
-    requests: &alloy::eips::eip7685::Requests,
-    expected_hashes: &[B256],
-) -> Result<()> {
-    let mut block = payload.clone().try_into_block::<TxEnvelope>()?;
-    block.header.parent_beacon_block_root = Some(parent_root);
-    block.header.requests_hash = Some(requests.requests_hash());
-    ensure!(
-        block.header.hash_slow() == payload.payload_inner.payload_inner.block_hash,
-        "execution block hash mismatch"
-    );
-    let hashes: Vec<_> = block
-        .body
-        .transactions
-        .iter()
-        .flat_map(|tx| tx.blob_versioned_hashes().unwrap_or_default())
-        .copied()
-        .collect();
-    ensure!(
-        hashes == expected_hashes,
-        "blob commitments do not match transactions"
-    );
-    Ok(())
 }

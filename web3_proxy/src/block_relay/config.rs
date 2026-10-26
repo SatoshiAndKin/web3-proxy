@@ -22,8 +22,6 @@ pub struct Config {
     pub sources: BTreeMap<String, Source>,
     pub execution_targets: BTreeMap<String, ExecutionTarget>,
     pub consensus_targets: BTreeMap<String, ConsensusTarget>,
-    #[serde(default = "proof_workers")]
-    pub proof_workers: usize,
     #[serde(default = "cache_bytes")]
     pub cache_max_bytes: u64,
     #[serde(default)]
@@ -45,9 +43,6 @@ impl Default for RpcPolicy {
 }
 fn metered_fallback_delay_ms() -> u64 {
     500
-}
-fn proof_workers() -> usize {
-    2
 }
 fn cache_bytes() -> u64 {
     128 * 1024 * 1024
@@ -104,8 +99,6 @@ pub struct Source {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub cost_class: CostClass,
-    #[serde(default = "default_source_resources")]
-    pub resources: Vec<Resource>,
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -113,15 +106,6 @@ pub enum CostClass {
     #[default]
     Free,
     Metered,
-}
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum Resource {
-    Block,
-    Blob,
-}
-fn default_source_resources() -> Vec<Resource> {
-    vec![Resource::Block, Resource::Blob]
 }
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -180,10 +164,6 @@ impl Config {
             "relay supports at most 16 sources and 64 targets per process"
         );
         ensure!(
-            (1..=16).contains(&self.proof_workers),
-            "proof workers must be between 1 and 16"
-        );
-        ensure!(
             self.network.seconds_per_slot > 0 && self.network.seconds_per_slot <= 60,
             "invalid slot duration"
         );
@@ -226,16 +206,6 @@ impl Config {
                     beacons.insert(endpoint.to_string()),
                     "duplicate Beacon target endpoint"
                 );
-            }
-        }
-        for source in self.sources.values() {
-            ensure!(
-                !source.resources.is_empty(),
-                "source must advertise a resource"
-            );
-            let mut resources = std::collections::BTreeSet::new();
-            for resource in &source.resources {
-                ensure!(resources.insert(*resource), "source resource listed twice");
             }
         }
         Ok(())

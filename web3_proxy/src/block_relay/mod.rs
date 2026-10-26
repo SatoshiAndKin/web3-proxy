@@ -11,7 +11,6 @@ mod status;
 mod target;
 mod telemetry;
 pub mod transport;
-mod tree_hash;
 pub use service::BlockRelay;
 use service::Work;
 pub use stats::Sample;

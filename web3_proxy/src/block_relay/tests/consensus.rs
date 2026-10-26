@@ -3,133 +3,72 @@ use crate::block_relay::{
     consensus::{ConsensusTarget, ConsensusWork},
     payload::ConsensusPayload,
 };
-use alloy::{
-    consensus::{SignableTransaction, TxEip4844, TxEnvelope},
-    eips::{
-        eip2718::Encodable2718,
-        eip4844::{self, env_settings::EnvKzgSettings, AsCkzg, Blob, Bytes48},
-    },
-    primitives::{Signature, U256},
-};
+use alloy::eips::eip4844::{self, Bytes48};
 
 fn blob_block(
     network: &config::Network,
     fork: &str,
 ) -> (payload::BeaconResponse, Vec<alloy::primitives::Bytes>) {
-    let bytes: alloy::primitives::Bytes = vec![0; eip4844::BYTES_PER_BLOB].into();
-    let blob: &Blob = bytes.as_ref().try_into().unwrap();
-    let commitment = EnvKzgSettings::Default
-        .get()
-        .blob_to_kzg_commitment(blob.as_ckzg())
-        .unwrap()
-        .to_bytes();
-    let commitment = Bytes48::from_ckzg(commitment);
     let mut block = beacon(network);
     block.version = fork.into();
     block.data.signature = alloy::primitives::FixedBytes::repeat_byte(7);
-    block.data.message.body.blob_kzg_commitments = vec![commitment];
-    let tx = TxEip4844 {
-        chain_id: 1,
-        gas_limit: 21_000,
-        max_fee_per_gas: 2,
-        max_fee_per_blob_gas: 1,
-        blob_versioned_hashes: vec![eip4844::kzg_to_versioned_hash(commitment.as_slice())],
-        ..Default::default()
-    };
-    let tx: TxEnvelope = tx
-        .into_signed(Signature::new(U256::from(1), U256::from(2), false))
-        .into();
-    let ExecutionPayload::V3(p) = &mut block.data.message.body.execution_payload.0 else {
-        unreachable!()
-    };
-    p.payload_inner.payload_inner.transactions = vec![tx.encoded_2718().into()];
-    p.blob_gas_used = eip4844::DATA_GAS_PER_BLOB;
+    block.data.message.body.blob_kzg_commitments = vec![Bytes48::repeat_byte(3)];
     rehash_execution(&mut block);
-    (block, vec![bytes])
+    (block, vec![vec![255; eip4844::BYTES_PER_BLOB].into()])
 }
 
 #[test]
-fn consensus_contents_keep_the_exact_signature_and_validate_electra_and_fulu_proofs() {
+fn consensus_contents_preserve_source_blocks_blobs_and_proofs_without_validation() {
     for fork in ["electra", "fulu"] {
-        let mut network = network();
-        network.forks[0].name = fork.into();
+        let network = network();
         let (response, blobs) = blob_block(&network, fork);
         let block = Arc::new(decode(&response, &network));
-        let packet = ConsensusPayload::from_blobs(block.clone(), blobs.clone()).unwrap();
+        // Deliberately invalid proof and blob bytes must reach the destination unchanged.
+        let count = if fork == "fulu" {
+            alloy::eips::eip7594::CELLS_PER_EXT_BLOB
+        } else {
+            1
+        };
+        let proofs = (0..count)
+            .map(|index| Bytes48::repeat_byte(index as u8))
+            .collect::<Vec<_>>();
+        let packet = ConsensusPayload::from_blobs(block, blobs.clone(), proofs.clone()).unwrap();
         let contents: sonic_rs::Value = sonic_rs::from_slice(&packet.body).unwrap();
         assert_eq!(
             contents["signed_block"],
             sonic_rs::to_value(&response.data).unwrap()
         );
         assert_eq!(contents["blobs"], sonic_rs::to_value(&blobs).unwrap());
-        let proofs: Vec<Bytes48> = sonic_rs::from_value(&contents["kzg_proofs"]).unwrap();
-        let blob: &Blob = blobs[0].as_ref().try_into().unwrap();
-        if fork == "electra" {
-            assert_eq!(proofs.len(), 1);
-            assert!(EnvKzgSettings::Default
-                .get()
-                .verify_blob_kzg_proof(
-                    blob.as_ckzg(),
-                    block.blob_commitments[0].as_ckzg(),
-                    proofs[0].as_ckzg()
-                )
-                .unwrap());
-        } else {
-            assert_eq!(proofs.len(), alloy::eips::eip7594::CELLS_PER_EXT_BLOB);
-            let settings = EnvKzgSettings::Default.get();
-            let cells = settings.compute_cells(blob.as_ckzg()).unwrap();
-            let commitments = vec![block.blob_commitments[0]; proofs.len()];
-            let indices = (0..proofs.len() as u64).collect::<Vec<_>>();
-            assert!(settings
-                .verify_cell_kzg_proof_batch(
-                    Bytes48::slice_as_ckzg(&commitments),
-                    &indices,
-                    cells.as_ref(),
-                    Bytes48::slice_as_ckzg(&proofs)
-                )
-                .unwrap());
-        }
-        assert_eq!(
-            packet.block.beacon_root,
-            tree_hash::block_root(&response.data.message).unwrap()
-        );
+        assert_eq!(contents["kzg_proofs"], sonic_rs::to_value(&proofs).unwrap());
     }
 }
 
 #[test]
-fn consensus_rejects_missing_wrong_and_invalid_field_element_blobs() {
+fn consensus_publication_preserves_raw_signed_block_json() {
     let network = network();
-    let (response, mut blobs) = blob_block(&network, "electra");
-    let block = Arc::new(decode(&response, &network));
-    assert_eq!(
-        ConsensusPayload::from_blobs(block.clone(), Vec::new())
-            .unwrap_err()
-            .to_string(),
-        "blob count mismatch"
+    let response = beacon(&network);
+    let signed = format!(
+        r#"{{ "message": {}, "signature": {}, "source_extension": {{ "keep": true }} }}"#,
+        sonic_rs::to_string(&response.data.message).unwrap(),
+        sonic_rs::to_string(&response.data.signature).unwrap(),
     );
-    let mut wrong = blobs[0].to_vec();
-    wrong[31] = 1;
-    blobs[0] = wrong.clone().into();
-    assert_eq!(
-        ConsensusPayload::from_blobs(block.clone(), blobs.clone())
-            .unwrap_err()
-            .to_string(),
-        "blob commitment mismatch"
-    );
-    wrong[0] = 255;
-    blobs[0] = wrong.into();
-    assert!(
-        ConsensusPayload::from_blobs(block, blobs).is_err(),
-        "out-of-field blob must fail KZG validation"
-    );
+    let source = format!(r#"{{"version":"electra","data":{signed}}}"#);
+    let block = Arc::new(payload::RelayPayload::decode(source.as_bytes(), B256::ZERO).unwrap());
+    let packet = ConsensusPayload::from_blobs(block, Vec::new(), Vec::new()).unwrap();
+    let forwarded = sonic_rs::get(packet.body.as_ref(), ["signed_block"]).unwrap();
+    assert_eq!(forwarded.as_raw_str(), signed);
 }
 
 #[test]
 fn empty_blob_blocks_publish_empty_proof_and_blob_arrays() {
     let network = network();
     let response = beacon(&network);
-    let packet =
-        ConsensusPayload::from_blobs(Arc::new(decode(&response, &network)), Vec::new()).unwrap();
+    let packet = ConsensusPayload::from_blobs(
+        Arc::new(decode(&response, &network)),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
     let contents: sonic_rs::Value = sonic_rs::from_slice(&packet.body).unwrap();
     assert_eq!(
         contents,
@@ -159,50 +98,39 @@ async fn start_relay(
 }
 
 #[tokio::test]
-async fn standard_engine_blobs_avoid_paid_fetch_and_wrong_blobs_require_verified_fallback() {
-    for local_matches in [true, false] {
-        let network = network();
-        let (block, blobs) = blob_block(&network, "electra");
-        let payload = decode(&block, &network);
-        let hashes = payload.versioned_hashes();
+async fn relays_engine_blob_and_proof_bytes_and_leaves_rejection_to_consensus_nodes() {
+    for fork in ["electra", "fulu"] {
+        let mut network = network();
+        network.forks[0].name = fork.into();
+        let (block, blobs) = blob_block(&network, fork);
+        let hashes = decode(&block, &network).versioned_hashes();
         let source = MockBeacon::new(network.clone());
         let source_server = Server::beacon(source.clone()).await;
         let root = source.add(&block);
-        source
-            .state
-            .lock()
-            .blobs
-            .insert(root, sonic_rs::to_vec(&json!({"data": blobs})).unwrap());
         let engine = MockRpc::new();
         let engine_server = Server::rpc(engine.clone()).await;
-        let mut local_bytes = blobs[0].to_vec();
-        if !local_matches {
-            local_bytes[31] = 1;
-        }
-        let local_blob: &Blob = local_bytes.as_slice().try_into().unwrap();
-        let (_, proofs) = EnvKzgSettings::Default
-            .get()
-            .compute_cells_and_kzg_proofs(local_blob.as_ckzg())
-            .unwrap();
-        engine.state.lock().blobs.insert(
-            hashes[0],
-            alloy_rpc_types_engine::BlobAndProofV2 {
-                blob: Box::new(*local_blob),
-                proofs: proofs
-                    .into_iter()
-                    .map(|proof| Bytes48::from_ckzg(proof.to_bytes()))
-                    .collect(),
-            },
-        );
+        let count = if fork == "fulu" {
+            alloy::eips::eip7594::CELLS_PER_EXT_BLOB
+        } else {
+            1
+        };
+        let proofs = (0..count)
+            .map(|i| Bytes48::repeat_byte(i as u8))
+            .collect::<Vec<_>>();
+        let data = if fork == "fulu" {
+            json!({"blob": blobs[0], "proofs": proofs})
+        } else {
+            json!({"blob": blobs[0], "proof": proofs[0]})
+        };
+        engine.state.lock().blobs.insert(hashes[0], data);
         let target = MockBeacon::new(network.clone());
+        target.state.lock().publication_status = 400;
         let target_server = Server::beacon(target.clone()).await;
         let mut config = relay_config(
             network,
-            &[("alchemy", &source_server.url)],
+            &[("source", &source_server.url)],
             &[("el", &engine_server.url)],
         );
-        config.sources.get_mut("alchemy").unwrap().cost_class = config::CostClass::Metered;
-        config.rpc.metered_fallback_delay_ms = 0;
         config
             .consensus_targets
             .insert("cl".into(), target_config(&target_server.url));
@@ -210,19 +138,18 @@ async fn standard_engine_blobs_avoid_paid_fetch_and_wrong_blobs_require_verified
         let (relay, stop, run) = start_relay(&config).await;
         until(|| source.events.receiver_count() == 1).await;
         source.announce("block_gossip", root, block.data.message.slot);
-        until(|| target.state.lock().publications.len() == 1).await;
+        until(|| relay.snapshot()["consensus_targets"]["cl"]["rejected"].as_u64() == Some(1)).await;
         stop.send(()).unwrap();
         run.await.unwrap();
         assert_eq!(engine.state.lock().blob_requests, vec![hashes]);
         assert_eq!(engine.state.lock().bad_jwt, 0);
-        assert_eq!(
-            source.state.lock().blob_reads,
-            if local_matches {
-                Vec::new()
-            } else {
-                vec![root]
-            }
-        );
+        let method = if fork == "fulu" {
+            "engine_getBlobsV2"
+        } else {
+            "engine_getBlobsV1"
+        };
+        assert!(engine.state.lock().methods.iter().any(|m| m == method));
+        assert!(source.state.lock().blob_reads.is_empty());
         let state = target.state.lock();
         assert_eq!(state.publications[0].0, root);
         assert_eq!(
@@ -233,8 +160,47 @@ async fn standard_engine_blobs_avoid_paid_fetch_and_wrong_blobs_require_verified
             state.publications[0].2["blobs"],
             sonic_rs::to_value(&blobs).unwrap()
         );
-        assert_eq!(relay.snapshot()["consensus_acquired"].as_u64(), Some(1));
+        assert_eq!(
+            state.publications[0].2["kzg_proofs"],
+            sonic_rs::to_value(&proofs).unwrap()
+        );
     }
+}
+
+#[tokio::test]
+async fn missing_engine_blobs_do_not_fetch_proofless_beacon_blobs_or_block_execution_delivery() {
+    let mut network = network();
+    network.forks[0].name = "fulu".into();
+    let (block, _) = blob_block(&network, "fulu");
+    let hash = decode(&block, &network).hash;
+    let source = MockBeacon::new(network.clone());
+    let source_server = Server::beacon(source.clone()).await;
+    let root = source.add(&block);
+    let engine = MockRpc::new();
+    let engine_server = Server::rpc(engine.clone()).await;
+    let target = MockBeacon::new(network.clone());
+    let target_server = Server::beacon(target.clone()).await;
+    let mut config = relay_config(
+        network,
+        &[("source", &source_server.url)],
+        &[("el", &engine_server.url)],
+    );
+    config
+        .consensus_targets
+        .insert("cl".into(), target_config(&target_server.url));
+    config.mode = config::Mode::Inject;
+    let (relay, stop, run) = start_relay(&config).await;
+    until(|| source.events.receiver_count() == 1).await;
+    source.announce("block_gossip", root, block.data.message.slot);
+    until(|| {
+        relay.snapshot()["consensus_acquisition_failed"].as_u64() == Some(1)
+            && engine.payload_hashes().contains(&hash)
+    })
+    .await;
+    stop.send(()).unwrap();
+    run.await.unwrap();
+    assert!(source.state.lock().blob_reads.is_empty());
+    assert!(target.state.lock().publications.is_empty());
 }
 
 #[tokio::test]
@@ -360,16 +326,25 @@ async fn unavailable_blobs_do_not_delay_execution_and_observe_mode_never_publish
     let (relay, stop, run) = start_relay(&config).await;
     until(|| source.events.receiver_count() == 1).await;
     source.announce("block_gossip", root, block.data.message.slot);
-    until(|| engine.payload_hashes() == [hash] && !source.state.lock().blob_reads.is_empty()).await;
+    until(|| {
+        engine.payload_hashes() == [hash]
+            && relay.snapshot()["consensus_acquisition_failed"].as_u64() == Some(1)
+    })
+    .await;
+    assert!(source.state.lock().blob_reads.is_empty());
     assert_eq!(target.state.lock().publications.len(), 0);
     config.mode = config::Mode::Observe;
     relay.apply(Some(&config)).await.unwrap();
-    source
-        .state
-        .lock()
-        .blobs
-        .insert(root, sonic_rs::to_vec(&json!({"data": blobs})).unwrap());
-    source.announce("block", root, block.data.message.slot);
+    let mut next = block.clone();
+    next.data.message.slot += 1;
+    rehash_execution(&mut next);
+    let next_root = source.add(&next);
+    let hashes = decode(&next, &config.network).versioned_hashes();
+    engine.state.lock().blobs.insert(
+        hashes[0],
+        json!({"blob": blobs[0], "proof": Bytes48::repeat_byte(7)}),
+    );
+    source.announce("block", next_root, next.data.message.slot);
     until(|| relay.snapshot()["consensus_acquired"].as_u64() == Some(1)).await;
     stop.send(()).unwrap();
     run.await.unwrap();
@@ -424,7 +399,8 @@ async fn publication_202_without_import_does_not_count_as_ready() {
     let w_mut = Arc::get_mut(&mut w).unwrap();
     w_mut.payload = Arc::new(decode(&response, &network));
     w_mut.deadline = Instant::now() + Duration::from_millis(200);
-    let payload = Arc::new(ConsensusPayload::from_blobs(w.payload.clone(), Vec::new()).unwrap());
+    let payload =
+        Arc::new(ConsensusPayload::from_blobs(w.payload.clone(), Vec::new(), Vec::new()).unwrap());
     let stats = Arc::new(parking_lot::Mutex::new(stats::Stats::default()));
     let (tx, rx) = broadcast::channel(8);
     let (stop, stop_rx) = watch::channel(false);
@@ -459,7 +435,7 @@ fn child_of(
 ) -> payload::BeaconResponse {
     let mut child = parent.clone();
     child.data.message.slot += 1;
-    child.data.message.parent_root = tree_hash::block_root(&parent.data.message).unwrap();
+    child.data.message.parent_root = fixture_root(&parent.data.message);
     let ExecutionPayload::V3(p) = &mut child.data.message.body.execution_payload.0 else {
         unreachable!()
     };
@@ -491,7 +467,7 @@ fn consensus_work(
     });
     Arc::new(ConsensusWork {
         work,
-        payload: Arc::new(ConsensusPayload::from_blobs(block, Vec::new()).unwrap()),
+        payload: Arc::new(ConsensusPayload::from_blobs(block, Vec::new(), Vec::new()).unwrap()),
     })
 }
 
@@ -721,8 +697,8 @@ async fn stalled_consensus_import_observations_do_not_delay_new_publications() {
             .map(|p| p.0)
             .collect::<Vec<_>>(),
         [
-            tree_hash::block_root(&first.data.message).unwrap(),
-            tree_hash::block_root(&next.data.message).unwrap()
+            fixture_root(&first.data.message),
+            fixture_root(&next.data.message)
         ]
     );
     assert_eq!(stats.lock().consensus_targets["cl"].ready, 0);

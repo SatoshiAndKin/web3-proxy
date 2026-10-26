@@ -1,12 +1,9 @@
 //! Read-only compatibility check against existing nodes. Starts no clients.
 use alloy::primitives::{B256, U64};
-use alloy_rpc_types_beacon::{
-    config::ForkScheduleResponse, genesis::GenesisResponse, header::HeaderResponse,
-};
+use alloy_rpc_types_beacon::header::HeaderResponse;
 use anyhow::{ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use web3_proxy::block_relay::{
-    config::{Fork, Network},
     payload::RelayPayload,
     transport::{self, Rpc},
 };
@@ -27,9 +24,6 @@ async fn main() -> Result<()> {
         "usage: block_relay_check BEACON_URL RPC_URL [RPC_URL ...]"
     );
     let client = transport::client()?;
-    let genesis: GenesisResponse = get(&client, &args[0], "/eth/v1/beacon/genesis").await?;
-    let schedule: ForkScheduleResponse =
-        get(&client, &args[0], "/eth/v1/config/fork_schedule").await?;
     let header: HeaderResponse = get(&client, &args[0], "/eth/v1/beacon/headers/head").await?;
     let response = client
         .get(format!(
@@ -41,31 +35,9 @@ async fn main() -> Result<()> {
         .send()
         .await?;
     let bytes = transport::body(response).await?;
-    #[derive(serde::Deserialize)]
-    struct Version {
-        version: String,
-    }
-    let version: Version = sonic_rs::from_slice(&bytes)?;
-    let epoch = header.data.header.message.slot / 32;
-    let fork = schedule
-        .data
-        .iter()
-        .filter(|f| f.epoch <= epoch)
-        .max_by_key(|f| f.epoch)
-        .context("missing active fork")?;
-    let network = Network {
-        genesis_validators_root: genesis.data.genesis_validators_root,
-        genesis_time: genesis.data.genesis_time,
-        seconds_per_slot: 12,
-        forks: vec![Fork {
-            name: version.version,
-            version: fork.current_version,
-            epoch: fork.epoch,
-        }],
-    };
-    let payload = RelayPayload::decode(&bytes, header.data.root, &network)?;
+    let payload = RelayPayload::decode(&bytes, header.data.root)?;
     println!(
-        "Verified Beacon root {}, execution hash {}, slot {}, Engine body {} bytes",
+        "Read Beacon block {}, execution hash {}, slot {}, Engine body {} bytes",
         payload.beacon_root,
         payload.hash,
         payload.slot,

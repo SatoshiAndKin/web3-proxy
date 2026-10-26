@@ -67,24 +67,27 @@ fn beacon(network: &config::Network) -> payload::BeaconResponse {
 }
 
 fn rehash_execution(response: &mut payload::BeaconResponse) {
-    let b = &mut response.data.message;
-    let ExecutionPayload::V3(p) = &mut b.body.execution_payload.0 else {
+    // Mock identity includes Engine request inputs, without Ethereum block reconstruction.
+    let parent_root = response.data.message.parent_root;
+    let body = &mut response.data.message.body;
+    let ExecutionPayload::V3(p) = &mut body.execution_payload.0 else {
         unreachable!()
     };
-    let mut execution = p
-        .clone()
-        .try_into_block::<alloy::consensus::TxEnvelope>()
-        .unwrap();
-    execution.header.parent_beacon_block_root = Some(b.parent_root);
-    execution.header.requests_hash = Some(b.body.execution_requests.to_requests().requests_hash());
-    p.payload_inner.payload_inner.block_hash = execution.header.hash_slow();
+    p.payload_inner.payload_inner.block_hash = B256::ZERO;
+    p.payload_inner.payload_inner.block_hash = alloy::primitives::keccak256(
+        sonic_rs::to_vec(&(parent_root, &body.execution_requests, &*p)).unwrap(),
+    );
 }
 
-fn decode(response: &payload::BeaconResponse, network: &config::Network) -> payload::RelayPayload {
+// Deterministic mock identity only. Ethereum nodes own consensus validation.
+fn fixture_root(block: &BeaconBlock<BeaconBlockBodyElectra<payload::BeaconPayload>>) -> B256 {
+    alloy::primitives::keccak256(sonic_rs::to_vec(block).unwrap())
+}
+
+fn decode(response: &payload::BeaconResponse, _network: &config::Network) -> payload::RelayPayload {
     payload::RelayPayload::decode(
         &sonic_rs::to_vec(response).unwrap(),
-        tree_hash::block_root(&response.data.message).unwrap(),
-        network,
+        fixture_root(&response.data.message),
     )
     .unwrap()
 }
@@ -97,19 +100,6 @@ async fn until(mut condition: impl FnMut() -> bool) {
     })
     .await
     .expect("condition was not reached");
-}
-
-#[test]
-fn electra_root_matches_consensus_spec_vector() {
-    let block: BeaconBlock<BeaconBlockBodyElectra<payload::BeaconPayload>> =
-        sonic_rs::from_str(include_str!("fixtures/electra.json")).unwrap();
-    let expected: B256 = "0x853653c6733c3275753665c3e1269f9f1fed274a67809dd9dec8245097f1aa7b"
-        .parse()
-        .unwrap();
-    assert_eq!(tree_hash::block_root(&block).unwrap(), expected);
-    let mut altered = block;
-    altered.body.graffiti = B256::ZERO;
-    assert_ne!(tree_hash::block_root(&altered).unwrap(), expected);
 }
 
 #[test]
@@ -165,71 +155,48 @@ fn empty_requests_are_omitted_and_fulu_uses_v4() {
 }
 
 #[test]
-fn rejects_wrong_roots_execution_hashes_blobs_and_forks() {
+fn relays_block_data_without_recomputing_roots_hashes_or_blob_commitments() {
     let network = network();
-    let response = beacon(&network);
-    let bytes = sonic_rs::to_vec(&response).unwrap();
-    let root = tree_hash::block_root(&response.data.message).unwrap();
-    assert_eq!(
-        payload::RelayPayload::decode(&bytes, B256::ZERO, &network)
-            .unwrap_err()
-            .to_string(),
-        "Beacon block root mismatch"
-    );
-    let mut bad = response.clone();
-    let ExecutionPayload::V3(p) = &mut bad.data.message.body.execution_payload.0 else {
+    let mut response = beacon(&network);
+    let ExecutionPayload::V3(p) = &mut response.data.message.body.execution_payload.0 else {
         unreachable!()
     };
-    p.payload_inner.payload_inner.block_hash = B256::ZERO;
-    assert_eq!(
-        payload::RelayPayload::decode(
-            &sonic_rs::to_vec(&bad).unwrap(),
-            tree_hash::block_root(&bad.data.message).unwrap(),
-            &network
-        )
-        .unwrap_err()
-        .to_string(),
-        "execution block hash mismatch"
-    );
-    let mut bad = response.clone();
-    bad.data
+    p.payload_inner.payload_inner.block_hash = B256::repeat_byte(9);
+    p.payload_inner.payload_inner.timestamp = 0;
+    p.payload_inner.payload_inner.transactions = vec![vec![255].into()];
+    response
+        .data
         .message
         .body
         .blob_kzg_commitments
         .push(Default::default());
+    let bytes = sonic_rs::to_vec(&response).unwrap();
+    let announced_root = B256::repeat_byte(8);
+    let encoded = payload::RelayPayload::decode(&bytes, announced_root).unwrap();
+    assert_eq!(encoded.beacon_root, announced_root);
+    assert_eq!(encoded.hash, B256::repeat_byte(9));
     assert_eq!(
-        payload::RelayPayload::decode(
-            &sonic_rs::to_vec(&bad).unwrap(),
-            tree_hash::block_root(&bad.data.message).unwrap(),
-            &network
-        )
-        .unwrap_err()
-        .to_string(),
-        "blob commitments do not match transactions"
+        encoded.signed_block.as_ref(),
+        sonic_rs::get(bytes.as_slice(), ["data"])
+            .unwrap()
+            .as_raw_str()
+            .as_bytes()
     );
-    let mut bad = response.clone();
-    bad.version = "amsterdam".into();
+    let body: sonic_rs::Value = sonic_rs::from_slice(&encoded.body).unwrap();
+    assert_eq!(body["params"][0]["transactions"], json!(["0xff"]));
+    assert_eq!(body["params"][0]["timestamp"], json!("0x0"));
+}
+
+#[test]
+fn rejects_unsupported_wire_format() {
+    let network = network();
+    let mut response = beacon(&network);
+    response.version = "amsterdam".into();
     assert_eq!(
-        payload::RelayPayload::decode(&sonic_rs::to_vec(&bad).unwrap(), root, &network)
+        payload::RelayPayload::decode(&sonic_rs::to_vec(&response).unwrap(), B256::ZERO)
             .unwrap_err()
             .to_string(),
         "unsupported Beacon fork"
-    );
-    let mut wrong_schedule = network.clone();
-    wrong_schedule.forks[0].epoch = 3;
-    assert_eq!(
-        payload::RelayPayload::decode(&bytes, root, &wrong_schedule)
-            .unwrap_err()
-            .to_string(),
-        "fork schedule mismatch"
-    );
-    let mut wrong_time = network;
-    wrong_time.genesis_time += 1;
-    assert_eq!(
-        payload::RelayPayload::decode(&bytes, root, &wrong_time)
-            .unwrap_err()
-            .to_string(),
-        "payload timestamp mismatch"
     );
 }
 
@@ -237,12 +204,12 @@ fn rejects_wrong_roots_execution_hashes_blobs_and_forks() {
 fn requires_complete_execution_requests_even_when_empty() {
     let network = network();
     let response = beacon(&network);
-    let root = tree_hash::block_root(&response.data.message).unwrap();
+    let root = fixture_root(&response.data.message);
     let mut raw = sonic_rs::to_value(&response).unwrap();
     raw["data"]["message"]["body"]["execution_requests"] =
         json!({"deposits": [], "withdrawals": []});
     assert_eq!(
-        payload::RelayPayload::decode(&sonic_rs::to_vec(&raw).unwrap(), root, &network)
+        payload::RelayPayload::decode(&sonic_rs::to_vec(&raw).unwrap(), root)
             .unwrap_err()
             .to_string(),
         "missing execution request list"
@@ -519,7 +486,6 @@ fn relay_config(
         cache_max_bytes: 1024 * 1024,
         rpc: config::RpcPolicy::default(),
         consensus_targets: BTreeMap::new(),
-        proof_workers: 2,
         sources: sources
             .iter()
             .map(|(name, url)| {
@@ -529,7 +495,6 @@ fn relay_config(
                         beacon_url: url.to_string(),
                         headers: BTreeMap::new(),
                         cost_class: config::CostClass::Free,
-                        resources: vec![config::Resource::Block, config::Resource::Blob],
                     },
                 )
             })
@@ -557,7 +522,8 @@ fn relay_config(
 }
 
 #[tokio::test]
-async fn complete_pipeline_races_valid_sources_deduplicates_and_reloads_mode_without_reconnect() {
+async fn complete_pipeline_races_decodable_sources_deduplicates_and_reloads_mode_without_reconnect()
+{
     let network = network();
     let local = MockBeacon::new(network.clone());
     let external = MockBeacon::new(network.clone());
@@ -614,12 +580,12 @@ async fn complete_pipeline_races_valid_sources_deduplicates_and_reloads_mode_wit
     rehash_execution(&mut competitor);
     let expected = decode(&competitor, &network);
     let root = local.add(&competitor);
-    // The external endpoint returns an earlier block under the requested root. It must not win.
+    // A response that cannot be decoded cannot form an Engine request.
     external
         .state
         .lock()
         .blocks
-        .insert(root, sonic_rs::to_vec(&block).unwrap());
+        .insert(root, b"invalid JSON".to_vec());
     local.announce("block_gossip", root, competitor.data.message.slot);
     external.announce("block", root, competitor.data.message.slot);
     until(|| {
@@ -715,7 +681,6 @@ async fn rejects_wrong_network_capability_and_bad_config_without_losing_current_
             beacon_url: server.url.clone(),
             headers: BTreeMap::new(),
             cost_class: config::CostClass::Free,
-            resources: vec![config::Resource::Block, config::Resource::Blob],
         },
     )
     .unwrap();
@@ -765,21 +730,21 @@ async fn rejects_wrong_network_capability_and_bad_config_without_losing_current_
     let relay = BlockRelay::new();
     relay.apply(Some(&config)).await.unwrap();
     let mut bad = config.clone();
-    bad.proof_workers = 0;
+    bad.cache_max_bytes = 0;
     assert_eq!(
         relay.apply(Some(&bad)).await.unwrap_err().to_string(),
-        "proof workers must be between 1 and 16"
+        "relay cache capacity must be positive"
     );
     assert_eq!(
         relay.snapshot()["config_error"].as_str(),
-        Some("proof workers must be between 1 and 16")
+        Some("relay cache capacity must be positive")
     );
     assert!(!format!("{bad:?}").contains("credential-must-not-leak"));
     relay.apply(Some(&config)).await.unwrap();
     assert!(relay.snapshot()["config_error"].is_null());
     assert_eq!(
         relay.apply(Some(&bad)).await.unwrap_err().to_string(),
-        "proof workers must be between 1 and 16"
+        "relay cache capacity must be positive"
     );
     let mut new_mode = config;
     new_mode.mode = config::Mode::Inject;

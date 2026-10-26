@@ -18,7 +18,6 @@ anyhow = { version = "1.0.104", features = ["backtrace"] }
 alloy = { version = "2.5.0", default-features = false, features = [
     "consensus",
     "eips",
-    "kzg",
     "node-bindings",
     "provider-http",
     "provider-ws",
@@ -34,7 +33,6 @@ alloy = { version = "2.5.0", default-features = false, features = [
 alloy-rpc-types-beacon = { version = "2.5.0", features = ["ssz"] }
 alloy-rpc-types-engine = { version = "2.5.0", features = ["jwt-aws-lc-rs"] }
 eventsource-stream = "0.2.3"
-tree_hash = "0.12"
 arc-swap = { version = "1.9.2" }
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
 async-stream = "0.3.6"

@@ -1,6 +1,7 @@
 //! Private, bounded HTTP transport. Never put URLs or remote response text in errors.
+use alloy::eips::eip4844::Bytes48;
 use alloy::primitives::{Bytes, B256};
-use alloy::rpc::types::engine::{BlobAndProofV2, Claims, JwtSecret, PayloadStatus};
+use alloy::rpc::types::engine::{Claims, JwtSecret, PayloadStatus};
 use anyhow::{ensure, Result};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -12,6 +13,13 @@ use std::{
     time::Duration,
 };
 use url::Url;
+
+/// Blob and proof bytes supplied by an execution node, kept in request order.
+#[derive(Default)]
+pub struct BlobBundle {
+    pub blobs: Vec<Bytes>,
+    pub proofs: Vec<Bytes48>,
+}
 
 /// Identity of a Beacon endpoint. Credentials are represented by a stable digest,
 /// never by their value, so transports cannot share reads across auth boundaries.
@@ -335,30 +343,37 @@ impl Rpc {
     ) -> Result<PayloadStatus> {
         self.send(payload.body.clone(), ENGINE_TIMEOUT).await
     }
-    pub async fn get_blobs_v2(&self, hashes: &[B256]) -> Result<Option<Vec<Bytes>>> {
-        let result: Option<Vec<BlobAndProofV2>> = self.call("engine_getBlobsV2", (hashes,)).await?;
-        let Some(result) = result else {
-            return Ok(None);
-        };
-        ensure!(
-            result.len() == hashes.len(),
-            "incomplete engine blob response"
-        );
-        for item in &result {
-            ensure!(
-                item.proofs.len() == alloy::eips::eip7594::CELLS_PER_EXT_BLOB,
-                "incomplete engine blob proofs"
-            );
+    pub async fn get_blobs(&self, hashes: &[B256], fork: &str) -> Result<Option<BlobBundle>> {
+        // Heap-backed Bytes avoid deserializing 128-KiB inline arrays on Tokio stacks.
+        #[derive(Deserialize)]
+        struct V1 {
+            blob: Bytes,
+            proof: Bytes48,
         }
-        // V2 returns blob + cell proofs, without a versionedHash field. The
-        // bounded proof worker checks each blob against the block's ordered
-        // commitments before accepting it and regenerates its own proofs.
-        Ok(Some(
-            result
-                .into_iter()
-                .map(|item| Bytes::copy_from_slice(item.blob.as_slice()))
-                .collect(),
-        ))
+        #[derive(Deserialize)]
+        struct V2 {
+            blob: Bytes,
+            proofs: Vec<Bytes48>,
+        }
+        let mut bundle = BlobBundle::default();
+        if fork == "fulu" {
+            let result: Option<Vec<V2>> = self.call("engine_getBlobsV2", (hashes,)).await?;
+            let Some(result) = result else {
+                return Ok(None);
+            };
+            for item in result {
+                bundle.blobs.push(item.blob);
+                bundle.proofs.extend(item.proofs);
+            }
+        } else {
+            let result: Vec<Option<V1>> = self.call("engine_getBlobsV1", (hashes,)).await?;
+            for item in result {
+                let Some(item) = item else { return Ok(None) };
+                bundle.blobs.push(item.blob);
+                bundle.proofs.push(item.proof);
+            }
+        }
+        Ok(Some(bundle))
     }
     pub async fn send<T: DeserializeOwned>(
         &self,
@@ -695,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn source_race_winner_and_deadline_clean_up_shared_reads() {
         use super::super::{
-            config::{CostClass, Resource},
+            config::CostClass,
             source::{race_sources, BeaconSource},
         };
         use std::sync::atomic::AtomicBool;
@@ -707,7 +722,6 @@ mod tests {
                         name: format!("source-{i}"),
                         http: server.http.clone(),
                         cost_class: CostClass::Free,
-                        resources: vec![Resource::Block],
                         verified: AtomicBool::new(true),
                     })
                 })
@@ -718,7 +732,6 @@ mod tests {
                     &sources,
                     deadline,
                     &tokio::sync::Notify::new(),
-                    Resource::Block,
                     Duration::ZERO,
                     |source| async move {
                         source

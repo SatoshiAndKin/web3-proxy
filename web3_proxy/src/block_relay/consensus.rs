@@ -87,10 +87,6 @@ impl ConsensusTarget {
             .await?;
         if let Some(header) = &header {
             ensure!(header.data.root == root, "Beacon target root mismatch");
-            ensure!(
-                super::tree_hash::header(&header.data.header.message) == root,
-                "Beacon target header root mismatch"
-            );
             if !header.execution_optimistic && !self.confirmed.contains_key(&root) {
                 self.confirmed.insert(root, ()).await;
                 self.evidence.notify_one();
