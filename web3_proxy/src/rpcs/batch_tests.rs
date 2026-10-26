@@ -238,7 +238,7 @@ impl Harness {
         );
     }
 
-    fn idle(&self) {
+    pub(super) fn idle(&self) {
         assert_eq!(self.rpc.active_requests.load(Ordering::SeqCst), 0);
     }
 }
@@ -1892,3 +1892,6 @@ async fn ordinary_batch_starts_ready_calls_while_other_validation_is_blocked() {
     })
     .await;
 }
+
+#[path = "latency_bench.rs"]
+mod latency_bench;
