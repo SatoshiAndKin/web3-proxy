@@ -2,11 +2,22 @@
 //! Run the ignored `serve` test and use the `rpc_latency_load` example in another process.
 use super::{Harness, Incoming};
 use crate::rpcs::{consensus::RankedRpcs, one::RequestPermits};
-use axum::{extract::State, routing::post, Router};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Router,
+};
 use latency::{PeakEwmaLatency, RollingQuantileLatency};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 use tokio::{net::TcpListener, sync::oneshot};
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 fn reply(call: &Value, answer: &Value) -> Value {
     let result = if call["method"] == "eth_getBlockByHash" {
@@ -23,9 +34,30 @@ fn reply(call: &Value, answer: &Value) -> Value {
 #[test]
 #[ignore = "manual release performance benchmark; starts loopback listeners"]
 fn serve() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info,alloy_transport=error")
-        .with_writer(std::io::sink)
+    let subscriber = std::env::var("W3P_BENCH_SUBSCRIBER").unwrap_or("minimal".into());
+    let production_layers = subscriber != "minimal";
+    // Exercise an enabled SDK without sending any benchmark data to a service.
+    struct Discard;
+    impl sentry::Transport for Discard {
+        fn send_envelope(&self, _: sentry::Envelope) {}
+    }
+    let _sentry = (subscriber == "sentry").then(|| {
+        let mut options = sentry::ClientOptions::new()
+            .sample_rate(1.0)
+            .traces_sample_rate(0.0);
+        options.dsn = Some("https://public@localhost/1".parse().unwrap());
+        options.transport = Some(Arc::new(Arc::new(Discard)));
+        sentry::init(options)
+    });
+    let filter = || EnvFilter::new("info,alloy_transport=error");
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .pretty()
+                .with_writer(std::io::sink)
+                .with_filter(filter()),
+        )
+        .with(production_layers.then(|| sentry_tracing::layer().with_filter(filter())))
         .try_init()
         .unwrap();
     let workers = std::env::var("W3P_BENCH_WORKERS")
@@ -88,8 +120,14 @@ fn serve() {
                 .unwrap_or("66".into())
                 .parse()
                 .unwrap();
+            let probe = Arc::new(Probe {
+                started: Instant::now(),
+                first_packet: AtomicU64::new(0),
+                rpcs: rpcs.clone(),
+            });
             let answer = Arc::new(json!(format!("0x{}", "a".repeat(bytes - 2))));
             for mut node in nodes {
+                let probe = probe.clone();
                 let answer = answer.clone();
                 super::super::test_support::spawn(async move {
                     while let Some(Incoming {
@@ -97,6 +135,16 @@ fn serve() {
                         reply: sender,
                     }) = node.incoming.recv().await
                     {
+                        if (body.is_array() || body["method"] == "eth_call")
+                            && probe.first_packet.load(Ordering::Relaxed) == 0
+                        {
+                            let _ = probe.first_packet.compare_exchange(
+                                0,
+                                probe.started.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                        }
                         // Readiness is independent from response delays, as with a real server.
                         let answer = answer.clone();
                         tokio::spawn(async move {
@@ -137,6 +185,12 @@ fn serve() {
             let controls = Router::new()
                 .route("/bench/reset", post(reset))
                 .with_state(app.clone());
+            let controls = controls.merge(
+                Router::new()
+                    .route("/bench/stats", get(stats))
+                    .route("/bench/reset-clock", post(reset_clock))
+                    .with_state(probe),
+            );
             let router = crate::frontend::make_router(app).merge(controls);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -160,4 +214,32 @@ fn serve() {
                 .unwrap();
             signal.abort();
         }));
+}
+
+struct Probe {
+    started: Instant,
+    first_packet: AtomicU64,
+    rpcs: Vec<Arc<crate::rpcs::one::Web3Rpc>>,
+}
+
+async fn reset_clock(State(probe): State<Arc<Probe>>) -> axum::response::Response {
+    probe.first_packet.store(0, Ordering::Relaxed);
+    crate::jsonrpc::response::json_response(
+        axum::http::StatusCode::OK,
+        &json!({"started_ns": probe.started.elapsed().as_nanos() as u64}),
+    )
+}
+
+async fn stats(State(probe): State<Arc<Probe>>) -> axum::response::Response {
+    crate::jsonrpc::response::json_response(
+        axum::http::StatusCode::OK,
+        &json!({
+            "first_packet_ns": probe.first_packet.load(Ordering::Relaxed),
+            "rpcs": probe.rpcs.iter().map(|rpc| json!({
+                "name": rpc.name,
+                "calls": rpc.total_requests.load(Ordering::Relaxed),
+                "packets": rpc.backend_batch_requests.load(Ordering::Relaxed),
+            })).collect::<Vec<_>>(),
+        }),
+    )
 }

@@ -738,7 +738,11 @@ impl App {
                     last_success = Some(response_data);
                     break;
                 }
-                Err(err @ Web3ProxyError::ExhaustedBackends(_)) => {
+                Err(
+                    err @ (Web3ProxyError::ExhaustedBackends(_)
+                    | Web3ProxyError::MethodNotFound(_)
+                    | Web3ProxyError::AccessDenied(_)),
+                ) => {
                     last_error = Some(err);
                     break;
                 }
@@ -1214,6 +1218,43 @@ mod tests {
         };
         header.inner.number = number;
         BlockHeader::new(Arc::new(header))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_local_errors_return_without_waiting_for_rankings() {
+        let app = app_with_no_backend().await;
+        for (index, method) in ["eth_sign", "eth_newFilter", "admin_test"]
+            .into_iter()
+            .enumerate()
+        {
+            let request =
+                SingleRequest::new((index as u64).into(), method.into(), json!([])).unwrap();
+            let started = Instant::now();
+            let (status, response, rpcs) = app
+                .proxy_request(request, ProxyMode::Best, None, None)
+                .await;
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "{method} waited for a retry"
+            );
+            assert!(rpcs.is_empty());
+            let response: serde_json::Value = serde_json::from_str(
+                &sonic_rs::to_string(&response.parsed().await.unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(response["id"], index);
+            let expected = if method == "admin_test" { 403 } else { -32601 };
+            assert_eq!(response["error"]["code"], expected);
+            assert_eq!(
+                status,
+                if method == "admin_test" {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                }
+            );
+        }
     }
 
     #[tokio::test]
