@@ -615,25 +615,35 @@ impl Web3Rpcs {
             return Ok(block);
         }
 
-        let result: Option<Arc<OwnedLazyValue>> = Box::pin(self.internal_request(
-            "eth_getBlockByHash".into(),
-            &(block_hash, false),
-            Some(Duration::from_secs(5)),
-        ))
-        .await?;
-        let result = result.ok_or(Web3ProxyError::UnknownBlockHash(block_hash))?;
-        let block: Block = sonic_rs::from_str(
-            &sonic_rs::to_string(&result).expect("block result must serialize"),
-        )?;
+        let fetch = async {
+            let result: Option<Arc<OwnedLazyValue>> = Box::pin(self.internal_request(
+                "eth_getBlockByHash".into(),
+                &(block_hash, false),
+                Some(Duration::from_secs(5)),
+            ))
+            .await?;
+            let result = result.ok_or(Web3ProxyError::UnknownBlockHash(block_hash))?;
+            let block: Block = sonic_rs::from_str(
+                &sonic_rs::to_string(&result).expect("block result must serialize"),
+            )?;
 
-        if block.header.hash != block_hash {
-            return Err(Web3ProxyError::BadResponse(
-                "fetched block hash does not match the requested hash".into(),
-            ));
+            if block.header.hash != block_hash {
+                return Err(Web3ProxyError::BadResponse(
+                    "fetched block hash does not match the requested hash".into(),
+                ));
+            }
+            Ok(BlockHeader::new(Arc::new(block.header)))
+        };
+        // Match try_cache_block_header's existing policy for an uncacheable hash.
+        if block_hash.is_zero() {
+            return fetch.await;
         }
-
-        let block = BlockHeader::new(Arc::new(block.header));
-        self.try_cache_block_header(block, false).await
+        // Moka runs one initializer per hash. A cancelled initializer lets another
+        // caller take over; failed lookups do not enter the header cache.
+        self.blocks_by_hash
+            .try_get_with(block_hash, fetch)
+            .await
+            .map_err(Web3ProxyError::Arc)
     }
 
     async fn invalidate_uncle_headers_if_canonical(&self, block: &CachedBlockResponse) {
