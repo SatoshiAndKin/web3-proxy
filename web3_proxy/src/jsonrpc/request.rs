@@ -18,7 +18,19 @@ pub struct SingleRequest {
     pub id: OwnedLazyValue,
     pub method: Cow<'static, str>,
     #[serde_inline_default(Value::default())]
+    #[serde(deserialize_with = "deserialize_params")]
     pub params: Value,
+}
+
+// Sonic's nested Value decoder sizes its node scratch buffer from all remaining
+// input. A batch repeats that oversized allocation for every params field.
+// Limit DOM parsing to this field while retaining the existing owned Value.
+fn deserialize_params<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let params = sonic_rs::LazyValue::deserialize(deserializer)?;
+    sonic_rs::from_str(params.as_raw_str()).map_err(de::Error::custom)
 }
 
 impl SingleRequest {
@@ -190,5 +202,53 @@ impl<'de> Deserialize<'de> for JsonRpcRequestEnum {
         let batch_visitor = JsonRpcBatchVisitor {};
 
         deserializer.deserialize_any(batch_visitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JsonRpcRequestEnum;
+    use sonic_rs::{json, JsonValueTrait};
+
+    #[test]
+    fn batch_params_preserve_nested_values_and_following_requests() {
+        let payload = r#"[
+            {"jsonrpc":"2.0","id":"line\n雪","method":"eth_call","params":[{"text":"quote\" and \\ and \u96ea","values":[null,true,-1.25e3]},"latest"]},
+            {"params":{"blockHash":"0xab","requireCanonical":true},"jsonrpc":"2.0","id":7,"method":"eth_call"},
+            {"jsonrpc":"2.0","id":null,"method":"web3_clientVersion","params":null},
+            {"jsonrpc":"2.0","id":7,"method":"web3_clientVersion"},
+            {"jsonrpc":"2.0","id":"7","method":"eth_call","params":[]}
+        ]"#;
+        let JsonRpcRequestEnum::Batch(requests) = sonic_rs::from_str(payload).unwrap() else {
+            panic!("expected a batch");
+        };
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0].id.as_str(), Some("line\n雪"));
+        assert_eq!(
+            requests[0].params,
+            json!([{"text":"quote\" and \\ and 雪", "values":[null,true,-1250.0]}, "latest"])
+        );
+        assert_eq!(requests[1].id.as_u64(), Some(7));
+        assert_eq!(
+            requests[1].params,
+            json!({"blockHash":"0xab", "requireCanonical":true})
+        );
+        assert_eq!(requests[2].params, json!(null));
+        assert_eq!(requests[3].params, json!(null));
+        assert_eq!(requests[4].id.as_str(), Some("7"));
+        assert_eq!(requests[4].params, json!([]));
+    }
+
+    #[test]
+    fn batch_params_reject_malformed_nested_json() {
+        for params in ["[1,]", "{\"a\":}", "[true false]", "[\"unterminated]"] {
+            let payload = format!(
+                r#"[{{"jsonrpc":"2.0","id":1,"method":"eth_call","params":{params}}},{{"jsonrpc":"2.0","id":2,"method":"eth_call","params":[]}}]"#
+            );
+            assert!(
+                sonic_rs::from_str::<JsonRpcRequestEnum>(&payload).is_err(),
+                "{params}"
+            );
+        }
     }
 }
