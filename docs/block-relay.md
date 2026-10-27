@@ -82,9 +82,10 @@ two dispatched block-read attempts.
 Consensus delivery fetches blob and proof data from the configured execution
 nodes: `engine_getBlobsV1` for Electra, `engine_getBlobsV2` for Fulu. It preserves
 the supplied blob and proof bytes and their order. The Beacon `/blobs` endpoint
-returns no proofs, so the relay no longer uses it to construct publications. If
-no execution source supplies the data, consensus acquisition reports failure;
-execution delivery continues independently. Nodes retain their normal peer
+returns no proofs, so the relay no longer uses it to construct publications.
+When an Engine source lacks data, each source retries independently with a 10 ms initial delay, capped at 100 ms.
+Retries stop at the block deadline or once all consensus targets confirm the block.
+Execution delivery continues independently. Nodes retain their normal peer
 connections to obtain missing data.
 
 The relay formats the parent Beacon root, versioned blob hashes, and SSZ-encoded,
@@ -198,16 +199,14 @@ runs a standalone forwarder. Independent forwarders on different hosts can each
 submit to the full target fleet.
 
 Omit the section to disable the service. `mode = "observe"` is the default. It
-checks capabilities, fetches and verifies blocks, and probes direct RPCs, but
+checks capabilities, fetches and formats blocks, and probes direct RPCs, but
 never sends Engine payloads or Beacon publications. Change only `mode` to
 `"inject"` for an approved trial.
 Mode-only reloads retain streams and warm caches. Switching back to observe
 prevents queued imports and ancestor repairs; an import already sent may finish.
 Other config changes drain the previous workers before they start replacements.
-Changing the proof-worker count requires a process restart. KZG setup runs on the
-blocking pool during preparation, before source intake. Blob decoding uses
-heap-backed bytes; proof work has its own bounded pool and cannot occupy the
-execution decoder pool or its source-read permits.
+JSON decoding uses the bounded blocking pool. The relay does not run a proof
+worker pool or initialize a KZG setup.
 Invalid local config leaves the previous config active.
 
 The initial read-only check verified a real Fulu Beacon root and execution hash against
@@ -237,7 +236,7 @@ process lifetime and mix modes. Use `telemetry.modes.observe` and
 `telemetry.modes.inject` for separate totals. Those totals reset on a configuration
 generation change. A mode-only reload retains both sets of totals.
 
-Every new JSONL row has a `context`: schema `1`, process `session`, increasing
+Every new JSONL row has a `context`: schema `2`, process `session`, increasing
 `sequence`, monotonic and Unix microseconds, configuration `generation`,
 `mode_epoch`, and `mode`. A mode epoch changes on every mode or config change.
 The process session changes on restart. Never subtract monotonic times or CPU
@@ -249,6 +248,7 @@ The same instrumentation runs in observe and inject:
 
 | Measurement | Evidence and limit |
 | --- | --- |
+| `acquisition_attempt` | Per-source block/blob attempt, origin mode and epoch, start, elapsed fetch time, transport permit wait, response-header wait, body transfer time, response size for blocks, decoder permit wait, blocking queue wait, decode duration, and outcome. Cancelled attempts retain partial timings. Fetch time includes transport permits, shared reads, HTTP, and (for blobs) RPC decoding. These are logical consumer timings, not physical request counts. |
 | `acquired`, `blob_ready` | First source announcement, decoded payload availability, source-supplied blobs and proofs. Execution does not wait for blobs. |
 | `head` | Independent execution `newHeads` notification, hash, height, block timestamp, observer time and connection ID. This includes network delivery delay. It does not gate or suppress injection. |
 | `submission_started`, `submission` | Unique attempt ID, layer, target, block, serialized request bytes, call start, result and elapsed time. A timeout stays `unknown`. A missing completion is missing evidence. |

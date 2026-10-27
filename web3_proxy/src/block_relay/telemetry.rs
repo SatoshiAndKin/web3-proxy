@@ -31,6 +31,80 @@ pub struct Envelope {
     pub event: Record,
 }
 
+/// One logical source attempt, including failed and cancelled race participants.
+/// Fetch time includes transport permits, shared reads, and HTTP. Decode time is
+/// elapsed time on the blocking worker, not a CPU-time counter.
+#[derive(Clone, Serialize)]
+pub(super) struct AcquisitionAttempt {
+    pub kind: &'static str,
+    pub root: B256,
+    pub slot: u64,
+    pub source: String,
+    pub started_mode: Mode,
+    pub started_mode_epoch: u64,
+    pub started_us: u64,
+    pub elapsed_us: u64,
+    pub fetch_us: Option<u64>,
+    pub transport_permit_us: Option<u64>,
+    pub headers_us: Option<u64>,
+    pub body_us: Option<u64>,
+    pub response_bytes: Option<usize>,
+    pub decoder_permit_us: Option<u64>,
+    pub blocking_queue_us: Option<u64>,
+    pub decode_us: Option<u64>,
+    pub outcome: &'static str,
+}
+
+pub(super) struct Attempt {
+    stats: Shared,
+    started: Instant,
+    pub event: AcquisitionAttempt,
+}
+
+impl Attempt {
+    pub fn start(stats: Shared, kind: &'static str, root: B256, slot: u64, source: &str) -> Self {
+        let started = Instant::now();
+        let s = stats.lock();
+        let event = AcquisitionAttempt {
+            kind,
+            root,
+            slot,
+            source: source.to_owned(),
+            started_mode: s.mode,
+            started_mode_epoch: s.telemetry.mode_epoch,
+            started_us: s.telemetry.at(started),
+            elapsed_us: 0,
+            fetch_us: None,
+            transport_permit_us: None,
+            headers_us: None,
+            body_us: None,
+            response_bytes: None,
+            decoder_permit_us: None,
+            blocking_queue_us: None,
+            decode_us: None,
+            outcome: "cancelled",
+        };
+        drop(s);
+        Self {
+            stats,
+            started,
+            event,
+        }
+    }
+    pub fn fetch_finished(&mut self) {
+        self.event.fetch_us = Some(stats::micros(self.started.elapsed()));
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        self.event.elapsed_us = stats::micros(self.started.elapsed());
+        self.stats
+            .lock()
+            .record(Record::AcquisitionAttempt(self.event.clone()));
+    }
+}
+
 #[derive(Default, Serialize)]
 pub struct Traffic {
     pub attempts: u64,

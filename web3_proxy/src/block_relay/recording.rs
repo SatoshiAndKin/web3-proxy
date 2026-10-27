@@ -21,6 +21,7 @@ pub(super) type Sender = mpsc::Sender<super::telemetry::Envelope>;
 #[derive(Serialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub(super) enum Record {
+    AcquisitionAttempt(super::telemetry::AcquisitionAttempt),
     Configured {
         sources: Vec<String>,
         execution_targets: Vec<String>,

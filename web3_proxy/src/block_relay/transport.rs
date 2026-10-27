@@ -81,8 +81,16 @@ impl BeaconReadCoordinators {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct BeaconRead {
+    pub body: Option<bytes::Bytes>,
+    pub permit_us: u64,
+    pub headers_us: u64,
+    pub body_us: u64,
+}
+
 struct SharedRead {
-    result: tokio::sync::OnceCell<std::result::Result<Option<bytes::Bytes>, String>>,
+    result: tokio::sync::OnceCell<std::result::Result<BeaconRead, String>>,
 }
 
 struct RegisteredRead {
@@ -179,7 +187,7 @@ impl BeaconHttp {
             shared: registered.shared.clone(),
         }
     }
-    pub async fn get_bytes(&self, path: &str) -> Result<Option<bytes::Bytes>> {
+    pub async fn get_bytes(&self, path: &str) -> Result<BeaconRead> {
         // Register the consumer and its cleanup before the first suspension point.
         let read = self.shared_read(path);
         let result = read
@@ -190,14 +198,17 @@ impl BeaconHttp {
             .clone();
         result.map_err(|e| anyhow::anyhow!(e))
     }
-    async fn fetch_bytes(&self, path: &str) -> Result<Option<bytes::Bytes>> {
+    async fn fetch_bytes(&self, path: &str) -> Result<BeaconRead> {
         let pool = if path.starts_with("/eth/v1/beacon/blobs/") {
             &self.inner.blob_reads
         } else {
             &self.inner.reads
         };
         let operation = async {
+            let queued = tokio::time::Instant::now();
             let _permit = pool.acquire().await?;
+            let permit_us = super::stats::micros(queued.elapsed());
+            let sent = tokio::time::Instant::now();
             let response = self
                 .inner
                 .client
@@ -206,10 +217,23 @@ impl BeaconHttp {
                 .send()
                 .await
                 .map_err(|_| anyhow::anyhow!("Beacon transport error"))?;
+            let headers_us = super::stats::micros(sent.elapsed());
+            let received = tokio::time::Instant::now();
             if response.status() == reqwest::StatusCode::NOT_FOUND {
-                return Ok(None);
+                return Ok(BeaconRead {
+                    body: None,
+                    permit_us,
+                    headers_us,
+                    body_us: 0,
+                });
             }
-            Ok(Some(body(response).await?))
+            let body = Some(body(response).await?);
+            Ok(BeaconRead {
+                body,
+                permit_us,
+                headers_us,
+                body_us: super::stats::micros(received.elapsed()),
+            })
         };
         tokio::time::timeout(READ_TIMEOUT, operation)
             .await
@@ -218,6 +242,7 @@ impl BeaconHttp {
     pub async fn get_optional<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
         self.get_bytes(path)
             .await?
+            .body
             .map(|bytes| {
                 sonic_rs::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid Beacon response"))
             })
@@ -609,7 +634,7 @@ mod tests {
             };
             let (result, ()) = tokio::join!(survivor, control);
             assert_eq!(
-                result.unwrap(),
+                result.unwrap().body,
                 Some(bytes::Bytes::from_static(b"survived"))
             );
             assert!(http.inner.shared_reads.lock().is_empty());
@@ -655,7 +680,7 @@ mod tests {
             };
             let (result, ()) = tokio::join!(survivor, control);
             assert_eq!(
-                result.unwrap(),
+                result.unwrap().body,
                 Some(bytes::Bytes::from_static(b"survived"))
             );
             assert!(server.requests.try_recv().is_err());
@@ -695,12 +720,12 @@ mod tests {
         };
         let (result, ()) = tokio::join!(first, control);
         assert_eq!(
-            result.unwrap(),
+            result.unwrap().body,
             Some(bytes::Bytes::from_static(b"complete"))
         );
         assert_eq!(http.inner.shared_reads.lock().len(), 1);
         assert_eq!(
-            last.await.unwrap(),
+            last.await.unwrap().body,
             Some(bytes::Bytes::from_static(b"complete"))
         );
         assert!(http.inner.shared_reads.lock().is_empty());
@@ -776,7 +801,7 @@ mod tests {
         let key = "/eth/v1/beacon/headers/head";
         let old = http.shared_read(key);
         let late_waiter = http.shared_read(key);
-        old.shared.result.set(Ok(None)).unwrap();
+        old.shared.result.set(Ok(BeaconRead::default())).unwrap();
         // Force a replacement while old guards exist, then drop both generations.
         http.inner.shared_reads.lock().remove(key);
         let replacement = http.shared_read(key);
@@ -860,7 +885,10 @@ mod tests {
                 _ => Err("HTTP status 429".to_owned()),
             };
             for result in [a, b, c] {
-                assert_eq!(result.map_err(|e| e.to_string()), expected);
+                assert_eq!(
+                    result.map(|read| read.body).map_err(|e| e.to_string()),
+                    expected
+                );
             }
             assert!(requests.try_recv().is_err());
             for http in [&first, &same, &other] {

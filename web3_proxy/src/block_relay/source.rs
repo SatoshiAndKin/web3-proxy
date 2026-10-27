@@ -102,12 +102,16 @@ impl BeaconSource {
         path: &str,
         kind: &str,
         stats: super::stats::Shared,
-    ) -> Result<bytes::Bytes> {
+    ) -> Result<transport::BeaconRead> {
         let mut measurement = super::telemetry::Fetch::start(stats, &self.name, kind);
-        let result = self.get_bytes(path).await;
+        let result = self.http.get_bytes(path).await;
         measurement.finish(
-            result.is_ok(),
-            result.as_ref().map_or(0, |bytes| bytes.len()),
+            result.as_ref().is_ok_and(|read| read.body.is_some()),
+            result
+                .as_ref()
+                .ok()
+                .and_then(|read| read.body.as_ref())
+                .map_or(0, |bytes| bytes.len()),
         );
         result
     }
@@ -134,6 +138,7 @@ impl BeaconSource {
         self.http
             .get_bytes(path)
             .await?
+            .body
             .ok_or_else(|| anyhow::anyhow!("Beacon block not found"))
     }
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {

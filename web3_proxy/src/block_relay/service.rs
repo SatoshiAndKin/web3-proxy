@@ -351,6 +351,7 @@ enum ConsensusAcquisition {
 async fn acquire_consensus(
     prepared: Arc<Prepared>,
     work: Arc<Work>,
+    stats: Shared,
 ) -> Result<ConsensusAcquisition> {
     if work.payload.blob_commitments.is_empty() {
         let payload = encode_consensus(
@@ -367,13 +368,28 @@ async fn acquire_consensus(
             let hashes = hashes.clone();
             let prepared = prepared.clone();
             let work = work.clone();
+            let stats = stats.clone();
             async move {
                 let mut delay = Duration::from_millis(10);
                 loop {
                     if Instant::now() >= work.deadline {
                         return None;
                     }
+                    let mut attempt = super::telemetry::Attempt::start(
+                        stats.clone(),
+                        "blobs",
+                        work.payload.beacon_root,
+                        work.payload.slot,
+                        &target.name,
+                    );
                     let fetched = target.engine.get_blobs(&hashes, &work.payload.fork).await;
+                    attempt.fetch_finished();
+                    attempt.event.outcome = match &fetched {
+                        Ok(Some(_)) => "available",
+                        Ok(None) => "unavailable",
+                        Err(_) => "fetch_failed",
+                    };
+                    drop(attempt);
                     if let Ok(Some(bundle)) = fetched {
                         return Some((target, bundle));
                     }
@@ -441,17 +457,49 @@ async fn acquire(
         let decoders = decoders.clone();
         let root = announcement.root;
         let stats = stats.clone();
+        let slot = announcement.slot;
         async move {
-            let bytes = source
+            let mut attempt =
+                super::telemetry::Attempt::start(stats.clone(), "block", root, slot, &source.name);
+            let fetched = source
                 .read_measured(&format!("/eth/v2/beacon/blocks/{root}"), "block", stats)
-                .await?;
+                .await;
+            attempt.fetch_finished();
+            attempt.event.outcome = "fetch_failed";
+            let read = fetched?;
+            attempt.event.transport_permit_us = Some(read.permit_us);
+            attempt.event.headers_us = Some(read.headers_us);
+            attempt.event.body_us = Some(read.body_us);
+            attempt.event.outcome = "unavailable";
+            let bytes = read
+                .body
+                .ok_or_else(|| anyhow::anyhow!("Beacon block not found"))?;
+            attempt.event.response_bytes = Some(bytes.len());
+            attempt.event.outcome = "cancelled";
+            let permit_started = Instant::now();
             let permit = decoders.acquire_owned().await?;
-            let payload = tokio::task::spawn_blocking(move || {
+            attempt.event.decoder_permit_us = Some(stats::micros(permit_started.elapsed()));
+            let queued = Instant::now();
+            let (payload, blocking_queue_us, decode_us) = tokio::task::spawn_blocking(move || {
                 // A canceled request must not release capacity while its decoder still runs.
                 let _permit = permit;
-                RelayPayload::decode(&bytes, root)
+                let started = Instant::now();
+                let payload = RelayPayload::decode(&bytes, root);
+                (
+                    payload,
+                    stats::micros(started.duration_since(queued)),
+                    stats::micros(started.elapsed()),
+                )
             })
-            .await??;
+            .await?;
+            attempt.event.blocking_queue_us = Some(blocking_queue_us);
+            attempt.event.decode_us = Some(decode_us);
+            attempt.event.outcome = if payload.is_ok() {
+                "decoded"
+            } else {
+                "decode_failed"
+            };
+            let payload = payload?;
             Ok(Arc::new(payload))
         }
     })
@@ -645,8 +693,9 @@ async fn run_generation(
                 if !prepared.consensus_targets.is_empty() {
                     if blob_acquisitions.len() < 8 {
                         let prepared = prepared.clone(); let work = work.clone();
+                        let blob_stats = stats.clone();
                         blob_acquisitions.spawn(async move {
-                            let result = tokio::time::timeout_at(work.deadline, acquire_consensus(prepared, work.clone())).await;
+                            let result = tokio::time::timeout_at(work.deadline, acquire_consensus(prepared, work.clone(), blob_stats)).await;
                             (work, result)
                         });
                     } else { stats.lock().consensus_acquisition_dropped += 1; }
