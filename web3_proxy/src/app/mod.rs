@@ -741,6 +741,7 @@ impl App {
                 Err(
                     err @ (Web3ProxyError::ExhaustedBackends(_)
                     | Web3ProxyError::MethodNotFound(_)
+                    | Web3ProxyError::BadRequest(_)
                     | Web3ProxyError::AccessDenied(_)),
                 ) => {
                     last_error = Some(err);
@@ -1139,10 +1140,13 @@ impl App {
                     return Err(Web3ProxyError::AccessDenied("admin methods are not allowed".into()));
                 }
                 if method.starts_with("alchemy_") {
-                    return Err(JsonRpcErrorData::from(format!(
-                        "the method {} does not exist/is not available",
-                        method
-                    )).into());
+                    return Ok(jsonrpc::ParsedResponse::from_error(
+                        JsonRpcErrorData::from(format!(
+                            "the method {} does not exist/is not available",
+                            method
+                        )),
+                        web3_request.id(),
+                    ).into());
                 }
                 let mut response = timeout_at(
                     web3_request.expire_at(),
@@ -1221,37 +1225,41 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn permanent_local_errors_return_without_waiting_for_rankings() {
         let app = app_with_no_backend().await;
-        for (index, method) in ["eth_sign", "eth_newFilter", "admin_test"]
-            .into_iter()
-            .enumerate()
-        {
-            let request =
-                SingleRequest::new((index as u64).into(), method.into(), json!([])).unwrap();
-            let started = Instant::now();
-            let (status, response, rpcs) = app
-                .proxy_request(request, ProxyMode::Best, None, None)
-                .await;
-            assert_eq!(
-                started.elapsed(),
-                Duration::ZERO,
-                "{method} waited for a retry"
-            );
-            assert!(rpcs.is_empty());
-            let response: serde_json::Value = serde_json::from_str(
-                &sonic_rs::to_string(&response.parsed().await.unwrap()).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(response["id"], index);
-            let expected = if method == "admin_test" { 403 } else { -32601 };
-            assert_eq!(response["error"]["code"], expected);
-            assert_eq!(
-                status,
-                if method == "admin_test" {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::OK
+        for mode in [ProxyMode::Best, ProxyMode::Fastest(2), ProxyMode::Versus] {
+            let cases = [
+                ("eth_sign", json!([]), StatusCode::OK, -32601),
+                ("eth_newFilter", json!([]), StatusCode::OK, -32601),
+                ("admin_test", json!([]), StatusCode::FORBIDDEN, 403),
+                ("web3_sha3", json!(["0xgg"]), StatusCode::BAD_REQUEST, 400),
+                ("alchemy_test", json!([]), StatusCode::OK, -32000),
+            ];
+            for (index, (method, params, expected_status, expected_code)) in
+                cases.into_iter().enumerate()
+            {
+                let request =
+                    SingleRequest::new((index as u64).into(), method.into(), params).unwrap();
+                let started = Instant::now();
+                let (status, response, rpcs) = app.proxy_request(request, mode, None, None).await;
+                assert_eq!(
+                    started.elapsed(),
+                    Duration::ZERO,
+                    "{method} waited for a retry in {mode:?}"
+                );
+                assert!(rpcs.is_empty());
+                let response: serde_json::Value = serde_json::from_str(
+                    &sonic_rs::to_string(&response.parsed().await.unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(response["id"], index);
+                assert_eq!(response["error"]["code"], expected_code);
+                assert_eq!(status, expected_status);
+                if method == "alchemy_test" {
+                    assert_eq!(
+                        response["error"]["message"],
+                        "the method alchemy_test does not exist/is not available"
+                    );
                 }
-            );
+            }
         }
     }
 
