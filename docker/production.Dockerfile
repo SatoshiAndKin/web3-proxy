@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # This image contains application code only. Production endpoints and secrets
 # belong in the operator's private deployment repository.
-FROM rust:slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS build
+FROM rust:slim-bookworm@sha256:86234e857a413004348b471d11a4ebe1aa92d2eae2b6b143cac68fd1ac3c48be AS build
 WORKDIR /app
 RUN apt-get update && apt-get install --no-install-recommends -y \
     build-essential clang cmake pkg-config libssl-dev ca-certificates
@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p web3_proxy_cli && \
     install -m 0755 target/release/web3_proxy_cli /usr/local/bin/web3_proxy_cli
 
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
 RUN apt-get update && apt-get install --no-install-recommends -y ca-certificates curl libssl3 && \
     sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
       -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' /etc/ca-certificates.conf && \
