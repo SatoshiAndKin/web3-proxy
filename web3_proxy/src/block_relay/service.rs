@@ -453,8 +453,12 @@ async fn acquire(
     metered_delay: Duration,
 ) -> Result<(Arc<RelayPayload>, String)> {
     let deadline = announcement.at + slot_duration;
+    // Sources race their reads, but only one source copy of this block needs CPU
+    // at a time. Keep the global decoder slots available to distinct blocks.
+    let block_decoder = Arc::new(tokio::sync::Semaphore::new(1));
     race_sources(&sources, deadline, &notify, metered_delay, |source| {
         let decoders = decoders.clone();
+        let block_decoder = block_decoder.clone();
         let root = announcement.root;
         let stats = stats.clone();
         let slot = announcement.slot;
@@ -477,11 +481,13 @@ async fn acquire(
             attempt.event.response_bytes = Some(bytes.len());
             attempt.event.outcome = "cancelled";
             let permit_started = Instant::now();
+            let block_permit = block_decoder.acquire_owned().await?;
             let permit = decoders.acquire_owned().await?;
             attempt.event.decoder_permit_us = Some(stats::micros(permit_started.elapsed()));
             let queued = Instant::now();
             let (payload, blocking_queue_us, decode_us) = tokio::task::spawn_blocking(move || {
                 // A canceled request must not release capacity while its decoder still runs.
+                let _block_permit = block_permit;
                 let _permit = permit;
                 let started = Instant::now();
                 let payload = RelayPayload::decode(&bytes, root);

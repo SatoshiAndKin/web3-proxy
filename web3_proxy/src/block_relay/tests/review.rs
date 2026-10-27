@@ -179,6 +179,58 @@ async fn ready_source_retries_before_an_unrelated_read_finishes() {
 }
 
 #[tokio::test]
+async fn failed_source_decode_does_not_block_another_source() {
+    let network = network();
+    let bad = MockBeacon::new(network.clone());
+    let good = MockBeacon::new(network.clone());
+    let bad_server = Server::beacon(bad.clone()).await;
+    let good_server = Server::beacon(good.clone()).await;
+    let rpc = MockRpc::new();
+    let rpc_server = Server::rpc(rpc.clone()).await;
+    let mut config = relay_config(
+        network.clone(),
+        &[("bad", &bad_server.url), ("good", &good_server.url)],
+        &[("a", &rpc_server.url)],
+    );
+    config.mode = config::Mode::Inject;
+    let block = beacon(&network);
+    let root = good.add(&block);
+    let mut broken = block.clone();
+    broken.version = "unsupported".into();
+    bad.state
+        .lock()
+        .blocks
+        .insert(root, sonic_rs::to_vec(&broken).unwrap());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    good.state.lock().block_gates.insert(root, gate.clone());
+    let relay = BlockRelay::new();
+    relay.apply(Some(&config)).await.unwrap();
+    let (stop, _) = broadcast::channel(1);
+    let run = tokio::spawn(relay.run(1, stop.subscribe()));
+    until(|| bad.events.receiver_count() == 1 && good.events.receiver_count() == 1).await;
+    bad.announce("block_gossip", root, block.data.message.slot);
+    // Release the good response only after a completed decode failure. This
+    // proves that the failed source releases its decoder capacity for fallback.
+    until(|| {
+        std::fs::read_dir(config.state_dir.join("observations"))
+            .unwrap()
+            .any(|entry| {
+                std::fs::read_to_string(entry.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| sonic_rs::from_str::<sonic_rs::Value>(line).ok())
+                    .any(|row| row["outcome"] == json!("decode_failed"))
+            })
+    })
+    .await;
+    gate.notify_one();
+    until(|| rpc.payload_hashes().len() == 1).await;
+    stop.send(()).unwrap();
+    run.await.unwrap();
+    assert_eq!(rpc.payload_hashes(), vec![decode(&block, &network).hash]);
+}
+
+#[tokio::test]
 async fn rpc_confirmed_parent_wakes_its_waiting_child() {
     let rpc = MockRpc::new();
     let server = Server::rpc(rpc.clone()).await;
