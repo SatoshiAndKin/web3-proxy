@@ -956,11 +956,9 @@ impl App {
                 let gas_estimate = match response.payload {
                     jsonrpc::ResponsePayload::Success { result } => result,
                     jsonrpc::ResponsePayload::Error { error } => {
-                        if matches!(web3_request.proxy_mode(), ProxyMode::Fastest(_) | ProxyMode::Versus) {
-                            // The scheduler already accepted this response.
-                            return Ok(jsonrpc::ParsedResponse::from_error(error, web3_request.id()).into());
-                        }
-                        return Err(Web3ProxyError::JsonRpcErrorData(error));
+                        // Routing already accepted this reply. Returning Err here
+                        // restarts the application retry wait for a completed call.
+                        return Ok(jsonrpc::ParsedResponse::from_error(error, web3_request.id()).into());
                     }
                 };
 

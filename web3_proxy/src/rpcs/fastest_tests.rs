@@ -817,32 +817,28 @@ async fn fastest_gas_estimate_keeps_configured_increases() {
 }
 
 #[tokio::test]
-async fn best_gas_estimate_revert_keeps_app_error_handling_and_single_node_selection() {
+async fn best_gas_estimate_keeps_accepted_errors_and_single_node_selection() {
     super::test_support::with_cleanup(async {
-        let mut fleet = Fleet::new(3, 3).await;
-        let (port, server) = fleet.frontend().await;
-        let mut task = http_request(port, "/", gas_estimate_request(json!("best-id"), "0x"));
-        let call = fleet.nodes[0].next().await;
-        let error = json!({"code":3,"message":"execution reverted: best estimate","data":"0xabcd"});
-        without_advancing_time(async {
-            fail_with(call, error.clone());
-            fleet.wait_for_active(&[0, 0, 0]).await;
-        })
-        .await;
-        fleet.idle();
-        assert!(
-            timeout(Duration::from_millis(50), &mut task).await.is_err(),
-            "Best must retain the application retry wait"
-        );
-        assert_eq!(fleet.counts(), [1, 0, 0]);
-        advance_to(Instant::now() + Duration::from_secs(3)).await;
-        assert_eq!(
-            without_advancing_time(task).await.unwrap(),
-            json!({"jsonrpc":"2.0","id":"best-id","error":error})
-        );
-        assert_eq!(fleet.counts(), [1, 0, 0]);
-        fleet.idle();
-        drop(server);
+        for error in [
+            json!({"code":3,"message":"execution reverted: best estimate","data":"0xabcd"}),
+            json!({"code":-32602,"message":"invalid transaction","data":{"field":"value"}}),
+        ] {
+            let mut fleet = Fleet::new(3, 3).await;
+            let (port, server) = fleet.frontend().await;
+            let task = http_request(port, "/", gas_estimate_request(json!("best-id"), "0x"));
+            let call = fleet.nodes[0].next().await;
+            assert_eq!(
+                without_advancing_time(async {
+                    fail_with(call, error.clone());
+                    task.await.unwrap()
+                })
+                .await,
+                json!({"jsonrpc":"2.0","id":"best-id","error":error})
+            );
+            assert_eq!(fleet.counts(), [1, 0, 0]);
+            fleet.idle();
+            drop(server);
+        }
     })
     .await;
 }
