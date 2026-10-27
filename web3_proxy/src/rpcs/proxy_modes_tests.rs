@@ -1396,3 +1396,74 @@ async fn versus_null_gas_estimate_is_an_accepted_answer() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn gas_estimate_reverts_return_without_waiting_or_restarting_in_all_modes() {
+    super::test_support::with_cleanup(async {
+        for path in ["/", "/fastest", "/versus"] {
+            let mut fleet = Fleet::configured(2, 2, AppConfig { fastest_rpcs: 1, ..Default::default() }).await;
+            let (port, server) = fleet.frontend().await;
+            let task = http_request(
+                port,
+                path,
+                json!({"jsonrpc":"2.0","id":"estimate-id","method":"eth_estimateGas","params":[{"to":"0x0000000000000000000000000000000000000000","data":"0x1234"}]}),
+            );
+            let first = fleet.nodes[0].next().await;
+            let slow = if path == "/versus" {
+                Some(fleet.nodes[1].next().await)
+            } else {
+                None
+            };
+            let expected = json!({"jsonrpc":"2.0","id":"estimate-id","error":{"code":3,"message":"execution reverted","data":"0x08c379a0"}});
+            first.respond(expected.clone());
+            assert_eq!(without_advancing_time(task).await.unwrap(), expected);
+            if let Some(slow) = slow {
+                succeed(slow, json!("0x5208"));
+            }
+            drained(&fleet).await;
+            assert_eq!(fleet.counts(), if path == "/versus" { vec![1, 1] } else { vec![1, 0] });
+            drop(server);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "manual release latency measurement through the HTTP frontend"]
+async fn measure_gas_estimate_revert_batch_latency() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(1, 1).await;
+        let (port, server) = fleet.frontend().await;
+        let calls: Value = if let Ok(path) = std::env::var("W3P_GAS_REPLAY_FILE") {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        } else {
+            json!((0..8).map(|id| json!({"jsonrpc":"2.0","id":id,"method":"eth_estimateGas","params":[{"to":"0x0000000000000000000000000000000000000000","data":"0x1234"}]})).collect::<Vec<_>>())
+        };
+        let calls = calls.as_array().unwrap();
+        assert!(!calls.is_empty());
+        for call in calls {
+            assert_eq!(call["method"], "eth_estimateGas");
+        }
+        for trial in 0..6 {
+            let started = std::time::Instant::now();
+            let task = http_request(port, "/", json!(calls));
+            for _ in calls {
+                let incoming = fleet.nodes[0].next().await;
+                assert!(calls.iter().any(|call| call["params"][0] == incoming.body["params"][0]));
+                let id = incoming.body["id"].clone();
+                incoming.respond(json!({"jsonrpc":"2.0","id":id,"error":{"code":3,"message":"execution reverted"}}));
+            }
+            let response = task.await.unwrap();
+            let elapsed = started.elapsed();
+            let responses = response.as_array().unwrap();
+            assert_eq!(responses.len(), calls.len());
+            for (call, response) in calls.iter().zip(responses) {
+                assert_eq!(*response, json!({"jsonrpc":"2.0","id":call["id"],"error":{"code":3,"message":"execution reverted"}}));
+            }
+            drained(&fleet).await;
+            println!("gas-revert-batch trial={trial} calls={} elapsed_ms={:.3}", calls.len(), elapsed.as_secs_f64() * 1000.0);
+        }
+        assert_eq!(fleet.counts(), [calls.len() * 6]);
+        drop(server);
+    }).await;
+}
