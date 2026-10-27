@@ -328,3 +328,16 @@ hold 128 blocks each. Observations hold at most 128 block sessions. HTTP respons
 have a 32 MiB limit. SSE connections recycle after 1 MiB to bound parser memory.
 Overflow counters are visible. Use modest source/target counts, private monitoring,
 and normal process memory limits; do not treat this relay as a public submission API.
+
+For a controlled release acquisition benchmark, put captured public Beacon JSON
+responses in a private fixture directory. Run the ignored library test
+`block_relay::tests::acquisition_bench::ready_block_acquisition` with
+`WEB3_RELAY_BENCH_FIXTURES`, `WEB3_RELAY_BENCH_BLOCKS` (at least 100),
+`WEB3_RELAY_BENCH_CONCURRENCY` (1 through 8), and
+`WEB3_RELAY_BENCH_WORKERS` set. Build the test with `cargo test --release --locked
+-p web3_proxy --lib --no-run`. It uses three loopback HTTP source fixtures and
+observe mode. It changes only the fixture routing slot and checks output digests
+and loss counters. It does not submit data to Ethereum nodes. Its acquisition
+percentiles start at receipt of the source announcement and exclude source-node
+import wait. Compare the same captured inputs and runtime settings in balanced
+baseline/candidate order; do not compile during timing.

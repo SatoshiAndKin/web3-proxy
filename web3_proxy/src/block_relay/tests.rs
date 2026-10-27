@@ -9,6 +9,7 @@ use tokio::{
     time::{timeout, Instant},
 };
 
+mod acquisition_bench;
 mod consensus;
 mod cost;
 mod isolation;
