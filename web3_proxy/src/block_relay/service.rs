@@ -361,22 +361,40 @@ async fn acquire_consensus(
         .await?;
         return Ok(ConsensusAcquisition::Complete(payload, work.source.clone()));
     }
+    let hashes: Arc<[_]> = work.payload.versioned_hashes().into();
     let local = futures_util::stream::iter(prepared.execution_targets.iter().cloned())
         .map(|target| {
-            let hashes = work.payload.versioned_hashes();
-            let block = work.payload.clone();
+            let hashes = hashes.clone();
+            let prepared = prepared.clone();
+            let work = work.clone();
             async move {
-                target
-                    .engine
-                    .get_blobs(&hashes, &block.fork)
-                    .await
-                    .map(|v| (target, v))
+                let mut delay = Duration::from_millis(10);
+                loop {
+                    if Instant::now() >= work.deadline {
+                        return None;
+                    }
+                    let fetched = target.engine.get_blobs(&hashes, &work.payload.fork).await;
+                    if let Ok(Some(bundle)) = fetched {
+                        return Some((target, bundle));
+                    }
+                    // Each source retries independently. A slow Engine must not hold
+                    // back another Engine whose blobs have just become available.
+                    if prepared
+                        .consensus_targets
+                        .iter()
+                        .all(|target| target.confirmed(work.payload.beacon_root))
+                    {
+                        return None;
+                    }
+                    tokio::time::sleep_until((Instant::now() + delay).min(work.deadline)).await;
+                    delay = (delay * 2).min(Duration::from_millis(100));
+                }
             }
         })
         .buffer_unordered(prepared.execution_targets.len().max(1));
     tokio::pin!(local);
     while let Some(result) = local.next().await {
-        if let Ok((target, Some(bundle))) = result {
+        if let Some((target, bundle)) = result {
             let payload =
                 encode_consensus(work.payload.clone(), bundle, prepared.decoders.clone()).await?;
             return Ok(ConsensusAcquisition::Complete(

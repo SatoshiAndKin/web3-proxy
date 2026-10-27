@@ -168,8 +168,71 @@ async fn relays_engine_blob_and_proof_bytes_and_leaves_rejection_to_consensus_no
 }
 
 #[tokio::test]
+async fn late_engine_blobs_retry_without_delaying_execution() {
+    for fork in ["electra", "fulu"] {
+        let network = network();
+        let (block, blobs) = blob_block(&network, fork);
+        let payload = decode(&block, &network);
+        let hashes = payload.versioned_hashes();
+        let source = MockBeacon::new(network.clone());
+        let source_server = Server::beacon(source.clone()).await;
+        let root = source.add(&block);
+        let engine = MockRpc::new();
+        let engine_server = Server::rpc(engine.clone()).await;
+        let target = MockBeacon::new(network.clone());
+        let target_server = Server::beacon(target.clone()).await;
+        let slow = Server::start(axum::Router::new().fallback(|| async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }))
+        .await;
+        let mut config = relay_config(
+            network,
+            &[("source", &source_server.url)],
+            &[("el", &engine_server.url), ("slow", &slow.url)],
+        );
+        config
+            .consensus_targets
+            .insert("cl".into(), target_config(&target_server.url));
+        config.mode = config::Mode::Inject;
+        let (relay, stop, run) = start_relay(&config).await;
+        until(|| source.events.receiver_count() == 1).await;
+        source.announce("block_gossip", root, block.data.message.slot);
+        until(|| engine.state.lock().blob_requests.len() >= 2).await;
+        assert_eq!(engine.payload_hashes(), vec![payload.hash]);
+        assert!(target.state.lock().publications.is_empty());
+        let data = if fork == "fulu" {
+            json!({"blob": blobs[0], "proofs": [Bytes48::repeat_byte(7)]})
+        } else {
+            json!({"blob": blobs[0], "proof": Bytes48::repeat_byte(7)})
+        };
+        engine.state.lock().blobs.insert(hashes[0], data);
+        timeout(
+            Duration::from_millis(250),
+            until(|| target.state.lock().publications.len() == 1),
+        )
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        run.await.unwrap();
+        assert_eq!(
+            relay.snapshot()["consensus_acquisition_failed"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(engine.payload_hashes(), vec![payload.hash]);
+        assert!(source.state.lock().blob_reads.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn missing_engine_blobs_do_not_fetch_proofless_beacon_blobs_or_block_execution_delivery() {
     let mut network = network();
+    network.seconds_per_slot = 1;
+    network.genesis_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 64;
     network.forks[0].name = "fulu".into();
     let (block, _) = blob_block(&network, "fulu");
     let hash = decode(&block, &network).hash;
@@ -304,7 +367,13 @@ async fn two_forwarders_send_to_all_three_execution_and_consensus_targets() {
 
 #[tokio::test]
 async fn unavailable_blobs_do_not_delay_execution_and_observe_mode_never_publishes() {
-    let network = network();
+    let mut network = network();
+    network.seconds_per_slot = 1;
+    network.genesis_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 64;
     let (block, blobs) = blob_block(&network, "electra");
     let source = MockBeacon::new(network.clone());
     let source_server = Server::beacon(source.clone()).await;
