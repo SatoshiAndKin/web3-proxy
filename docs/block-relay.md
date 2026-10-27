@@ -257,6 +257,11 @@ The same instrumentation runs in observe and inject:
 | `resources` | Process CPU time across all threads, current RSS on Linux and process peak RSS. Sampled every five seconds on the blocking pool. |
 | `mode_totals` | Per-mode counts, source fetch attempts/results/cancellations/bytes, submission bytes, histograms and process loss counters. Written each minute, before a mode change and at graceful shutdown. |
 
+Transport stage times describe the shared HTTP read. A late consumer can join a
+read that has already started, so these stages need not sum to that consumer's
+fetch time. Missing stages are null; a cancelled attempt does not imply that a
+blocking decoder has stopped.
+
 `telemetry.head_streams` and `telemetry.resource_status` show current measurement
 conditions and historical errors. Check their last progress time. Measurement
 failure does not stop useful forwarding. The queue, file and storage bounds
