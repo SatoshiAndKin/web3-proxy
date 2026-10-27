@@ -11,8 +11,8 @@ use futures::{future::BoxFuture, FutureExt};
 use hashbrown::{HashMap, HashSet};
 use moka::future::{Cache, CacheBuilder};
 use parking_lot::Mutex as SyncMutex;
-use serde::ser::SerializeStruct;
-use serde::Serialize;
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Deserialize, Serialize};
 use sonic_rs::{json, JsonContainerTrait, JsonValueTrait, OwnedLazyValue};
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -331,67 +331,129 @@ pub struct CachedBlockResponse {
     uncle_hashes: Arc<[B256]>,
 }
 
+#[derive(Deserialize)]
+struct BlockResponseFields<T> {
+    hash: String,
+    number: String,
+    uncles: Vec<String>,
+    transactions: T,
+}
+
+// Parse only the hash in each transaction. Using deserialize_map keeps the
+// wire contract object-only; ordinary Serde structs also accept sequences.
+#[derive(Serialize)]
+#[serde(transparent)]
+struct CachedTransactionHash(String);
+
+impl<'de> Deserialize<'de> for CachedTransactionHash {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            Hash,
+            #[serde(other)]
+            Other,
+        }
+        struct HashVisitor;
+        impl<'de> serde::de::Visitor<'de> for HashVisitor {
+            type Value = CachedTransactionHash;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a transaction object with a hash")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut hash = None;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Hash => {
+                            if hash.is_some() {
+                                return Err(serde::de::Error::duplicate_field("hash"));
+                            }
+                            hash = Some(map.next_value::<String>()?);
+                        }
+                        Field::Other => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                hash.map(CachedTransactionHash)
+                    .ok_or_else(|| serde::de::Error::missing_field("hash"))
+            }
+        }
+        deserializer.deserialize_map(HashVisitor)
+    }
+}
+
+struct HashesBlockProjection<'a> {
+    original: &'a str,
+    transactions: &'a [CachedTransactionHash],
+}
+
+impl Serialize for HashesBlockProjection<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for field in sonic_rs::to_object_iter(self.original) {
+            let (key, value) = field.map_err(serde::ser::Error::custom)?;
+            if key == "transactions" {
+                map.serialize_entry(&key, self.transactions)?;
+            } else {
+                map.serialize_entry(&key, &value)?;
+            }
+        }
+        map.end()
+    }
+}
+
 impl CachedBlockResponse {
-    fn metadata(value: &serde_json::Value) -> Web3ProxyResult<(B256, U64, Arc<[B256]>)> {
-        let object = value
-            .as_object()
-            .ok_or_else(|| Web3ProxyError::BadResponse("block result must be an object".into()))?;
-        let block_hash = object
-            .get("hash")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| Web3ProxyError::BadResponse("block result has no valid hash".into()))?;
-        let block_number = object
-            .get("number")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| {
-                Web3ProxyError::BadResponse("block result has no valid number".into())
-            })?;
-        let uncle_hashes = object
-            .get("uncles")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| Web3ProxyError::BadResponse("block result has no uncle array".into()))?
+    fn metadata<T>(value: &BlockResponseFields<T>) -> Web3ProxyResult<(B256, U64, Arc<[B256]>)> {
+        let block_hash = value
+            .hash
+            .parse()
+            .map_err(|_| Web3ProxyError::BadResponse("block result has no valid hash".into()))?;
+        let block_number = value
+            .number
+            .parse()
+            .map_err(|_| Web3ProxyError::BadResponse("block result has no valid number".into()))?;
+        let uncle_hashes = value
+            .uncles
             .iter()
             .map(|value| {
-                value
-                    .as_str()
-                    .and_then(|value| value.parse().ok())
-                    .ok_or_else(|| {
-                        Web3ProxyError::BadResponse(
-                            "block result contains an invalid uncle hash".into(),
-                        )
-                    })
+                value.parse().map_err(|_| {
+                    Web3ProxyError::BadResponse(
+                        "block result contains an invalid uncle hash".into(),
+                    )
+                })
             })
             .collect::<Web3ProxyResult<Vec<_>>>()?
             .into();
-
         Ok((block_hash, block_number, uncle_hashes))
     }
 
-    fn parse_json(result: &OwnedLazyValue) -> Web3ProxyResult<serde_json::Value> {
-        serde_json::from_str(
-            &sonic_rs::to_string(result).expect("lazy JSON block results must serialize"),
-        )
-        .map_err(|_| Web3ProxyError::BadResponse("block result contains invalid JSON".into()))
+    fn json_body(result: &OwnedLazyValue) -> Web3ProxyResult<String> {
+        if !result.is_object() {
+            return Err(Web3ProxyError::BadResponse(
+                "block result must be an object".into(),
+            ));
+        }
+        Ok(sonic_rs::to_string(result).expect("lazy JSON block results must serialize"))
+    }
+
+    fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> Web3ProxyResult<T> {
+        sonic_rs::from_str(json).map_err(|_| {
+            Web3ProxyError::BadResponse("block result contains invalid required fields".into())
+        })
     }
 
     pub fn from_hashes(result: Arc<OwnedLazyValue>) -> Web3ProxyResult<Self> {
-        let value = Self::parse_json(&result)?;
+        let value: BlockResponseFields<Vec<String>> = Self::parse_json(&Self::json_body(&result)?)?;
         let (block_hash, block_number, uncle_hashes) = Self::metadata(&value)?;
-        let transactions = value
-            .get("transactions")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                Web3ProxyError::BadResponse("block result has no transaction array".into())
-            })?;
-
-        if transactions.iter().any(|transaction| {
-            transaction
-                .as_str()
-                .and_then(|value| value.parse::<B256>().ok())
-                .is_none()
-        }) {
+        if value
+            .transactions
+            .iter()
+            .any(|value| value.parse::<B256>().is_err())
+        {
             return Err(Web3ProxyError::BadResponse(
                 "hash-only block result contains an invalid transaction hash".into(),
             ));
@@ -409,50 +471,33 @@ impl CachedBlockResponse {
         result: Arc<OwnedLazyValue>,
         expected_hash: B256,
     ) -> Web3ProxyResult<(Self, Self)> {
-        let mut hashes_value = Self::parse_json(&result)?;
-        let (block_hash, block_number, uncle_hashes) = Self::metadata(&hashes_value)?;
-
+        let json = Self::json_body(&result)?;
+        let fields: BlockResponseFields<Vec<CachedTransactionHash>> = Self::parse_json(&json)?;
+        let (block_hash, block_number, uncle_hashes) = Self::metadata(&fields)?;
         if block_hash != expected_hash {
             return Err(Web3ProxyError::BadResponse(
                 "hydrated block hash does not match the requested hash".into(),
             ));
         }
-
-        let transactions = hashes_value
-            .get_mut("transactions")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or_else(|| {
-                Web3ProxyError::BadResponse("hydrated block has no transaction array".into())
-            })?;
-        let transaction_hashes = transactions
+        if fields
+            .transactions
             .iter()
-            .map(|transaction| {
-                let hash = transaction
-                    .as_object()
-                    .and_then(|transaction| transaction.get("hash"))
-                    .cloned()
-                    .ok_or_else(|| {
-                        Web3ProxyError::BadResponse("hydrated transaction has no hash field".into())
-                    })?;
-                if hash
-                    .as_str()
-                    .and_then(|value| value.parse::<B256>().ok())
-                    .is_none()
-                {
-                    return Err(Web3ProxyError::BadResponse(
-                        "hydrated transaction has an invalid hash field".into(),
-                    ));
-                }
-                Ok(hash)
-            })
-            .collect::<Web3ProxyResult<Vec<_>>>()?;
-        *transactions = transaction_hashes;
-
+            .any(|hash| hash.0.parse::<B256>().is_err())
+        {
+            return Err(Web3ProxyError::BadResponse(
+                "hydrated transaction has an invalid hash field".into(),
+            ));
+        }
+        // The projection streams untouched raw values, including provider fields
+        // and numbers outside native integer precision. The full response stays intact.
         let hashes_result = Arc::new(
-            sonic_rs::from_str::<OwnedLazyValue>(
-                &serde_json::to_string(&hashes_value).expect("JSON block values must serialize"),
-            )
-            .expect("serialized JSON block values must parse"),
+            sonic_rs::to_lazyvalue(&HashesBlockProjection {
+                original: &json,
+                transactions: &fields.transactions,
+            })
+            .map_err(|_| {
+                Web3ProxyError::BadResponse("block projection contains invalid JSON".into())
+            })?,
         );
 
         let full = Self {
@@ -966,6 +1011,82 @@ mod tests {
         let response = rpcs.cached_block_response(request).await?;
         let response = response.parsed().await.unwrap();
         Some(serde_json::from_str(&sonic_rs::to_string(&response).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn block_projection_preserves_unknown_raw_values_and_original_response() {
+        let block_hash = B256::with_last_byte(0x42);
+        let transaction_hash = B256::with_last_byte(0x11);
+        let wire = format!(
+            r#"{{"hash":"{block_hash}","number":"0x2a","uncles":[],"transactions":[{{"hash":"{transaction_hash}","input":"0x1234"}}],"provider":{{"large":123456789012345678901234567890123456789,"decimal":1.2300e+04,"escaped":"\u0061"}}}}"#
+        );
+        let original = Arc::new(sonic_rs::from_str::<OwnedLazyValue>(&wire).unwrap());
+        let (full, hashes) = CachedBlockResponse::from_full(original.clone(), block_hash).unwrap();
+        assert!(Arc::ptr_eq(&original, &full.result()));
+        assert_eq!(sonic_rs::to_string(&*original).unwrap(), wire);
+        assert_eq!(sonic_rs::to_string(&*full.result()).unwrap(), wire);
+        let projected = sonic_rs::to_string(&*hashes.result()).unwrap();
+        for (field, expected) in [
+            ("large", "123456789012345678901234567890123456789"),
+            ("decimal", "1.2300e+04"),
+            ("escaped", r#""\u0061""#),
+        ] {
+            assert_eq!(
+                sonic_rs::get(&projected, ["provider", field])
+                    .unwrap()
+                    .as_raw_str(),
+                expected
+            );
+        }
+        let projected: serde_json::Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(
+            projected["transactions"],
+            serde_json::json!([transaction_hash])
+        );
+        let hashes = CachedBlockResponse::from_hashes(hashes.result()).unwrap();
+        assert_eq!(hashes.block_hash(), block_hash);
+    }
+
+    #[test]
+    fn block_projection_rejects_invalid_metadata_and_transaction_forms() {
+        let block_hash = B256::with_last_byte(0x42);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!([block_hash, "0x2a", [], []]),
+            serde_json::json!(true),
+        ] {
+            assert!(CachedBlockResponse::from_full(raw_block(value.clone()), block_hash).is_err());
+            assert!(CachedBlockResponse::from_hashes(raw_block(value)).is_err());
+        }
+        let valid = serde_json::json!({
+            "hash": block_hash, "number": "0x2a", "uncles": [], "transactions": [],
+        });
+        for (field, invalid) in [
+            ("hash", serde_json::json!("bad")),
+            ("number", serde_json::json!(false)),
+            ("uncles", serde_json::json!(null)),
+            ("uncles", serde_json::json!(["bad"])),
+            ("transactions", serde_json::json!({})),
+        ] {
+            let mut value = valid.clone();
+            value[field] = invalid;
+            assert!(CachedBlockResponse::from_full(raw_block(value.clone()), block_hash).is_err());
+            assert!(CachedBlockResponse::from_hashes(raw_block(value)).is_err());
+        }
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("bad"),
+            serde_json::json!({}),
+            serde_json::json!({"hash":false}),
+            serde_json::json!([B256::with_last_byte(0x11)]),
+        ] {
+            let mut value = valid.clone();
+            value["transactions"] = serde_json::json!([invalid]);
+            assert!(CachedBlockResponse::from_full(raw_block(value.clone()), block_hash).is_err());
+            assert!(CachedBlockResponse::from_hashes(raw_block(value)).is_err());
+        }
+        assert!(CachedBlockResponse::from_full(raw_block(valid), B256::ZERO).is_err());
     }
 
     #[test]

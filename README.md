@@ -106,6 +106,36 @@ $ websocat ws://127.0.0.1:8544
 
 You can copy `config/example.toml` to `config/production-$CHAINNAME.toml` and then run `docker compose -f docker-compose.prod.yml up --build -d` to start proxies for many chains.
 
+### Production JSON and CPU requirements
+
+Application JSON decoding and encoding use `sonic-rs`, including cached block
+metadata and full-to-hashes projection. The cache keeps the original full response
+and unknown provider fields intact. Alloy's WebSocket API and required dependency internals still
+use `serde_json`; wire-format and Alloy integration tests also use it as a checker.
+
+Sonic selects SIMD paths from compiler target features; no general speed Cargo
+feature is required. Local builds use the existing native CPU configuration. The
+shared production image keeps its `x86-64` CPU target. Compare full-proxy tail
+latency before changing this target; a codec speedup alone is not sufficient.
+Do not use `target-cpu=native` in a shared CI-built image because CI and deployment
+CPUs can differ.
+
+Keep Sonic's `sanitize` and `sort_keys` features disabled for production. The
+`avx512` feature also requires AVX-512 CPU instructions, which Lambo and NUC do
+not have. Preserve UTF-8 validation; `utf8_lossy` changes invalid-input handling.
+
+For a release comparison of the actual block-cache JSON and request-decoder code:
+
+```sh
+cargo run --release --locked -p web3_proxy --example json_codec_bench -- \
+  --mode full --items 512 --data-bytes 256 --threads 8 --seconds 2
+```
+
+Use `full`, `hashes` or `decode` to select the operation. Block cases include fresh
+JSON input, cache validation, cache weighing and response serialization. Compare
+separate baseline and candidate builds in balanced repeated trials; these codec
+measurements do not establish full-proxy or execution-node capacity.
+
 ### Production TCP backlog
 
 The proxy requests the largest positive TCP accept queue backlog that Tokio can pass to `listen(2)`. The operating system selects the effective size and can silently cap the request. Linux uses `net.core.somaxconn` as the cap. See the [Linux `listen(2)` documentation](https://man7.org/linux/man-pages/man2/listen.2.html).
