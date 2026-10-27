@@ -9,6 +9,66 @@ use axum::{
     Router,
 };
 
+#[tokio::test]
+async fn acquisition_stage_records_cover_success_and_failed_reads() {
+    let network = network();
+    let source = MockBeacon::new(network.clone());
+    let source_server = Server::beacon(source.clone()).await;
+    let engine_server = Server::rpc(MockRpc::new()).await;
+    let config = relay_config(
+        network.clone(),
+        &[("source", &source_server.url)],
+        &[("el", &engine_server.url)],
+    );
+    let block = beacon(&network);
+    let root = source.add(&block);
+    source.state.lock().hidden.insert(root);
+    let relay = BlockRelay::new();
+    relay.apply(Some(&config)).await.unwrap();
+    let (stop, _) = broadcast::channel(1);
+    let run = tokio::spawn(relay.clone().run(1, stop.subscribe()));
+    until(|| source.events.receiver_count() == 1).await;
+    source.announce("block_gossip", root, block.data.message.slot);
+    until(|| source.state.lock().block_reads.len() >= 2).await;
+    source.state.lock().hidden.remove(&root);
+    source.announce("block", root, block.data.message.slot);
+    until(|| relay.snapshot()["acquired"].as_u64() == Some(1)).await;
+    stop.send(()).unwrap();
+    run.await.unwrap();
+    let mut attempts = Vec::new();
+    for file in std::fs::read_dir(config.state_dir.join("observations")).unwrap() {
+        for line in std::fs::read_to_string(file.unwrap().path())
+            .unwrap()
+            .lines()
+        {
+            let row: sonic_rs::Value = sonic_rs::from_str(line).unwrap();
+            if row["record"] == json!("acquisition_attempt") {
+                attempts.push(row);
+            }
+        }
+    }
+    assert!(attempts
+        .iter()
+        .any(|r| r["outcome"] == json!("unavailable") && r["decode_us"].is_null()));
+    let decoded = attempts
+        .iter()
+        .find(|r| r["outcome"] == json!("decoded"))
+        .unwrap();
+    assert_eq!(decoded["source"], json!("source"));
+    assert_eq!(decoded["root"], json!(root));
+    assert_eq!(decoded["kind"], json!("block"));
+    let stages = [
+        "fetch_us",
+        "decoder_permit_us",
+        "blocking_queue_us",
+        "decode_us",
+    ];
+    let elapsed = decoded["elapsed_us"].as_u64().unwrap();
+    let sum: u64 = stages.iter().map(|k| decoded[*k].as_u64().unwrap()).sum();
+    assert!(sum <= elapsed);
+    assert!(decoded["response_bytes"].as_u64().unwrap() > 0);
+}
+
 async fn heads(State(hash): State<B256>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
     upgrade.on_upgrade(move |mut socket| async move {
         while let Some(Ok(Message::Text(request))) = socket.recv().await {

@@ -2,7 +2,9 @@
 use alloy::eips::eip4844::{kzg_to_versioned_hash, Bytes48};
 use alloy::primitives::{Bytes, B256};
 use alloy::rpc::types::beacon::block::{BeaconBlockBodyElectra, BlockResponse};
-use alloy::rpc::types::engine::{ExecutionPayload, ExecutionPayloadV3};
+use alloy::rpc::types::beacon::{block::SignedBeaconBlock, requests::ExecutionRequestsV4};
+use alloy::rpc::types::engine::ExecutionPayload;
+use alloy::rpc::types::engine::ExecutionPayloadV3;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +15,33 @@ pub struct BeaconPayload(
 );
 
 pub type BeaconResponse = BlockResponse<BeaconBlockBodyElectra<BeaconPayload>>;
+
+/// Keep consensus data opaque and borrow its exact bytes for publication.
+#[derive(Deserialize)]
+struct TransportResponse<'a> {
+    version: String,
+    #[serde(borrow)]
+    data: sonic_rs::LazyValue<'a>,
+}
+
+#[derive(Deserialize)]
+struct TransportBody {
+    #[serde(with = "alloy::rpc::types::beacon::payload::beacon_payload_v3")]
+    execution_payload: ExecutionPayloadV3,
+    #[serde(with = "RequiredRequests")]
+    execution_requests: ExecutionRequestsV4,
+    blob_kzg_commitments: Vec<Bytes48>,
+}
+
+// Alloy accepts absent request lists as empty. The relay needs all three lists
+// to format a complete Engine request, so require them during the same decode.
+#[derive(Deserialize)]
+#[serde(remote = "ExecutionRequestsV4")]
+struct RequiredRequests {
+    deposits: Vec<alloy::eips::eip6110::DepositRequest>,
+    withdrawals: Vec<alloy::eips::eip7002::WithdrawalRequest>,
+    consolidations: Vec<alloy::eips::eip7251::ConsolidationRequest>,
+}
 
 /// The body is encoded once and shared between target requests. It never includes JWT data.
 #[derive(Debug)]
@@ -37,42 +66,25 @@ impl RelayPayload {
             .collect()
     }
     pub fn decode(bytes: &[u8], root: B256) -> Result<Self> {
-        // Check the version before decoding a body whose format a future fork can change.
-        #[derive(Deserialize)]
-        struct Version {
-            version: String,
-        }
-        let version: Version = sonic_rs::from_slice(bytes)?;
+        let response: TransportResponse<'_> = sonic_rs::from_slice(bytes)?;
         ensure!(
-            matches!(version.version.as_str(), "electra" | "fulu"),
+            matches!(response.version.as_str(), "electra" | "fulu"),
             "unsupported Beacon fork"
         );
-        // Alloy defaults missing execution requests to empty. At this trust
-        // boundary require the complete fork schema, including all three lists.
-        use sonic_rs::JsonValueTrait;
-        let requests = sonic_rs::get(bytes, ["data", "message", "body", "execution_requests"])
-            .map_err(|_| anyhow::anyhow!("missing execution requests"))?;
-        for name in ["deposits", "withdrawals", "consolidations"] {
-            ensure!(
-                requests.get(name).is_some_and(|v| v.is_array()),
-                "missing execution request list"
-            );
-        }
-        let response: BeaconResponse = sonic_rs::from_slice(bytes)?;
-        let signed_block =
-            bytes::Bytes::copy_from_slice(sonic_rs::get(bytes, ["data"])?.as_raw_str().as_bytes());
-        Self::from_beacon(response, root, signed_block)
+        let signed_block = bytes::Bytes::copy_from_slice(response.data.as_raw_str().as_bytes());
+        let block: SignedBeaconBlock<TransportBody> =
+            sonic_rs::from_str(response.data.as_raw_str())?;
+        Self::from_beacon(block, response.version, root, signed_block)
     }
 
     fn from_beacon(
-        response: BeaconResponse,
+        block: SignedBeaconBlock<TransportBody>,
+        fork: String,
         root: B256,
         signed_block: bytes::Bytes,
     ) -> Result<Self> {
-        let message = response.data.message;
-        let ExecutionPayload::V3(payload) = message.body.execution_payload.0 else {
-            anyhow::bail!("expected ExecutionPayloadV3");
-        };
+        let message = block.message;
+        let payload = message.body.execution_payload;
         let requests = message.body.execution_requests.to_requests();
         let hashes: Vec<B256> = message
             .body
@@ -107,7 +119,7 @@ impl RelayPayload {
             slot: message.slot,
             number,
             body,
-            fork: response.version,
+            fork,
             signed_block,
             blob_commitments: message.body.blob_kzg_commitments,
         })

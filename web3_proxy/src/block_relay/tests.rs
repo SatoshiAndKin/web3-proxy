@@ -2,13 +2,14 @@ use super::*;
 use alloy::primitives::B256;
 use alloy_rpc_types_beacon::block::{BeaconBlock, BeaconBlockBodyElectra};
 use alloy_rpc_types_engine::ExecutionPayload;
-use sonic_rs::{json, JsonValueTrait};
+use sonic_rs::{json, JsonValueMutTrait, JsonValueTrait};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, watch},
     time::{timeout, Instant},
 };
 
+mod acquisition_bench;
 mod consensus;
 mod cost;
 mod isolation;
@@ -188,6 +189,25 @@ fn relays_block_data_without_recomputing_roots_hashes_or_blob_commitments() {
 }
 
 #[test]
+fn ignores_consensus_fields_when_formatting_engine_requests() {
+    let response = beacon(&network());
+    let mut raw = sonic_rs::to_value(&response).unwrap();
+    // These fields are opaque transport data. Only destination nodes validate them.
+    raw["data"]["message"]["body"]["attestations"] = json!({"node_validates": true});
+    raw["data"]["message"]["body"]["randao_reveal"] = json!("0xff");
+    let bytes = sonic_rs::to_vec(&raw).unwrap();
+    let packet = payload::RelayPayload::decode(&bytes, B256::ZERO).unwrap();
+    assert_eq!(packet.body, decode(&response, &network()).body);
+    assert_eq!(
+        packet.signed_block.as_ref(),
+        sonic_rs::get(bytes.as_slice(), ["data"])
+            .unwrap()
+            .as_raw_str()
+            .as_bytes()
+    );
+}
+
+#[test]
 fn rejects_unsupported_wire_format() {
     let network = network();
     let mut response = beacon(&network);
@@ -205,15 +225,23 @@ fn requires_complete_execution_requests_even_when_empty() {
     let network = network();
     let response = beacon(&network);
     let root = fixture_root(&response.data.message);
-    let mut raw = sonic_rs::to_value(&response).unwrap();
-    raw["data"]["message"]["body"]["execution_requests"] =
-        json!({"deposits": [], "withdrawals": []});
-    assert_eq!(
-        payload::RelayPayload::decode(&sonic_rs::to_vec(&raw).unwrap(), root)
-            .unwrap_err()
-            .to_string(),
-        "missing execution request list"
-    );
+    for name in ["deposits", "withdrawals", "consolidations"] {
+        for value in [None, Some(json!(null)), Some(json!({}))] {
+            let mut raw = sonic_rs::to_value(&response).unwrap();
+            let requests = raw["data"]["message"]["body"]["execution_requests"]
+                .as_object_mut()
+                .unwrap();
+            if let Some(value) = value {
+                requests.insert(name, value);
+            } else {
+                requests.remove(&name);
+            }
+            assert!(
+                payload::RelayPayload::decode(&sonic_rs::to_vec(&raw).unwrap(), root).is_err(),
+                "{name} must be present and be an array"
+            );
+        }
+    }
 }
 
 fn work(hash: u8, parent: u8, number: u64, mode: config::Mode) -> Arc<Work> {
