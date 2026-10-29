@@ -19,6 +19,9 @@ mod fastest_tests;
 mod proxy_modes_tests;
 
 #[cfg(test)]
+mod retry_tests;
+
+#[cfg(test)]
 mod test_support;
 
 #[cfg(test)]

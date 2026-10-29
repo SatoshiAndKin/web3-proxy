@@ -180,6 +180,47 @@ pub enum RequestForError<'a> {
 }
 
 impl Web3ProxyError {
+    /// Backend availability can recover while the original request is still valid.
+    pub(crate) fn is_transient_backend_error(&self) -> bool {
+        match self {
+            Self::NoServersSynced | Self::NoHandleReady => true,
+            Self::Reqwest(error) => {
+                error.is_connect()
+                    || error.is_timeout()
+                    || error.is_body()
+                    || (error.is_request() && !error.is_builder())
+                    || error.status().is_some_and(|status| {
+                        status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+                    })
+            }
+            Self::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+            ),
+            Self::AlloyTransport(error) => error.as_transport_err().is_some_and(|error| {
+                use alloy::transports::TransportErrorKind;
+                matches!(
+                    error,
+                    TransportErrorKind::BackendGone | TransportErrorKind::Custom(_)
+                )
+            }),
+            Self::Arc(error) => error.is_transient_backend_error(),
+            Self::WithContext(Some(error), _) => error.is_transient_backend_error(),
+            // Routing owns the attempt set. Do not reopen a completed race
+            // merely because its first failure was temporary unavailability.
+            Self::ExhaustedBackends(_) => false,
+            _ => false,
+        }
+    }
+
     pub fn range_too_large(
         from: BlockNumOrHash,
         to: BlockNumOrHash,
@@ -967,6 +1008,69 @@ impl Web3ProxyError {
 mod tests {
     use super::{JsonRpcErrorData, RequestForError, StatusCode, Web3ProxyError};
     use std::mem::size_of;
+
+    #[test]
+    fn backend_recovery_preserves_transient_causes_and_rejects_terminal_errors() {
+        use alloy::transports::TransportErrorKind;
+        use std::{
+            io::{Error, ErrorKind},
+            sync::Arc,
+        };
+
+        for (error, expected) in [
+            (
+                Web3ProxyError::Io(Error::from(ErrorKind::ConnectionReset)),
+                true,
+            ),
+            (
+                Web3ProxyError::Io(Error::from(ErrorKind::ConnectionRefused)),
+                true,
+            ),
+            (
+                Web3ProxyError::Io(Error::from(ErrorKind::PermissionDenied)),
+                false,
+            ),
+            (
+                Web3ProxyError::AlloyTransport(TransportErrorKind::backend_gone()),
+                true,
+            ),
+            (
+                Web3ProxyError::AlloyTransport(TransportErrorKind::non_retryable_str(
+                    "invalid request",
+                )),
+                false,
+            ),
+            (Web3ProxyError::NoServersSynced, true),
+            (Web3ProxyError::BadRequest("invalid request".into()), false),
+            (
+                Web3ProxyError::MethodNotFound("alchemy_unknown".into()),
+                false,
+            ),
+            (
+                Web3ProxyError::JsonRpcErrorData(JsonRpcErrorData {
+                    code: -32602,
+                    message: "invalid params".into(),
+                    data: None,
+                }),
+                false,
+            ),
+            (Web3ProxyError::Timeout(None), false),
+        ] {
+            assert_eq!(error.is_transient_backend_error(), expected, "{error:?}");
+            let wrapped = Web3ProxyError::WithContext(
+                Some(Box::new(Web3ProxyError::Arc(Arc::new(error)))),
+                "backend failed".into(),
+            );
+            assert_eq!(
+                wrapped.is_transient_backend_error(),
+                expected,
+                "{wrapped:?}"
+            );
+            assert!(
+                !Web3ProxyError::ExhaustedBackends(Box::new(wrapped)).is_transient_backend_error()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn exhausted_backends_preserves_underlying_error_rendering() {

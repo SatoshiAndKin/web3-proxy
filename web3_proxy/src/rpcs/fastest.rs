@@ -153,6 +153,9 @@ impl Web3Rpcs {
             }
         }
         Err(match first_error {
+            // Lost rankings can interrupt admission while a transport retry
+            // is still possible. Let App wait for recovery within the deadline.
+            Some(error) if error.is_transient_backend_error() => error,
             Some(error) => Web3ProxyError::ExhaustedBackends(Box::new(error)),
             None => Web3ProxyError::NoServersSynced,
         })
