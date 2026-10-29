@@ -213,9 +213,10 @@ impl Web3ProxyError {
                 )
             }),
             Self::Arc(error) => error.is_transient_backend_error(),
-            Self::ExhaustedBackends(error) | Self::WithContext(Some(error), _) => {
-                error.is_transient_backend_error()
-            }
+            Self::WithContext(Some(error), _) => error.is_transient_backend_error(),
+            // Routing owns the attempt set. Do not reopen a completed race
+            // merely because its first failure was temporary unavailability.
+            Self::ExhaustedBackends(_) => false,
             _ => false,
         }
     }
@@ -1057,15 +1058,16 @@ mod tests {
         ] {
             assert_eq!(error.is_transient_backend_error(), expected, "{error:?}");
             let wrapped = Web3ProxyError::WithContext(
-                Some(Box::new(Web3ProxyError::ExhaustedBackends(Box::new(
-                    Web3ProxyError::Arc(Arc::new(error)),
-                )))),
+                Some(Box::new(Web3ProxyError::Arc(Arc::new(error)))),
                 "backend failed".into(),
             );
             assert_eq!(
                 wrapped.is_transient_backend_error(),
                 expected,
                 "{wrapped:?}"
+            );
+            assert!(
+                !Web3ProxyError::ExhaustedBackends(Box::new(wrapped)).is_transient_backend_error()
             );
         }
     }

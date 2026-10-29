@@ -120,6 +120,72 @@ async fn versus_reset_does_not_repeat_another_nodes_terminal_error() {
 }
 
 #[tokio::test]
+async fn versus_ranking_recovery_preserves_completed_attempts_and_original_membership() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(2, 3).await;
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(port, "/versus", log_call());
+        let call = fleet.nodes[0].next().await;
+        fail(fleet.nodes[1].next().await, -32602, "invalid params");
+        fleet.wait_for_active(&[1, 0, 0]).await;
+        fleet.app.balanced_rpcs.watch_ranked_rpcs.send_replace(None);
+        reset(call).await;
+        fleet.wait_for_active(&[0, 0, 0]).await;
+        fleet.sync(3);
+        succeed(fleet.nodes[0].next().await, json!([]));
+        assert_eq!(task.await.unwrap()["result"], json!([]));
+        for node in &mut fleet.nodes {
+            node.quiet().await;
+        }
+        assert_eq!(fleet.counts(), [2, 1, 0]);
+        fleet.idle();
+        drop(server);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn versus_withdrawn_node_does_not_restart_a_completed_comparison() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(2, 3).await;
+        let slots: Vec<_> = (0..4)
+            .map(|_| fleet.nodes[1].rpc.request_permits.try_acquire().unwrap())
+            .collect();
+        let (port, server) = fleet.frontend().await;
+        let task = http_request(port, "/versus", log_call());
+        let call = fleet.nodes[0].next().await;
+        let rankings = &fleet.app.balanced_rpcs.watch_ranked_rpcs;
+        let receivers = rankings.receiver_count();
+        fleet.sync(1);
+        timeout(Duration::from_secs(2), async {
+            // The queued node drops its ranking receiver when its attempt ends.
+            while rankings.receiver_count() >= receivers {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the withdrawn node must finish its attempt");
+        // A new comparison would now replay node 0 and add node 2.
+        fleet.sync(3);
+        drop(slots);
+        fail(call, -32602, "invalid params");
+        let response = timeout(Duration::from_millis(500), task)
+            .await
+            .expect("completed comparisons must return without restarting")
+            .unwrap();
+        assert_eq!(response["error"]["code"], 502);
+        assert_eq!(response["id"], "logs-during-upgrade");
+        for node in &mut fleet.nodes {
+            node.quiet().await;
+        }
+        assert_eq!(fleet.counts(), [1, 0, 0]);
+        fleet.idle();
+        drop(server);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn log_reset_uses_another_ready_backend_without_waiting_for_recovery() {
     super::test_support::with_cleanup(async {
         for path in ["/", "/fastest"] {

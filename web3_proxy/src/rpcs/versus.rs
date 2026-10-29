@@ -44,6 +44,12 @@ where
             return Err(Web3ProxyError::Timeout(None));
         }
         if !eligible(pool, request, &rpc) {
+            if pool.watch_head_block.is_some() && pool.watch_ranked_rpcs.borrow().is_none() {
+                // Retain this comparison's selected node during a temporary
+                // ranking outage. Other attempts keep their completed results.
+                rankings.changed().await.map_err(anyhow::Error::from)?;
+                continue;
+            }
             return Err(Web3ProxyError::NoServersSynced);
         }
         let handle = match rpc.try_request_handle(request, None, false).await? {
@@ -69,7 +75,8 @@ where
             }
         };
         if !eligible(pool, request, &rpc) {
-            return Err(Web3ProxyError::NoServersSynced);
+            drop(handle);
+            continue;
         }
         if !rpc.can_submit(request, false) {
             drop(handle);
