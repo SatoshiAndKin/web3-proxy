@@ -25,8 +25,8 @@ fn eligible(pool: &Web3Rpcs, request: &Arc<ValidatedRequest>, rpc: &Arc<Web3Rpc>
     })
 }
 
-/// Admission can wait and recheck state. Invoke this node's transport once;
-/// Alloy may retry internally on the same backend before that invocation finishes.
+/// Admission can wait and recheck state. Retry transient transport failures on
+/// this selected node through ordinary admission and the original deadline.
 async fn attempt<R, F, Fut>(
     rpc: Arc<Web3Rpc>,
     request: &Arc<ValidatedRequest>,
@@ -76,7 +76,10 @@ where
             continue;
         }
         // No await separates the eligibility check from the transport submission.
-        let response = send(handle).await?;
+        let response = match send(handle).await {
+            Err(error) if error.is_transient_backend_error() => continue,
+            response => response?,
+        };
         let SingleResponse::Parsed(parsed) = &response;
         if let ResponsePayload::Error { error } = &parsed.payload {
             if !error.is_execution_revert() {

@@ -738,6 +738,32 @@ impl App {
                     last_success = Some(response_data);
                     break;
                 }
+                Err(err) if err.is_transient_backend_error() => {
+                    last_error = Some(err);
+                    // A backend restart can remove rankings while a call is in
+                    // flight. Keep its response deadline instead of applying the
+                    // short window used for other application-level retries.
+                    let deadline = if web3_request.backend_rpcs_used().is_empty() {
+                        web3_request.connect_timeout_at()
+                    } else {
+                        web3_request.expire_at()
+                    };
+                    if Instant::now() >= deadline {
+                        last_error = Some(Web3ProxyError::Timeout(None));
+                        break;
+                    }
+                    select! {
+                        _ = ranked_rpcs_recv.changed() => {
+                            ranked_rpcs_recv.borrow_and_update();
+                        }
+                        _ = sleep_until((Instant::now() + Duration::from_secs(1)).min(deadline)) => {}
+                    }
+                    if Instant::now() >= deadline {
+                        last_error = Some(Web3ProxyError::Timeout(None));
+                        break;
+                    }
+                    continue;
+                }
                 Err(
                     err @ (Web3ProxyError::ExhaustedBackends(_)
                     | Web3ProxyError::MethodNotFound(_)
