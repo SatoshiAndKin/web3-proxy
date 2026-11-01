@@ -69,6 +69,13 @@ Start the server with the defaults. It listens on `http://localhost:8544` and us
 cargo run --release -- proxyd
 ```
 
+The frontend binds to `0.0.0.0` by default. Set `listen_address = "127.0.0.1"`
+in the `[app]` table for a private host-network deployment. IPv6 addresses such as
+`::1` also work. Supply an IP address only; `proxyd --port` selects the port.
+Restart the daemon to apply a listener-address change. When `listenfd` supplies
+a socket, its owner controls the bind address.
+
+
 Quickly run tests:
 
 ```

@@ -39,7 +39,11 @@ const MAX_HTTP_REQUEST_BODY_SIZE: usize = 32 * 1024 * 1024;
 fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     info!(%addr, requested_backlog = LISTEN_BACKLOG, "binding TCP listener");
 
-    let socket = TcpSocket::new_v4()?;
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     socket.listen(LISTEN_BACKLOG)
@@ -151,6 +155,10 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
 
     // TODO: https://docs.rs/tower-http/latest/tower_http/propagate_header/index.html
 
+    let addr = SocketAddr::new(
+        app.config.listen_address,
+        app.frontend_port.load(Ordering::SeqCst),
+    );
     #[cfg(feature = "listenfd")]
     let listener = if let Some(listener) = ListenFd::from_env().take_tcp_listener(0)? {
         // use systemd socket magic for no downtime deploys
@@ -161,17 +169,10 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
         listener.set_nonblocking(true)?;
         TcpListener::from_std(listener)?
     } else {
-        // TODO: allow only listening on localhost? top_config.app.host.parse()?
-        let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
-
         bind_tcp_listener(addr)?
     };
     #[cfg(not(feature = "listenfd"))]
-    let listener = {
-        let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
-
-        bind_tcp_listener(addr)?
-    };
+    let listener = bind_tcp_listener(addr)?;
 
     // The frontend runs behind a trusted proxy. Client IP extraction uses the
     // rightmost address from X-Forwarded-For.

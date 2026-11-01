@@ -1,6 +1,9 @@
 [app]
 chain_id = 1
 
+# Bind only loopback in a private host-network deployment. Restart to apply.
+listen_address = "0.0.0.0"
+
 # /fastest races this many synced eligible backends. 0 selects all of them.
 # The normal / route stays in Best mode. Reload applies to new requests.
 fastest_rpcs = 2

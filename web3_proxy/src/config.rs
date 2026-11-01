@@ -11,6 +11,7 @@ use sentry::types::Dsn;
 use serde::{de, Deserialize, Deserializer};
 use serde_inline_default::serde_inline_default;
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -71,6 +72,10 @@ impl TopConfig {
 #[serde_inline_default]
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct AppConfig {
+    /// IP address for the frontend listener. Use loopback for a host-network pod.
+    #[serde_inline_default(IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
+    pub listen_address: IpAddr,
+
     /// Concurrent backends used by /fastest. Zero selects all synced eligible nodes.
     #[serde_inline_default(DEFAULT_FASTEST_RPCS)]
     pub fastest_rpcs: usize,
