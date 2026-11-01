@@ -71,6 +71,48 @@ async fn best_and_fastest_prefer_eligible_primary_over_backup() {
 }
 
 #[tokio::test]
+async fn best_and_fastest_retry_unavailable_historical_state_on_another_backend() {
+    super::test_support::with_cleanup(async {
+        for mode in [ProxyMode::Best, ProxyMode::Fastest(1)] {
+            for method in ["eth_call", "eth_estimateGas"] {
+                let mut fleet = Fleet::new(2, 2).await;
+                let params = json!([
+                    {"to":"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","data":"0x18160ddd"},
+                    "0x1", {}, {}
+                ]);
+                let payload = json!({"jsonrpc":"2.0","id":"archive-id","method":method,"params":params});
+                let call: SingleRequest = sonic_rs::from_str(&payload.to_string()).unwrap();
+                let request = ValidatedRequest::new_with_app(
+                    &fleet.app,
+                    mode,
+                    None,
+                    call.into(),
+                    fleet.app.balanced_rpcs.head_block(),
+                    None,
+                )
+                .await
+                .unwrap();
+                let task = fleet.start(request);
+                let pruned = fleet.nodes[0].next().await;
+                assert_eq!(pruned.body["params"], params);
+                fail(
+                    pruned,
+                    -32000,
+                    "historical state d6997db457c1dea1a45c5913d6edb6d92dd81851615ae86c410484b28cd0ef51 is not available",
+                );
+                let archive = fleet.nodes[1].next().await;
+                assert_eq!(archive.body["params"], params);
+                succeed(archive, json!("0x42"));
+                assert_eq!(result(task).await, json!({"jsonrpc":"2.0","id":"archive-id","result":"0x42"}));
+                assert_eq!(fleet.counts(), [1, 1]);
+                drained(&fleet).await;
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn all_modes_compare_decoded_ids_and_reject_invalid_envelopes_without_samples() {
     super::test_support::with_cleanup(async {
     for mode in [ProxyMode::Best, ProxyMode::Fastest(1), ProxyMode::Versus] {
