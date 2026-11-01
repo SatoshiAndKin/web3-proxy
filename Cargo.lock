@@ -6393,6 +6393,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sonic-rs",
+ "tempfile",
  "test-log",
  "tracing",
  "tracing-subscriber",
