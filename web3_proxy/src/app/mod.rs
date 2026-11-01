@@ -1205,6 +1205,71 @@ mod tests {
     use alloy::rpc::types::Header;
     use sonic_rs::OwnedLazyValue;
 
+    async fn frontend_binds_only_to_configured_address(address: &str, forbidden: &str) {
+        let mut app = app_with_no_backend().await;
+        Arc::get_mut(&mut app).unwrap().config =
+            serde_json::from_value(serde_json::json!({"listen_address": address})).unwrap();
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            crate::frontend::serve(app.clone()),
+        ));
+        let port = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let port = app.frontend_port.load(std::sync::atomic::Ordering::Relaxed);
+                if port != 0 {
+                    break port;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let endpoint = std::net::SocketAddr::new(address.parse().unwrap(), port);
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{endpoint}/listener-test"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        let other = std::net::SocketAddr::new(forbidden.parse().unwrap(), port);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect(other)
+            )
+            .await
+            .expect("unused loopback address must reject promptly")
+            .is_err(),
+            "the configured listener also accepted {other}"
+        );
+        app.frontend_shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn frontend_uses_configured_loopback_address() {
+        frontend_binds_only_to_configured_address("127.0.0.1", "::1").await;
+    }
+
+    #[tokio::test]
+    async fn frontend_uses_configured_ipv6_address() {
+        frontend_binds_only_to_configured_address("::1", "127.0.0.1").await;
+    }
+
+    #[test]
+    fn frontend_rejects_invalid_listen_address() {
+        assert!(serde_json::from_value::<AppConfig>(serde_json::json!({
+            "listen_address": "127.0.0.1:8544"
+        }))
+        .is_err());
+    }
+
     async fn app_with_no_backend() -> Arc<App> {
         let frontend_tasks = tokio_util::task::TaskTracker::new();
         let (frontend_shutdown, _) = watch::channel(false);
