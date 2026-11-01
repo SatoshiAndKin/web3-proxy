@@ -99,6 +99,14 @@ fn history_error_for_request(
             min: request.min_block_needed(),
             max: request.max_block_needed(),
         })
+    } else if error.code == -32000
+        && error.message.starts_with("historical state ")
+        && error.message.ends_with(" is not available")
+    {
+        Some(Web3ProxyError::ArchiveRequired {
+            min: request.min_block_needed(),
+            max: request.max_block_needed(),
+        })
     } else {
         None
     }
