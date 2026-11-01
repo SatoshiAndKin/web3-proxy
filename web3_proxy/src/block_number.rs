@@ -243,6 +243,7 @@ fn get_block_param_id(method: &str) -> Option<usize> {
         "eth_call" => Some(1),
         "eth_estimateGas" => Some(1),
         "eth_feeHistory" => Some(1),
+        "eth_getAccountInfo" => Some(1),
         "eth_getBalance" => Some(1),
         "eth_getBlockByNumber" => Some(0),
         "eth_getBlockReceipts" => Some(0),
@@ -495,7 +496,7 @@ impl RequestBlocks {
 
 #[cfg(test)]
 mod test {
-    use super::RequestBlocks;
+    use super::{BlockNumOrHash, RequestBlocks};
     use crate::{
         errors::Web3ProxyError,
         jsonrpc::{LooseId, SingleRequest},
@@ -513,6 +514,67 @@ mod test {
         };
         header.inner.number = number;
         header
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn account_info_uses_the_requested_historical_block() {
+        let head = BlockHeader::new(Arc::new(block(100)));
+        let params = json!(["0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9", "0x2a"]);
+        let mut request =
+            SingleRequest::new(7.into(), "eth_getAccountInfo".into(), params.clone()).unwrap();
+        let blocks = RequestBlocks::try_new(&mut request, Some(&head), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            blocks,
+            RequestBlocks::Point {
+                block_needed: BlockNumOrHash::Num(U64::from(42))
+            }
+        );
+        assert_eq!(blocks.to_block().unwrap().num(), U64::from(42));
+        assert_eq!(request.params, params);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn account_info_preserves_the_canonical_hash_parameter() {
+        let head = BlockHeader::new(Arc::new(block(100)));
+        let params = json!(["0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9", {
+            "blockHash": head.hash(), "requireCanonical": true
+        }]);
+        let mut request =
+            SingleRequest::new(7.into(), "eth_getAccountInfo".into(), params.clone()).unwrap();
+        let blocks = RequestBlocks::try_new(&mut request, Some(&head), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            blocks,
+            RequestBlocks::Point {
+                block_needed: (&head).into()
+            }
+        );
+        assert_eq!(request.params, params);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn account_info_pins_latest_and_an_omitted_block() {
+        let head = BlockHeader::new(Arc::new(block(100)));
+        for params in [
+            json!(["0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9", "latest"]),
+            json!(["0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9"]),
+        ] {
+            let mut request =
+                SingleRequest::new(7.into(), "eth_getAccountInfo".into(), params).unwrap();
+            let blocks = RequestBlocks::try_new(&mut request, Some(&head), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                blocks,
+                RequestBlocks::Point {
+                    block_needed: (&head).into()
+                }
+            );
+            assert_eq!(request.params.get(1), Some(&json!(head.number())));
+        }
     }
 
     #[test_log::test(tokio::test)]
