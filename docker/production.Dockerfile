@@ -26,14 +26,15 @@ COPY web3_proxy_cli/src web3_proxy_cli/src
 COPY web3_proxy_cli/tests web3_proxy_cli/tests
 COPY docs/block-relay.example.toml docs/block-relay.example.toml
 
-# Compile all test targets, but run only these mock-only library suites.
+# Compile all test targets; run mock-only libraries and CLI filesystem tests.
 # Never install or start Anvil, an execution client, or a Beacon node here.
 FROM build AS checked
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo fmt --all --check && \
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && \
-    cargo test --locked --all-features -p web3_proxy -p deduped_broadcast -p latency --lib
+    cargo test --locked --all-features -p web3_proxy -p deduped_broadcast -p latency --lib && \
+    cargo test --locked --all-features -p web3_proxy_cli --bin web3_proxy_cli
 
 FROM checked AS binary
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

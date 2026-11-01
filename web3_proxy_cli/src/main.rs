@@ -6,7 +6,7 @@ use sentry::types::Dsn;
 use std::{
     borrow::Cow,
     fs,
-    path::Path,
+    path::{absolute, PathBuf},
     sync::atomic::{self, AtomicUsize},
 };
 use tokio::runtime;
@@ -54,6 +54,11 @@ enum SubCommand {
     PopularityContest(sub_commands::PopularityContestSubCommand),
     Proxyd(sub_commands::ProxydSubCommand),
     Sentryd(sub_commands::SentrydSubCommand),
+}
+
+fn config_path(path: &str) -> anyhow::Result<PathBuf> {
+    // Keep the logical filename: kubelet replaces its symlink target on reload.
+    absolute(path).with_context(|| format!("making config path absolute: {path}"))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -129,9 +134,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (top_config, top_config_path) = if let Some(top_config_path) = cli_config.config.clone() {
-        let top_config_path = Path::new(&top_config_path)
-            .canonicalize()
-            .context(format!("checking for config at {}", top_config_path))?;
+        let top_config_path = config_path(&top_config_path)?;
 
         let top_config: String = fs::read_to_string(top_config_path.clone())?;
 
@@ -278,5 +281,33 @@ fn load_dotenv() -> anyhow::Result<()> {
         Ok(_) => Ok(()),
         Err(error) if error.not_found() => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::config_path;
+    use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn config_reload_follows_rotated_projected_volume() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let first = root.join("generation-1");
+        let second = root.join("generation-2");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("relay.toml"), "mode = \"inject\"\n").unwrap();
+        fs::write(second.join("relay.toml"), "mode = \"observe\"\n").unwrap();
+        symlink("generation-1", root.join("..data")).unwrap();
+        symlink("..data/relay.toml", root.join("relay.toml")).unwrap();
+        let path = config_path(root.join("relay.toml").to_str().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mode = \"inject\"\n");
+
+        // Match kubelet's atomic ..data replacement and old-generation cleanup.
+        symlink("generation-2", root.join("..data-next")).unwrap();
+        fs::rename(root.join("..data-next"), root.join("..data")).unwrap();
+        fs::remove_dir_all(first).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mode = \"observe\"\n");
     }
 }
