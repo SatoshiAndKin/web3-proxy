@@ -790,9 +790,11 @@ impl OpenRequestHandle {
 #[cfg(test)]
 mod tests {
     use super::{backend_transport_failure, history_error_for_request};
+    use crate::block_number::{BlockNumOrHash, RequestBlocks};
     use crate::errors::Web3ProxyError;
     use crate::jsonrpc::{JsonRpcErrorData, RequestOrMethod, SingleRequest, ValidatedRequest};
     use crate::rpcs::one::{RequestPermits, Web3Rpc};
+    use alloy::primitives::U64;
     use axum::extract::State;
     use axum::http::header::CONTENT_TYPE;
     use axum::{routing::post, Router};
@@ -859,6 +861,55 @@ mod tests {
             data: None,
         };
         assert!(history_error_for_request(&request("eth_getLogs"), &different_error).is_none());
+    }
+
+    #[test]
+    fn geth_unavailable_historical_state_preserves_point_block() {
+        let block = U64::from(42);
+        let request = ValidatedRequest {
+            request_blocks: RequestBlocks::Point {
+                block_needed: BlockNumOrHash::Num(block),
+            },
+            inner: RequestOrMethod::Method("eth_call".into(), 0),
+            ..Default::default()
+        };
+        for message in [
+            "historical state d6997db457c1dea1a45c5913d6edb6d92dd81851615ae86c410484b28cd0ef51 is not available",
+            "historical state is not available",
+        ] {
+            let error = JsonRpcErrorData {
+                code: -32000,
+                message: message.into(),
+                data: None,
+            };
+            assert!(matches!(
+                history_error_for_request(&request, &error),
+                Some(Web3ProxyError::ArchiveRequired { min, max })
+                    if min.is_none() && max == Some(block)
+            ));
+        }
+    }
+
+    #[test]
+    fn other_historical_state_errors_do_not_request_archive() {
+        for (code, message) in [
+            (-32602, "historical state is not available"),
+            (-32603, "historical state is not available"),
+            (3, "historical state is not available"),
+            (-32000, "historical state is corrupt"),
+            (-32000, "unauthorized: historical state is not available"),
+            (
+                -32000,
+                "historical state is not available: execution reverted",
+            ),
+        ] {
+            let error = JsonRpcErrorData {
+                code,
+                message: message.into(),
+                data: None,
+            };
+            assert!(history_error_for_request(&request("eth_call"), &error).is_none());
+        }
     }
 
     #[tokio::test]
