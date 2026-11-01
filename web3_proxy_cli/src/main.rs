@@ -6,7 +6,7 @@ use sentry::types::Dsn;
 use std::{
     borrow::Cow,
     fs,
-    path::{Path, PathBuf},
+    path::{absolute, PathBuf},
     sync::atomic::{self, AtomicUsize},
 };
 use tokio::runtime;
@@ -57,9 +57,8 @@ enum SubCommand {
 }
 
 fn config_path(path: &str) -> anyhow::Result<PathBuf> {
-    Path::new(path)
-        .canonicalize()
-        .with_context(|| format!("checking for config at {path}"))
+    // Keep the logical filename: kubelet replaces its symlink target on reload.
+    absolute(path).with_context(|| format!("making config path absolute: {path}"))
 }
 
 fn main() -> anyhow::Result<()> {
