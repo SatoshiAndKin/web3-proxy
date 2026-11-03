@@ -139,7 +139,7 @@ fn context() -> ChainContext {
 #[test]
 fn corpus_is_pinned_bounded_and_read_only() {
     let context = context();
-    let cases = corpus::build_cases(&context, vec![], 32).unwrap();
+    let cases = corpus::build_cases(&context, vec![]).unwrap();
     assert!(cases.iter().any(|c| c.method == "trace_filter"));
     assert!(cases
         .iter()
@@ -173,29 +173,14 @@ fn corpus_is_pinned_bounded_and_read_only() {
             expect: Expect::NonNull,
             unavailable: None,
         };
-        assert!(corpus::build_cases(&context, vec![case], 32).is_err());
+        assert!(corpus::build_cases(&context, vec![case]).is_err());
     }
     let mut empty = context;
     empty.transactions.clear();
-    let cases = corpus::build_cases(&empty, vec![], 32).unwrap();
+    let cases = corpus::build_cases(&empty, vec![]).unwrap();
     assert!(cases
         .iter()
         .find(|c| c.name == "receipt")
-        .unwrap()
-        .unavailable
-        .is_some());
-    let bounded = corpus::build_cases(
-        &ChainContext {
-            transactions: vec![hash('2')],
-            ..empty
-        },
-        vec![],
-        0,
-    )
-    .unwrap();
-    assert!(bounded
-        .iter()
-        .find(|c| c.method == "trace_block")
         .unwrap()
         .unavailable
         .is_some());
@@ -203,7 +188,7 @@ fn corpus_is_pinned_bounded_and_read_only() {
 
 #[test]
 fn matching_errors_are_not_successful_coverage() {
-    let cases = corpus::build_cases(&context(), vec![], 32).unwrap();
+    let cases = corpus::build_cases(&context(), vec![]).unwrap();
     let unsupported =
         parse(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"unsupported"}}"#);
     assert!(!corpus::expected(&cases[0], &unsupported));
@@ -359,7 +344,6 @@ async fn run_mocks(handlers: Vec<Handler>) -> (Value, Vec<Mock>, tempfile::TempD
         interval: Duration::ZERO,
         timeout: Duration::from_secs(2),
         max_response_bytes: 1_000_000,
-        max_trace_transactions: 32,
         batch_size: 4,
     };
     let mut runner = Runner::new(endpoints, settings, vec![], &output).unwrap();
@@ -454,6 +438,61 @@ fn changed_code(request: Value) -> (u16, String) {
         changed(&request)
     };
     (200, response.to_string())
+}
+
+#[tokio::test]
+async fn large_blocks_run_all_block_wide_trace_cases() {
+    let handler: Handler = Arc::new(|request| {
+        fn large_block(request: &Value) -> Value {
+            let mut reply = answer(request);
+            if matches!(
+                request["method"].as_str(),
+                Some("eth_getBlockByNumber" | "eth_getBlockByHash")
+            ) && reply["result"]["number"] == "0x10"
+            {
+                let transactions: Vec<_> = std::iter::once(hash('2'))
+                    .chain((1..300).map(|index| format!("0x{index:064x}")))
+                    .collect();
+                reply["result"]["transactions"] = json!(transactions);
+            }
+            reply
+        }
+        let reply = match request.as_array() {
+            Some(requests) => Value::Array(requests.iter().map(large_block).collect()),
+            None => large_block(&request),
+        };
+        (200, reply.to_string())
+    });
+    let (report, mocks, _) = run_mocks(vec![handler.clone(), handler]).await;
+    assert_eq!(report["exit_code"], 0);
+    for (name, method) in [
+        ("trace_block", "trace_block"),
+        ("trace_filter", "trace_filter"),
+        ("trace_replay_block", "trace_replayBlockTransactions"),
+    ] {
+        let rows: Vec<_> = report["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == name)
+            .collect();
+        assert_eq!(rows.len(), 6, "three individual and three batch checks");
+        assert!(rows
+            .iter()
+            .all(|row| row["classification"] == "full_agreement"));
+        for mock in &mocks {
+            assert_eq!(
+                mock.seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == method)
+                    .count(),
+                3,
+                "send every individual block-wide trace on every endpoint"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -650,7 +689,6 @@ async fn credentials_are_withheld_and_existing_evidence_is_preserved() {
         interval: Duration::ZERO,
         timeout: Duration::from_secs(1),
         max_response_bytes: 1024,
-        max_trace_transactions: 32,
         batch_size: 4,
     };
     let directory = tempfile::tempdir().unwrap();
@@ -665,7 +703,6 @@ async fn credentials_are_withheld_and_existing_evidence_is_preserved() {
         interval: Duration::ZERO,
         timeout: Duration::from_secs(1),
         max_response_bytes: 1024,
-        max_trace_transactions: 32,
         batch_size: 4,
     };
     assert!(Runner::new(vec![], settings, vec![], &output).is_err());

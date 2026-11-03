@@ -37,9 +37,6 @@ pub struct CompareRpcsSubCommand {
     /// maximum complete response size in bytes (default 33554432)
     #[argh(option, default = "33554432")]
     max_response_bytes: usize,
-    /// maximum transactions for block-wide traces (default 32)
-    #[argh(option, default = "32")]
-    max_trace_transactions: usize,
     /// requests per batch (default 4)
     #[argh(option, default = "4")]
     batch_size: usize,
@@ -74,7 +71,6 @@ struct Settings {
     interval: Duration,
     timeout: Duration,
     max_response_bytes: usize,
-    max_trace_transactions: usize,
     batch_size: usize,
 }
 
@@ -116,7 +112,6 @@ impl CompareRpcsSubCommand {
             interval: Duration::from_millis(self.interval_ms),
             timeout: Duration::from_secs(self.timeout_seconds),
             max_response_bytes: self.max_response_bytes,
-            max_trace_transactions: self.max_trace_transactions,
             batch_size: self.batch_size,
         };
         let mut secrets = Vec::new();

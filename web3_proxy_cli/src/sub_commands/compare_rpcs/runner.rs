@@ -391,7 +391,7 @@ impl Runner {
                 .and_then(|p| p.field("result").and_then(Json::string).map(str::to_owned));
             client_versions.insert(reply.endpoint, version);
         }
-        let cases = corpus::build_cases(&context, extra, self.settings.max_trace_transactions)?;
+        let cases = corpus::build_cases(&context, extra)?;
         let mut report = Report {
             schema_version: 1,
             started_at: self.started_at.clone(),
@@ -400,7 +400,7 @@ impl Runner {
             proxy_version_supplied: proxy_version,
             client_versions,
             anchor: json!({"chain_id":chain_ids[0].value(),"genesis_hash":genesis_hash,"number":context.number,"hash":context.hash}),
-            limits: json!({"interval_ms":self.settings.interval.as_millis(),"timeout_ms":self.settings.timeout.as_millis(),"max_response_bytes":self.settings.max_response_bytes,"max_trace_transactions":self.settings.max_trace_transactions,"batch_size":self.settings.batch_size,"rounds":3}),
+            limits: json!({"interval_ms":self.settings.interval.as_millis(),"timeout_ms":self.settings.timeout.as_millis(),"max_response_bytes":self.settings.max_response_bytes,"batch_size":self.settings.batch_size,"rounds":3}),
             anchor_stable: true,
             cases,
             results: Vec::new(),
@@ -863,7 +863,6 @@ mod tests {
             interval: Duration::ZERO,
             timeout,
             max_response_bytes: max_bytes,
-            max_trace_transactions: 32,
             batch_size: 4,
         };
         let observation = fetch(&mut endpoint, b"{}".to_vec(), &settings).await;

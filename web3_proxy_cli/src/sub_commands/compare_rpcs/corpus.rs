@@ -85,11 +85,7 @@ fn case(name: &str, method: &str, params: Value) -> Case {
     }
 }
 
-pub(super) fn build_cases(
-    context: &ChainContext,
-    extra: Vec<Case>,
-    max_trace_transactions: usize,
-) -> anyhow::Result<Vec<Case>> {
+pub(super) fn build_cases(context: &ChainContext, extra: Vec<Case>) -> anyhow::Result<Vec<Case>> {
     let state = json!({"blockHash":context.hash,"requireCanonical":true});
     let zero = "0x0000000000000000000000000000000000000000";
     let fixture = "0x0000000000000000000000000000000000001000";
@@ -195,16 +191,6 @@ pub(super) fn build_cases(
         );
         bind(&mut case.params, context, &mut case.unavailable);
         validate(case, context)?;
-        if matches!(
-            case.method.as_str(),
-            "trace_block" | "trace_filter" | "trace_replayBlockTransactions"
-        ) && context.transactions.len() > max_trace_transactions
-        {
-            case.unavailable = Some(
-                "block exceeds --max-trace-transactions; select a smaller block or raise the limit"
-                    .into(),
-            );
-        }
     }
     Ok(cases)
 }

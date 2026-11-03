@@ -71,10 +71,10 @@ The built-in suite covers:
   `trace_rawTransaction` need separate cases/work; this suite does not claim their coverage.
 
 Transaction cases use the first transaction in the anchor block. An empty block
-leaves those cases incomplete. Block-wide trace cases run only if the anchor has
-at most `--max-trace-transactions` transactions (default 32). `trace_filter` stays
-within that block and requests at most 1,000 entries. A limit can truncate its
-coverage. Select a suitable historical block or raise the explicit limit when needed.
+leaves those cases incomplete. Block-wide trace cases run regardless of the
+anchor's transaction count. The same request timeout and response-size limits
+apply to them. `trace_filter` stays within that block and requests at most 1,000
+entries; this can truncate its coverage.
 
 Every available case runs three times individually and three times in mixed
 batches of up to four requests. Methods with multiple cases also run in batches
