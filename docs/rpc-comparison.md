@@ -76,8 +76,10 @@ at most `--max-trace-transactions` transactions (default 32). `trace_filter` sta
 within that block and requests at most 1,000 entries. A limit can truncate its
 coverage. Select a suitable historical block or raise the explicit limit when needed.
 
-Every available case runs three times individually and three times in batches
-of up to four requests. The runner also checks replies against their first
+Every available case runs three times individually and three times in mixed
+batches of up to four requests. Methods with multiple cases also run in batches
+grouped by method. This includes all-`eth_call` batches, which use a separate
+proxy execution path. The runner also checks replies against their first
 individual observation to detect changes between repeats or batch forms.
 It labels `eth_blockNumber` and `eth_estimateGas` as observations. Moving heads,
 client estimation rules, and configured proxy estimate increases can differ.

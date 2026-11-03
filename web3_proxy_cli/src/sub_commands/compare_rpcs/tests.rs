@@ -357,6 +357,25 @@ async fn complete_http_run_compares_singles_batches_repeats_and_keeps_raw_eviden
         .collect();
     assert_eq!(first, direct);
     assert_eq!(first.len(), 3);
+    let requests = mocks[0].seen.lock().unwrap();
+    let call_batches: Vec<_> = requests
+        .iter()
+        .filter_map(Value::as_array)
+        .filter(|batch| batch.len() == 3 && batch.iter().all(|call| call["method"] == "eth_call"))
+        .collect();
+    assert_eq!(
+        call_batches.len(),
+        3,
+        "exercise the optimized all-eth_call batch path in every round"
+    );
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("capture/report.json")).unwrap())
+            .unwrap();
+    assert!(persisted["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["name"] == "call" && row["form"] == "method_batch"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -537,4 +556,34 @@ async fn credentials_are_withheld_and_existing_evidence_is_preserved() {
         fs::read_to_string(output.join("exchanges.jsonl")).unwrap(),
         journal
     );
+}
+
+#[tokio::test]
+async fn detects_proxy_changes_confined_to_same_method_batches() {
+    let proxy: Handler = Arc::new(|request| {
+        let method_batch = request.as_array().is_some_and(|batch| {
+            batch.len() > 1 && batch.iter().all(|call| call["method"] == "eth_call")
+        });
+        let (status, body) = normal(request);
+        if !method_batch {
+            return (status, body);
+        }
+        let mut replies: Value = serde_json::from_str(&body).unwrap();
+        for reply in replies.as_array_mut().unwrap() {
+            if reply.get("result").is_some() {
+                reply["result"] = json!("0x1234");
+            }
+        }
+        (status, replies.to_string())
+    });
+    let (report, _, _) = run_mocks(vec![proxy, Arc::new(normal), Arc::new(normal)]).await;
+    assert_eq!(report["exit_code"], 1);
+    assert_eq!(report["proxy_differences"], 6);
+    assert_eq!(report["backend_differences"], 0);
+    assert!(report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["classification"] == "proxy_only_difference")
+        .all(|row| row["form"] == "method_batch"));
 }

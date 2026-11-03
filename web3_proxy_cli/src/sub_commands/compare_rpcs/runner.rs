@@ -39,11 +39,26 @@ struct PairDifference {
     differences: Vec<Difference>,
 }
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Form {
+    Individual,
+    MixedBatch,
+    MethodBatch,
+    Skipped,
+}
+
+impl Form {
+    fn is_batch(self) -> bool {
+        matches!(self, Self::MixedBatch | Self::MethodBatch)
+    }
+}
+
 #[derive(Serialize)]
 struct CaseResult {
     name: String,
     round: usize,
-    form: &'static str,
+    form: Form,
     classification: &'static str,
     matching_backends: Vec<String>,
     coverage_gaps: Vec<String>,
@@ -402,7 +417,7 @@ impl Runner {
                 report.results.push(CaseResult {
                     name: case.name.clone(),
                     round: 0,
-                    form: "skipped",
+                    form: Form::Skipped,
                     classification: "incomplete",
                     matching_backends: vec![],
                     coverage_gaps: vec![reason.clone()],
@@ -422,16 +437,55 @@ impl Runner {
             .filter(|(_, c)| c.unavailable.is_none())
             .map(|(i, _)| i)
             .collect();
+        // Mixed batches and same-method batches can take different application
+        // paths. In particular, web3-proxy has an optimized all-eth_call path.
+        let mut method_groups = BTreeMap::<String, Vec<usize>>::new();
+        for &index in &indices {
+            method_groups
+                .entry(report.cases[index].method.clone())
+                .or_default()
+                .push(index);
+        }
         let mut baseline = BTreeMap::new();
         for round in 1..=3 {
             println!("Comparison round {round}/3");
             for &index in &indices {
-                self.measure(&mut report, &[index], round, false, &all, &mut baseline)
-                    .await?;
+                self.measure(
+                    &mut report,
+                    &[index],
+                    round,
+                    Form::Individual,
+                    &all,
+                    &mut baseline,
+                )
+                .await?;
             }
             for chunk in indices.chunks(self.settings.batch_size) {
-                self.measure(&mut report, chunk, round, true, &all, &mut baseline)
+                self.measure(
+                    &mut report,
+                    chunk,
+                    round,
+                    Form::MixedBatch,
+                    &all,
+                    &mut baseline,
+                )
+                .await?;
+            }
+            for group in method_groups.values() {
+                for chunk in group
+                    .chunks(self.settings.batch_size)
+                    .filter(|chunk| chunk.len() > 1)
+                {
+                    self.measure(
+                        &mut report,
+                        chunk,
+                        round,
+                        Form::MethodBatch,
+                        &all,
+                        &mut baseline,
+                    )
                     .await?;
+                }
             }
         }
         if self.verify_anchor(&context, &all).await.is_err() {
@@ -464,7 +518,7 @@ impl Runner {
         report: &mut Report,
         indices: &[usize],
         round: usize,
-        batch: bool,
+        form: Form,
         all: &[usize],
         baseline: &mut BTreeMap<(usize, usize), Json>,
     ) -> anyhow::Result<()> {
@@ -472,7 +526,7 @@ impl Runner {
             .iter()
             .map(|i| corpus::request(&report.cases[*i], *i + 1))
             .collect();
-        let request = if batch {
+        let request = if form.is_batch() {
             Value::Array(requests)
         } else {
             requests[0].clone()
@@ -480,7 +534,7 @@ impl Runner {
         let packets = self.exchange(&request, all).await?;
         let replies: Vec<_> = packets
             .iter()
-            .map(|packet| unpack(packet, indices, batch))
+            .map(|packet| unpack(packet, indices, form.is_batch()))
             .collect();
         for (position, &index) in indices.iter().enumerate() {
             let case = &report.cases[index];
@@ -597,7 +651,7 @@ impl Runner {
             report.results.push(CaseResult {
                 name: case.name.clone(),
                 round,
-                form: if batch { "batch" } else { "individual" },
+                form,
                 classification,
                 matching_backends,
                 coverage_gaps,
