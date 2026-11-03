@@ -24,6 +24,7 @@ COPY web3_proxy/tests web3_proxy/tests
 COPY web3_proxy_cli/Cargo.toml web3_proxy_cli/Cargo.toml
 COPY web3_proxy_cli/src web3_proxy_cli/src
 COPY web3_proxy_cli/tests web3_proxy_cli/tests
+COPY config/example.toml config/example.toml
 COPY docs/block-relay.example.toml docs/block-relay.example.toml
 
 # Compile all test targets; run mock-only libraries and CLI filesystem tests.

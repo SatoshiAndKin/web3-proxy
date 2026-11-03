@@ -29,5 +29,7 @@
 !web3_proxy_cli/src/**/*.rs
 !web3_proxy_cli/tests/
 !web3_proxy_cli/tests/**/*.rs
+!config/
+!config/example.toml
 !docs/
 !docs/block-relay.example.toml
