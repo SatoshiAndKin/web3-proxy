@@ -146,7 +146,11 @@ difference.
 
 Comparison ignores JSON spacing and object-key order. It compares decoded string
 values, preserves number tokens without floating-point conversion, and keeps
-hex text, array order, field presence, types, and complete error objects exact.
+hex text, array order, field presence, types, and error objects exact, with one
+exception: for execution reverts, missing `error.data` and `error.data: "0x"`
+compare as equal. This applies across backends, batch forms, and repeats. Raw
+captures retain the original fields. Non-empty data, `null`, error codes, error
+messages, and data on other errors still compare exactly.
 Thus `"0x0"` differs from `"0x00"`, and numeric `1` differs from `1.0`.
 Duplicate JSON keys and invalid JSON-RPC envelopes are incomplete observations.
 Batch replies can arrive in any order, but must contain exactly the requested IDs.

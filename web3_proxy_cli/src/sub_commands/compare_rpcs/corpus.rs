@@ -340,12 +340,6 @@ pub(super) fn expected(case: &Case, reply: &Json) -> bool {
     match case.expect {
         Expect::NonNull => reply.field("result").is_some_and(|v| v != &Json::Null),
         Expect::Result => reply.field("result").is_some(),
-        Expect::Revert => reply.field("error").is_some_and(|error| {
-            error.field("code").and_then(Json::number) == Some("3")
-                || error
-                    .field("message")
-                    .and_then(Json::string)
-                    .is_some_and(|message| message.to_ascii_lowercase().contains("revert"))
-        }),
+        Expect::Revert => reply.field("error").is_some_and(super::strict::is_revert),
     }
 }

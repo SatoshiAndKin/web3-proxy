@@ -61,6 +61,53 @@ fn comparison_preserves_fields_types_hex_array_order_and_large_numbers() {
 }
 
 #[test]
+fn empty_revert_data_normalization_keeps_other_error_differences() {
+    fn compared(value: Value) -> Json {
+        let mut reply = parse(&value.to_string());
+        strict::normalize_empty_revert_data(&mut reply);
+        reply
+    }
+    let revert = json!({"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}});
+    let expected = compared(revert.clone());
+    let mut empty = revert.clone();
+    empty["error"]["data"] = json!("0x");
+    assert_eq!(expected, compared(empty.clone()));
+    for code in [3, -32000] {
+        let mut missing = revert.clone();
+        missing["error"]["code"] = json!(code);
+        let mut empty = missing.clone();
+        empty["error"]["data"] = json!("0x");
+        assert_eq!(compared(missing), compared(empty));
+    }
+    for data in [
+        Value::Null,
+        json!(""),
+        json!("0x00"),
+        json!("0xdead"),
+        json!({"data":"0x"}),
+    ] {
+        let mut changed = revert.clone();
+        changed["error"]["data"] = data;
+        assert_ne!(expected, compared(changed));
+    }
+    for (field, value) in [
+        ("code", json!(-32000)),
+        ("message", json!("execution reverted: reason")),
+        ("extra", json!("0x")),
+    ] {
+        let mut changed = empty.clone();
+        changed["error"][field] = value;
+        assert_ne!(expected, compared(changed));
+    }
+    let other = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}});
+    let mut other_empty = other.clone();
+    other_empty["error"]["data"] = json!("0x");
+    assert_ne!(compared(other), compared(other_empty));
+    let result = json!({"jsonrpc":"2.0","id":1,"result":{"data":"0x"}});
+    assert_eq!(compared(result.clone()), parse(&result.to_string()));
+}
+
+#[test]
 fn decoder_rejects_malformed_and_duplicate_keys_at_every_depth() {
     for value in [
         r#"{"id":1,"id":2}"#,
@@ -230,7 +277,10 @@ impl Mock {
                     serde_json::from_slice(&buffer[header_end..header_end + length]).unwrap();
                 captured.lock().unwrap().push(request.clone());
                 let (status, body) = handler(request);
-                let header = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let header = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
                 let _ = socket.write_all(header.as_bytes()).await;
                 let _ = socket.write_all(body.as_bytes()).await;
             }
@@ -254,7 +304,7 @@ fn answer(request: &Value) -> Value {
             }
         }
         "eth_call" if params.to_string().contains("0x60006000fd") => {
-            return json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":3,"message":"execution reverted","data":"0x"}})
+            return json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":3,"message":"execution reverted","data":"0x"}});
         }
         "eth_getTransactionByHash" => {
             json!({"hash":hash('2'),"blockHash":hash('1'),"blockNumber":"0x10"})
@@ -404,6 +454,73 @@ fn changed_code(request: Value) -> (u16, String) {
         changed(&request)
     };
     (200, response.to_string())
+}
+
+#[tokio::test]
+async fn empty_revert_data_is_equal_across_backends_batches_and_repeats() {
+    fn handler(omit: bool, alternate: bool) -> Handler {
+        let count = Mutex::new(0);
+        Arc::new(move |request| {
+            let (status, body) = normal(request);
+            let mut reply: Value = serde_json::from_str(&body).unwrap();
+            let replies = match &mut reply {
+                Value::Array(replies) => replies.as_mut_slice(),
+                reply => std::slice::from_mut(reply),
+            };
+            for reply in replies {
+                if reply.get("error").is_some() {
+                    let mut count = count.lock().unwrap();
+                    *count += 1;
+                    if omit || (alternate && *count % 2 == 0) {
+                        reply["error"].as_object_mut().unwrap().remove("data");
+                    }
+                }
+            }
+            (status, reply.to_string())
+        })
+    }
+    let (report, _, directory) = run_mocks(vec![
+        handler(false, true),
+        handler(true, false),
+        handler(false, false),
+    ])
+    .await;
+    assert_eq!(report["exit_code"], 0);
+    for counter in [
+        "backend_differences",
+        "proxy_differences",
+        "repeat_differences",
+        "incomplete",
+    ] {
+        assert_eq!(report[counter], 0, "{counter}");
+    }
+    let capture = directory.path().join("capture");
+    let journal = fs::read_to_string(capture.join("exchanges.jsonl")).unwrap();
+    let mut variants = [false; 2];
+    for line in journal.lines() {
+        let exchange: Value = serde_json::from_str(line).unwrap();
+        for observation in exchange["observations"].as_array().unwrap() {
+            if observation["endpoint"] != "node0" {
+                continue;
+            }
+            let body = fs::read(capture.join(observation["body_file"].as_str().unwrap())).unwrap();
+            let reply: Value = serde_json::from_slice(&body).unwrap();
+            let replies = reply
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(std::slice::from_ref(&reply));
+            for reply in replies {
+                if let Some(error) = reply.get("error") {
+                    variants[usize::from(error.get("data").is_some())] = true;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        variants,
+        [true, true],
+        "preserve both original response forms"
+    );
 }
 
 #[tokio::test]

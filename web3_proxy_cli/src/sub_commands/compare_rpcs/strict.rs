@@ -1,4 +1,4 @@
-//! Independent, lossless response comparison. Never decode through proxy types.
+//! Independent, lossless response decoding. Never decode through proxy types.
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{value::RawValue, Value};
 use std::{collections::BTreeMap, fmt};
@@ -176,5 +176,33 @@ pub(super) fn envelope(value: &Json, id: &Json) -> Result<(), &'static str> {
             Ok(())
         }
         _ => Err("response must contain exactly one of result or error"),
+    }
+}
+
+pub(super) fn is_revert(error: &Json) -> bool {
+    error.field("code").and_then(Json::number) == Some("3")
+        || error
+            .field("message")
+            .and_then(Json::string)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("revert"))
+}
+
+/// Missing revert data and an empty byte string represent the same outcome.
+/// Apply only to comparison copies; captured response bytes stay unchanged.
+pub(super) fn normalize_empty_revert_data(reply: &mut Json) {
+    let Json::Object(reply) = reply else {
+        return;
+    };
+    let Some(error) = reply.get_mut("error") else {
+        return;
+    };
+    if !is_revert(error) {
+        return;
+    }
+    let Json::Object(error) = error else {
+        return;
+    };
+    if error.get("data").and_then(Json::string) == Some("0x") {
+        error.remove("data");
     }
 }

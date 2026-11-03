@@ -698,7 +698,9 @@ fn unpack(packet: &Observation, indices: &[usize], batch: bool) -> Result<Vec<Js
             return Err("unexpected response ID".into());
         }
         strict::envelope(value, &Json::Number(id.to_string())).map_err(str::to_owned)?;
-        if ordered.insert(id, value.clone()).is_some() {
+        let mut value = value.clone();
+        strict::normalize_empty_revert_data(&mut value);
+        if ordered.insert(id, value).is_some() {
             return Err("duplicate response ID".into());
         }
     }
