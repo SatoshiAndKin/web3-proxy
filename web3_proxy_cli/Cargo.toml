@@ -23,11 +23,11 @@ mimalloc = { version = "0.1.52", optional = true }
 parking_lot = { version = "0.12.5", optional = true }
 prettytable = { version = "0.10.0", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.154", features = ["raw_value", "arbitrary_precision"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-serde_json = "1.0.154"
 sonic-rs = "0.5.10"
 test-log = { version ="0.2.21", default-features = false, features = ["trace"] }

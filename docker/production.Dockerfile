@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fmt --all --check && \
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && \
     cargo test --locked --all-features -p web3_proxy -p deduped_broadcast -p latency --lib && \
-    cargo test --locked --all-features -p web3_proxy_cli --bin web3_proxy_cli
+    cargo test --locked --all-features -p web3_proxy_cli --lib --bin web3_proxy_cli --test compare_rpcs
 
 FROM checked AS binary
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
