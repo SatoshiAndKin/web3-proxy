@@ -24,6 +24,7 @@ COPY web3_proxy/tests web3_proxy/tests
 COPY web3_proxy_cli/Cargo.toml web3_proxy_cli/Cargo.toml
 COPY web3_proxy_cli/src web3_proxy_cli/src
 COPY web3_proxy_cli/tests web3_proxy_cli/tests
+COPY config/example.toml config/example.toml
 COPY docs/block-relay.example.toml docs/block-relay.example.toml
 
 # Compile all test targets; run mock-only libraries and CLI filesystem tests.
@@ -34,7 +35,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fmt --all --check && \
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && \
     cargo test --locked --all-features -p web3_proxy -p deduped_broadcast -p latency --lib && \
-    cargo test --locked --all-features -p web3_proxy_cli --bin web3_proxy_cli
+    cargo test --locked --all-features -p web3_proxy_cli --lib --bin web3_proxy_cli --test compare_rpcs
 
 FROM checked AS binary
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

@@ -49,6 +49,7 @@ pub struct Web3ProxyCli {
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand)]
 enum SubCommand {
+    CompareRpcs(sub_commands::CompareRpcsSubCommand),
     BlockRelay(sub_commands::BlockRelaySubCommand),
     CheckConfig(sub_commands::CheckConfigSubCommand),
     PopularityContest(sub_commands::PopularityContestSubCommand),
@@ -126,6 +127,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut cli_config: Web3ProxyCli = argh::from_env();
+
+    // The observer owns its endpoint config and exit codes. It must not load a
+    // server config, initialize Sentry, or start any proxy services.
+    if let SubCommand::CompareRpcs(command) = cli_config.sub_command {
+        let rt = runtime::Builder::new_multi_thread()
+            .worker_threads(cli_config.workers.max(1))
+            .enable_all()
+            .build()?;
+        let code = rt.block_on(command.main());
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+        std::process::exit(i32::from(code));
+    }
 
     if cli_config.config.is_none() && cli_config.sentry_url.is_none() {
         // TODO: default to example.toml if development.toml doesn't exist
@@ -247,6 +260,7 @@ fn main() -> anyhow::Result<()> {
 
     let result = rt.block_on(async {
         match cli_config.sub_command {
+            SubCommand::CompareRpcs(_) => unreachable!("observer handled before server setup"),
             SubCommand::BlockRelay(command) => {
                 command
                     .main(

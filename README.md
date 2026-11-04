@@ -77,6 +77,16 @@ RUST_BACKTRACE=1 RUST_LOG=web3_proxy=trace,info cargo nextest run
 
 ## Common commands
 
+Compare live HTTP responses from the normal proxy route and every direct backend:
+
+```sh
+web3_proxy_cli compare-rpcs --endpoints /path/to/private/endpoints.toml --output /path/to/new-capture
+```
+
+The runner uses a fixed common block, strict JSON comparison, `eth_*` and bounded
+`trace_*` cases, individual requests, batches, and repeats. Read the
+[configuration, coverage, and evidence limits](docs/rpc-comparison.md) before a live run.
+
 Check that the proxy is working:
 
 ```
