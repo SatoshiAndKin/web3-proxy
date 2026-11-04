@@ -150,8 +150,10 @@ the run; the runner does not silently rewrite them to another block.
 per-case verdicts, counts, and exit code. `exchanges.jsonl` links each exact
 request body to endpoint observations, HTTP status, elapsed time, relevant proxy
 headers, and raw `.body` files. A transport or size failure can leave a partial
-body; the observation marks it as partial. JSON differences use JSON Pointer
-paths; an omitted difference side means missing, while a present `null` means null.
+body when the credential scan completes; the observation marks it as partial.
+An undecodable body is withheld when configured URLs or secrets need protection.
+JSON differences use JSON Pointer paths; an omitted difference side means missing,
+while a present `null` means null.
 Each pair lists at most 100 differences; inspect the raw bodies for the complete
 difference.
 
@@ -184,8 +186,11 @@ or setup failure without a content difference. An invalidated anchor yields 2.
 The runner creates a private directory (0700) and private files (0600) on Unix.
 It does not save endpoint URLs or request authorization headers. If a reply
 reflects a configured URL or credential, it withholds that reply and marks a gap
-instead of changing the raw evidence. Treat all evidence as private: requests
-and response bodies can contain application data.
+instead of changing the raw evidence. The scan checks every JSON key and value,
+including duplicate fields, before strict response validation. If it cannot
+finish decoding a body, it withholds that body and keeps the HTTP metadata and
+failure reason. Treat all evidence as private: requests and response bodies can
+contain application data.
 
 `X-W3P-BACKEND-RPCS` and `X-W3P-BACKUP-RPC` describe backend attempts. They do not
 identify the source of a cache entry or prove which retry supplied the reply.

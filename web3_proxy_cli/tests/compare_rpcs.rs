@@ -67,6 +67,7 @@ fn failed_preflight(
                 }
                 Err(error) => panic!("{error}"),
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                 .unwrap();
@@ -237,4 +238,88 @@ fn authorization_credentials_are_automatically_protected() {
         assert!(!directory.path().join("capture/000001-proxy.body").exists());
         assert!(!directory.path().join("capture/000001-direct.body").exists());
     }
+}
+
+#[test]
+fn escaped_credentials_in_duplicate_fields_are_never_saved() {
+    let secret = "fixture-hidden-credential";
+    let encoded: String = secret
+        .chars()
+        .map(|c| format!("\\u{:04x}", c as u32))
+        .collect();
+    for body in [
+        format!(r#"{{"jsonrpc":"2.0","id":0,"id":0,"result":"{encoded}"}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":0,"result":"{encoded}","result":"public"}}"#),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":0,"result":"public","result":{{"nested":["{encoded}"]}}}}"#
+        ),
+    ] {
+        let (output, directory, requests) = failed_preflight(
+            "headers = { Authorization = 'TEST_COMPARE_AUTHORIZATION' }",
+            "",
+            &[("TEST_COMPARE_AUTHORIZATION", &format!("Bearer {secret}"))],
+            Some(body),
+        );
+        assert_eq!(requests, 2);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!directory.path().join("capture/000001-proxy.body").exists());
+        assert!(!directory.path().join("capture/000001-direct.body").exists());
+        for entry in std::fs::read_dir(directory.path().join("capture")).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(secret));
+            assert!(!text.contains(&encoded));
+        }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+}
+
+#[test]
+fn incomplete_json_and_non_json_responses_are_withheld() {
+    for body in [
+        "<html>upstream unavailable</html>",
+        r#"{"jsonrpc":"2.0","id":0,"result":"\u0066ixture-credential"#,
+    ] {
+        let (output, directory, requests) = failed_preflight(
+            "headers = { Authorization = 'TEST_COMPARE_AUTHORIZATION' }",
+            "",
+            &[("TEST_COMPARE_AUTHORIZATION", "Bearer fixture-credential")],
+            Some(body.into()),
+        );
+        assert_eq!(requests, 2);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!directory.path().join("capture/000001-proxy.body").exists());
+        assert!(!directory.path().join("capture/000001-direct.body").exists());
+        let journal =
+            std::fs::read_to_string(directory.path().join("capture/exchanges.jsonl")).unwrap();
+        assert!(journal.contains("credential scan could not decode JSON"));
+        assert!(!journal.contains("fixture-credential"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-credential"));
+    }
+}
+
+#[test]
+fn duplicate_public_fields_keep_raw_evidence_without_becoming_valid_replies() {
+    let body = r#"{"jsonrpc":"2.0","id":0,"id":0,"result":"0x1"}"#;
+    let (output, directory, requests) = failed_preflight(
+        "headers = { Authorization = 'TEST_COMPARE_AUTHORIZATION' }",
+        "",
+        &[("TEST_COMPARE_AUTHORIZATION", "Bearer fixture-credential")],
+        Some(body.into()),
+    );
+    assert_eq!(requests, 2);
+    assert_eq!(output.status.code(), Some(2));
+    for endpoint in ["proxy", "direct"] {
+        let bytes = std::fs::read(
+            directory
+                .path()
+                .join(format!("capture/000001-{endpoint}.body")),
+        )
+        .unwrap();
+        assert_eq!(bytes, body.as_bytes());
+    }
+    let journal =
+        std::fs::read_to_string(directory.path().join("capture/exchanges.jsonl")).unwrap();
+    assert!(journal.contains("invalid or duplicate JSON object key"));
+    assert!(!journal.contains("withheld"));
 }

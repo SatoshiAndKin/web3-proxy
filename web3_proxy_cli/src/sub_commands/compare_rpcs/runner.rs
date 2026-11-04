@@ -148,30 +148,15 @@ impl Runner {
         })
     }
 
-    fn reflects_secret(&self, bytes: &[u8]) -> bool {
-        self.secrets.iter().any(|secret| {
-            !secret.is_empty()
-                && bytes
-                    .windows(secret.len())
-                    .any(|part| part == secret.as_bytes())
-        })
-    }
-
-    fn json_reflects_secret(&self, value: &Json) -> bool {
-        match value {
-            Json::String(text) => self.reflects_secret(text.as_bytes()),
-            Json::Array(values) => values.iter().any(|v| self.json_reflects_secret(v)),
-            Json::Object(fields) => fields
-                .iter()
-                .any(|(k, v)| self.reflects_secret(k.as_bytes()) || self.json_reflects_secret(v)),
-            _ => false,
-        }
+    fn reflects_secret(&self, bytes: &[u8]) -> anyhow::Result<bool> {
+        super::credentials::reflects_secret(bytes, &self.secrets)
+            .map_err(|_| anyhow::anyhow!("credential scan could not decode JSON"))
     }
 
     fn save_json(&self, name: &str, value: &impl Serialize) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec_pretty(value)?;
         ensure!(
-            !self.reflects_secret(&bytes),
+            !self.reflects_secret(&bytes)?,
             "evidence withheld because it reflects endpoint credentials"
         );
         private_file(&self.output.join(name))?.write_all(&bytes)?;
@@ -194,7 +179,7 @@ impl Runner {
     ) -> anyhow::Result<Vec<Observation>> {
         let bytes = serde_json::to_vec(request)?;
         ensure!(
-            !self.reflects_secret(&bytes),
+            !self.reflects_secret(&bytes)?,
             "request withheld because it contains endpoint credentials"
         );
         self.sequence += 1;
@@ -210,26 +195,32 @@ impl Runner {
         )
         .await;
         for reply in &mut replies {
-            let parsed = Json::parse(&reply.body);
-            let decoded_secret = parsed
-                .as_ref()
-                .is_ok_and(|value| self.json_reflects_secret(value));
-            // Check both raw bytes and decoded strings. Preserve exact bodies
-            // unless the server reflects endpoint credentials; then withhold.
             let header_bytes = serde_json::to_vec(&reply.headers)?;
-            if self.reflects_secret(&reply.body)
-                || self.reflects_secret(&header_bytes)
-                || decoded_secret
-            {
+            let scan = self
+                .reflects_secret(&reply.body)
+                .and_then(|body_reflected| {
+                    Ok(body_reflected || self.reflects_secret(&header_bytes)?)
+                });
+            let withheld = match scan {
+                Ok(false) => None,
+                Ok(true) => Some("response withheld: reflected endpoint credentials"),
+                Err(_) => Some("response withheld: credential scan could not decode JSON"),
+            };
+            if let Some(reason) = withheld {
                 reply.body.clear();
                 reply.headers.clear();
-                reply.error = Some("response withheld: reflected endpoint credentials".into());
+                if let Some(error) = &mut reply.error {
+                    error.push_str("; ");
+                    error.push_str(reason);
+                } else {
+                    reply.error = Some(reason.into());
+                }
             } else {
                 let file = format!("{prefix}-{}.body", reply.endpoint);
                 private_file(&self.output.join(&file))?.write_all(&reply.body)?;
                 reply.body_file = Some(file);
                 if reply.error.is_none() {
-                    match parsed {
+                    match Json::parse(&reply.body) {
                         Ok(parsed) => reply.parsed = Some(parsed),
                         Err(error) => reply.error = Some(error.into()),
                     }

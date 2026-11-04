@@ -1,4 +1,5 @@
 mod corpus;
+mod credentials;
 mod runner;
 mod strict;
 #[cfg(test)]
