@@ -41,19 +41,24 @@ fn setup_failure_uses_exit_two_without_loading_the_default_server_config() {
     assert!(!error.contains("development.toml"));
 }
 
-#[test]
-fn executable_reads_private_environment_and_saves_failed_preflight_without_credentials() {
+fn failed_preflight(
+    endpoint_options: &str,
+    query: &str,
+    environment: &[(&str, &str)],
+    response_body: Option<String>,
+) -> (std::process::Output, tempfile::TempDir, usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let endpoint_file = directory.path().join("endpoints.toml");
-    std::fs::write(&endpoint_file, "[proxy]\nname = 'proxy'\nurl_env = 'TEST_COMPARE_PROXY'\n[[backends]]\nname = 'direct'\nurl_env = 'TEST_COMPARE_DIRECT'\n").unwrap();
+    std::fs::write(&endpoint_file, format!("[proxy]\nname = 'proxy'\nurl_env = 'TEST_COMPARE_PROXY'\n{endpoint_options}\n[[backends]]\nname = 'direct'\nurl_env = 'TEST_COMPARE_DIRECT'\n{endpoint_options}\n")).unwrap();
+    let (stop, stopped) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut count = 0;
         // Fail the genesis preflight on both endpoints with a non-block result.
-        while count < 4 && std::time::Instant::now() < deadline {
+        while count < 4 && std::time::Instant::now() < deadline && stopped.try_recv().is_err() {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -92,10 +97,12 @@ fn executable_reads_private_environment_and_saves_failed_preflight_without_crede
             }
             let request: Value =
                 serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
-            let body = json!({"jsonrpc":"2.0","id":request["id"],"result":"0x1"}).to_string();
+            let body = response_body.clone().unwrap_or_else(|| {
+                json!({"jsonrpc":"2.0","id":request["id"],"result":"0x1"}).to_string()
+            });
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             )
@@ -117,15 +124,24 @@ fn executable_reads_private_environment_and_saves_failed_preflight_without_crede
         ])
         .env(
             "TEST_COMPARE_PROXY",
-            format!("http://{address}/proxy?key=fixture-proxy-secret"),
+            format!("http://{address}/proxy?key=fixture-proxy-secret{query}"),
         )
         .env(
             "TEST_COMPARE_DIRECT",
-            format!("http://{address}/direct?key=fixture-direct-secret"),
+            format!("http://{address}/direct?key=fixture-direct-secret{query}"),
         )
+        .envs(environment.iter().copied())
         .output()
         .unwrap();
-    assert_eq!(server.join().unwrap(), 4);
+    let _ = stop.send(());
+    let requests = server.join().unwrap();
+    (output, directory, requests)
+}
+
+#[test]
+fn executable_reads_private_environment_and_saves_failed_preflight_without_credentials() {
+    let (output, directory, requests) = failed_preflight("", "", &[], None);
+    assert_eq!(requests, 4);
     assert_eq!(output.status.code(), Some(2));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-"));
     let capture = directory.path().join("capture");
@@ -139,5 +155,86 @@ fn executable_reads_private_environment_and_saves_failed_preflight_without_crede
     for entry in std::fs::read_dir(capture).unwrap() {
         let body = std::fs::read(entry.unwrap().path()).unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("fixture-"));
+    }
+}
+
+#[test]
+fn ordinary_query_and_header_values_do_not_withhold_evidence() {
+    for (options, query, environment) in [
+        ("", "&network=1", vec![]),
+        (
+            "headers = { Accept = 'TEST_COMPARE_ACCEPT' }",
+            "",
+            vec![("TEST_COMPARE_ACCEPT", "application/json")],
+        ),
+    ] {
+        let (output, directory, requests) = failed_preflight(options, query, &environment, None);
+        assert_eq!(requests, 4);
+        assert_eq!(output.status.code(), Some(2));
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("capture/report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["failure"], "genesis hash missing");
+        assert!(directory.path().join("capture/000001-proxy.body").exists());
+        assert!(directory.path().join("capture/000001-direct.body").exists());
+    }
+}
+
+#[test]
+fn explicit_secrets_protect_custom_headers_and_url_components() {
+    let secret = "fixture-explicit-api-key";
+    let body = json!({"jsonrpc":"2.0","id":0,"result":secret}).to_string();
+    for options in [
+        "secret_env = ['TEST_COMPARE_KEY']",
+        "secret_env = ['TEST_COMPARE_KEY']\nheaders = { 'X-API-Key' = 'TEST_COMPARE_KEY' }",
+    ] {
+        let (output, directory, requests) = failed_preflight(
+            options,
+            &format!("&api_key={secret}"),
+            &[("TEST_COMPARE_KEY", secret)],
+            Some(body.clone()),
+        );
+        assert_eq!(requests, 2);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!directory.path().join("capture/000001-proxy.body").exists());
+        assert!(!directory.path().join("capture/000001-direct.body").exists());
+        let journal =
+            std::fs::read_to_string(directory.path().join("capture/exchanges.jsonl")).unwrap();
+        assert!(journal.contains("withheld"));
+        assert!(!journal.contains(secret));
+    }
+}
+
+#[test]
+fn empty_explicit_secret_stops_setup() {
+    let (output, directory, requests) = failed_preflight(
+        "secret_env = ['TEST_COMPARE_EMPTY_SECRET']",
+        "",
+        &[("TEST_COMPARE_EMPTY_SECRET", "")],
+        None,
+    );
+    assert_eq!(requests, 0);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("empty secret for proxy"));
+    assert!(!directory.path().join("capture").exists());
+}
+
+#[test]
+fn authorization_credentials_are_automatically_protected() {
+    for scheme in ["Bearer", "bearer", "Basic"] {
+        let token = "fixture-authorization-token";
+        let header = format!("{scheme} {token}");
+        let body = json!({"jsonrpc":"2.0","id":0,"result":token}).to_string();
+        let (output, directory, requests) = failed_preflight(
+            "headers = { Authorization = 'TEST_COMPARE_AUTHORIZATION' }",
+            "",
+            &[("TEST_COMPARE_AUTHORIZATION", &header)],
+            Some(body),
+        );
+        assert_eq!(requests, 2);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!directory.path().join("capture/000001-proxy.body").exists());
+        assert!(!directory.path().join("capture/000001-direct.body").exists());
     }
 }

@@ -19,6 +19,9 @@ name = "proxy"
 url_env = "COMPARE_PROXY_URL"
 # Optional: each header value names an environment variable, not a literal secret.
 # headers = { Authorization = "COMPARE_PROXY_AUTHORIZATION" }
+# For API keys in URL paths/query parameters or custom headers, explicitly name
+# variables containing the secret values (not the complete URL).
+# secret_env = ["COMPARE_PROXY_API_KEY"]
 
 [[backends]]
 name = "erigon"
@@ -33,6 +36,14 @@ Set these variables in your private environment. Do not put credentials in comma
 arguments. The URL variables must contain distinct HTTP or HTTPS URLs. Header
 variables contain complete values, such as `Bearer ...`. Do not supply credentials
 that could appear as ordinary response values.
+
+The runner automatically protects complete endpoint URLs, URL passwords, and
+`Authorization`/`Proxy-Authorization` header values and their credential portions.
+List environment variables containing API keys or other sensitive URL components
+and custom header values in that endpoint's `secret_env`. Missing or empty secret
+variables stop setup. Ordinary query parameters, paths, and headers such as
+`Accept: application/json` are not classified as credentials. The runner does not
+guess whether a query value or path segment is a secret.
 
 Run the command with a **new** output directory whose parent already exists:
 

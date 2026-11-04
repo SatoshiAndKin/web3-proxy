@@ -58,6 +58,9 @@ struct EndpointConfig {
     url_env: String,
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    /// Environment variables containing sensitive URL parts or custom header values.
+    #[serde(default)]
+    secret_env: Vec<String>,
 }
 
 struct Endpoint {
@@ -148,13 +151,12 @@ impl CompareRpcsSubCommand {
             if let Some(password) = url.password() {
                 secrets.push(password.to_string());
             }
-            secrets.extend(
-                url.query_pairs()
-                    .map(|(_, v)| v.into_owned())
-                    .filter(|v| !v.is_empty()),
-            );
-            if let Some(segments) = url.path_segments() {
-                secrets.extend(segments.filter(|v| v.len() >= 16).map(str::to_string));
+            for variable in &endpoint.secret_env {
+                let value = std::env::var(variable).map_err(|_| {
+                    anyhow::anyhow!("missing secret environment variable for {}", endpoint.name)
+                })?;
+                ensure!(!value.is_empty(), "empty secret for {}", endpoint.name);
+                secrets.push(value);
             }
             let mut headers = reqwest::header::HeaderMap::new();
             for (name, variable) in &endpoint.headers {
@@ -171,15 +173,19 @@ impl CompareRpcsSubCommand {
                 })?;
                 ensure!(
                     !value.is_empty(),
-                    "empty credential header for {}",
+                    "empty header value for {}",
                     endpoint.name
                 );
-                secrets.push(value.clone());
-                if let Some(token) = value
-                    .strip_prefix("Bearer ")
-                    .or_else(|| value.strip_prefix("Basic "))
+                if name == reqwest::header::AUTHORIZATION
+                    || name == reqwest::header::PROXY_AUTHORIZATION
                 {
-                    secrets.push(token.to_string());
+                    secrets.push(value.clone());
+                    if let Some((_, token)) = value.split_once(' ') {
+                        let token = token.trim_start();
+                        if !token.is_empty() {
+                            secrets.push(token.to_string());
+                        }
+                    }
                 }
                 let mut value = reqwest::header::HeaderValue::from_str(&value)
                     .map_err(|_| anyhow::anyhow!("invalid header value for {}", endpoint.name))?;
