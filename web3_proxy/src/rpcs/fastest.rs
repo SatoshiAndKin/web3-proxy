@@ -100,6 +100,9 @@ impl Web3Rpcs {
                         }
                     }
                 } else if pending.is_empty() {
+                    if let Err(error @ Web3ProxyError::MethodNotFound(_)) = candidates {
+                        first_error.get_or_insert(error);
+                    }
                     break;
                 }
             }

@@ -433,6 +433,13 @@ impl BackendRequest {
                             // Preserve the reply for App's decoded transaction hash
                             // and pending notification, without a success sample.
                             ResponseType::Error
+                        } else if error.code == -32601 {
+                            // JSON-RPC defines this code independently of the
+                            // backend's wording, casing, or localization.
+                            response = Err(Web3ProxyError::MethodNotFound(
+                                self.web3_request.inner.method().to_string().into(),
+                            ));
+                            ResponseType::Error
                         } else if let Some(history_error) =
                             history_error_for_request(&self.web3_request, error)
                         {
@@ -498,27 +505,6 @@ impl BackendRequest {
                                     } else {
                                         ResponseType::Error
                                     }
-                                }
-                                -32601 => {
-                                    let error_msg = error.message.as_ref();
-
-                                    // sometimes a provider does not support all rpc methods
-                                    // we check other connections rather than returning the error
-                                    // but sometimes the method is something that is actually unsupported,
-                                    // so we save the response here to return it later
-
-                                    // some providers look like this
-                                    if (error_msg.starts_with("the method")
-                                        && error_msg.ends_with("is not available"))
-                                        || error_msg == "Method not found"
-                                    {
-                                        let method = self.web3_request.inner.method().to_string();
-
-                                        response =
-                                            Err(Web3ProxyError::MethodNotFound(method.into()))
-                                    }
-
-                                    ResponseType::Error
                                 }
                                 _ => ResponseType::Error,
                             }

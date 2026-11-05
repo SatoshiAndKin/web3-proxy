@@ -22,6 +22,7 @@ use arc_swap::ArcSwapOption;
 use deduped_broadcast::DedupedBroadcaster;
 use futures::future::select_all;
 use futures::StreamExt;
+use hashbrown::HashMap;
 use latency::{EwmaLatency, PeakEwmaLatency, RollingQuantileLatency};
 use nanorand::tls::TlsWyRand;
 use nanorand::Rng;
@@ -139,6 +140,8 @@ pub struct Web3Rpc {
     pub(super) log_data_limit: AtomicU64,
     /// Whether this backend accepts `eth_simulateV1` requests.
     pub(super) supports_simulate: AtomicBool,
+    /// Per-method startup probes; an absent entry has not been checked yet.
+    pub(super) trace_method_support: RwLock<HashMap<&'static str, bool>>,
     /// head_block is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) head_block_sender: Option<watch::Sender<Option<BlockHeader>>>,
     /// Track head block latency.
@@ -166,6 +169,20 @@ pub struct Web3Rpc {
     /// if subscribed to pending transactions, transactions are sent through this channel to update a parent Web3App
     pub(super) pending_txid_firehose: Option<Arc<DedupedBroadcaster<TxHash>>>,
 }
+
+// All standard Parity trace methods require at least one argument. Probing
+// with [] checks dispatch/parameter decoding without running an EVM trace.
+pub(super) const TRACE_METHODS: [&str; 9] = [
+    "trace_block",
+    "trace_call",
+    "trace_callMany",
+    "trace_filter",
+    "trace_get",
+    "trace_rawTransaction",
+    "trace_replayBlockTransactions",
+    "trace_replayTransaction",
+    "trace_transaction",
+];
 
 impl Web3Rpc {
     /// Connect to a web3 rpc
@@ -570,10 +587,31 @@ impl Web3Rpc {
         Ok(limit)
     }
 
-    async fn check_simulate_support(self: &Arc<Self>) -> anyhow::Result<bool> {
+    async fn probe_method_support<P: JsonRpcParams>(
+        self: &Arc<Self>,
+        method: &'static str,
+        params: &P,
+    ) -> Web3ProxyResult<bool> {
         let probe: Web3ProxyResult<OwnedLazyValue> = self
             .internal_request(
-                "eth_simulateV1".into(),
+                method.into(),
+                params,
+                Some(Level::TRACE.into()),
+                Some(Duration::from_secs(5)),
+            )
+            .await;
+        match probe {
+            Ok(_) => Ok(true),
+            Err(Web3ProxyError::MethodNotFound(_)) => Ok(false),
+            Err(Web3ProxyError::JsonRpcErrorData(error)) if error.code == -32601 => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn check_simulate_support(self: &Arc<Self>) -> anyhow::Result<bool> {
+        let supports_simulate = self
+            .probe_method_support(
+                "eth_simulateV1",
                 &json!([{
                     "blockStateCalls": [{
                         "calls": [{
@@ -584,23 +622,33 @@ impl Web3Rpc {
                     "validation": false,
                     "returnFullTransactions": false,
                 }, "latest"]),
-                Some(Level::TRACE.into()),
-                Some(Duration::from_secs(5)),
             )
-            .await;
-
-        let supports_simulate = match probe {
-            Ok(_) => true,
-            Err(Web3ProxyError::MethodNotFound(_)) => false,
-            Err(Web3ProxyError::JsonRpcErrorData(error)) if error.code == -32601 => false,
-            Err(error) => return Err(error.into()),
-        };
+            .await?;
 
         self.supports_simulate
             .store(supports_simulate, atomic::Ordering::SeqCst);
         info!(rpc = %self, supports_simulate, "detected eth_simulateV1 support");
 
         Ok(supports_simulate)
+    }
+
+    async fn check_trace_support(self: &Arc<Self>) -> Web3ProxyResult<()> {
+        let mut support = HashMap::with_capacity(TRACE_METHODS.len());
+        for method in TRACE_METHODS {
+            let supported = match self.probe_method_support(method, &[(); 0]).await {
+                Ok(supported) => supported,
+                // The dispatcher recognized this method and rejected the missing
+                // arguments. Other errors do not establish method support.
+                Err(Web3ProxyError::JsonRpcErrorData(error)) if error.code == -32602 => true,
+                Err(error) => return Err(error),
+            };
+            support.insert(method, supported);
+        }
+        // Publish a complete check. A transport failure must not publish a
+        // partially checked set or turn an existing capability into a failure.
+        info!(rpc = %self, ?support, "detected trace method support");
+        *self.trace_method_support.write() = support;
+        Ok(())
     }
 
     /// TODO: this might be too simple. different nodes can prune differently. its possible we will have a block range
@@ -634,7 +682,13 @@ impl Web3Rpc {
     }
 
     pub(super) fn supports_request(&self, request: &ValidatedRequest) -> bool {
-        !request.requires_simulate() || self.supports_simulate.load(atomic::Ordering::SeqCst)
+        (!request.requires_simulate() || self.supports_simulate.load(atomic::Ordering::SeqCst))
+            && self
+                .trace_method_support
+                .read()
+                .get(request.inner.method())
+                .copied()
+                .unwrap_or(true)
     }
 
     fn has_data_with_limit(&self, needed_block_num: U64, data_limit: U64) -> bool {
@@ -736,6 +790,10 @@ impl Web3Rpc {
             "unable to check eth_simulateV1 support of {}",
             self
         ))?;
+
+        self.check_trace_support()
+            .await
+            .web3_context("unable to check trace method support")?;
 
         // TODO: only do this for balanced_rpcs. this errors on 4337 rpcs
         self.check_block_data_limit()
@@ -1635,7 +1693,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 18)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 19)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
@@ -1668,6 +1726,8 @@ impl Serialize for Web3Rpc {
             "supports_simulate",
             &self.supports_simulate.load(atomic::Ordering::SeqCst),
         )?;
+
+        state.serialize_field("trace_method_support", &*self.trace_method_support.read())?;
 
         state.serialize_field("tier", &self.tier)?;
 
@@ -1756,6 +1816,8 @@ impl fmt::Debug for Web3Rpc {
             "supports_simulate",
             &self.supports_simulate.load(atomic::Ordering::SeqCst),
         );
+
+        f.field("trace_method_support", &*self.trace_method_support.read());
 
         f.field("tier", &self.tier.load(atomic::Ordering::SeqCst));
 
@@ -2295,7 +2357,19 @@ mod tests {
                     }));
                 }
 
+                for (index, method) in TRACE_METHODS.into_iter().enumerate() {
+                    let trace = node.next().await;
+                    assert_eq!(trace.body["method"], method);
+                    assert_eq!(trace.body["params"], serde_json::json!([]));
+                    let id = trace.body["id"].clone();
+                    let code = if index % 2 == 0 { -32602 } else { -32601 };
+                    trace.respond(serde_json::json!({"jsonrpc":"2.0", "id":id,
+                        "error":{"code":code,"message":"probe response"}}));
+                }
                 check.await.unwrap().unwrap();
+                for (index, method) in TRACE_METHODS.into_iter().enumerate() {
+                    assert_eq!(node.rpc.trace_method_support.read()[method], index % 2 == 0);
+                }
                 assert_eq!(
                     node.rpc.supports_simulate.load(atomic::Ordering::SeqCst),
                     supports_simulate
@@ -2835,3 +2909,90 @@ mod tests {
 #[cfg(test)]
 #[path = "log_probe_tests.rs"]
 mod log_probe_tests;
+
+#[cfg(test)]
+mod trace_probe_tests {
+    use super::super::batch_tests::Harness;
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn reconnect_probe_refreshes_each_trace_method_independently() {
+        super::super::test_support::with_cleanup(async {
+            let mut node = Harness::named("changing-client", 1, 64).await;
+            for generation in [0, 1] {
+                let rpc = node.rpc.clone();
+                let check =
+                    super::super::test_support::spawn(
+                        async move { rpc.check_trace_support().await },
+                    );
+                for (index, method) in TRACE_METHODS.into_iter().enumerate() {
+                    let probe = node.next().await;
+                    assert_eq!(probe.body["method"], method);
+                    assert_eq!(probe.body["params"], json!([]));
+                    let id = probe.body["id"].clone();
+                    let code = if index % 2 == generation {
+                        -32602
+                    } else {
+                        -32601
+                    };
+                    probe.respond(json!({"jsonrpc":"2.0","id":id,
+                        "error":{"code":code,"message":"capability response"}}));
+                }
+                check.await.unwrap().unwrap();
+                for (index, method) in TRACE_METHODS.into_iter().enumerate() {
+                    assert_eq!(
+                        node.rpc.trace_method_support.read()[method],
+                        index % 2 == generation
+                    );
+                }
+            }
+            node.idle();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn failed_probe_does_not_publish_partial_or_false_capabilities() {
+        for transport_error in [false, true] {
+            super::super::test_support::with_cleanup(async {
+                let mut node = Harness::named("transient-failure", 1, 64).await;
+                let original: HashMap<_, _> = TRACE_METHODS
+                    .into_iter()
+                    .map(|method| (method, true))
+                    .collect();
+                *node.rpc.trace_method_support.write() = original.clone();
+                let rpc = node.rpc.clone();
+                let check =
+                    super::super::test_support::spawn(
+                        async move { rpc.check_trace_support().await },
+                    );
+                let first = node.next().await;
+                let id = first.body["id"].clone();
+                first.respond(json!({"jsonrpc":"2.0","id":id,
+                    "error":{"code":-32601,"message":"disabled"}}));
+                let second = node.next().await;
+                if transport_error {
+                    second
+                        .reply
+                        .send(
+                            axum::http::Response::builder()
+                                .status(503)
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .unwrap();
+                } else {
+                    let id = second.body["id"].clone();
+                    second.respond(json!({"jsonrpc":"2.0","id":id,
+                        "error":{"code":-32603,"message":"temporary failure"}}));
+                }
+                assert!(check.await.unwrap().is_err());
+                assert_eq!(*node.rpc.trace_method_support.read(), original);
+                node.quiet().await;
+                node.idle();
+            })
+            .await;
+        }
+    }
+}

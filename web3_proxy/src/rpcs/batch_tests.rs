@@ -1948,3 +1948,6 @@ async fn ordinary_batch_starts_ready_calls_while_other_validation_is_blocked() {
 
 #[path = "latency_bench.rs"]
 mod latency_bench;
+
+#[path = "method_routing_tests.rs"]
+mod method_routing_tests;
