@@ -24,6 +24,27 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        id: buildx
+      # The GHA layer exporter does not include RUN cache mounts. Restore Cargo's
+      # dependency and compiler caches separately; Cargo still checks fingerprints.
+      - name: Restore Cargo build caches
+        id: cargo-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo-cache
+          key: cargo-production-amd64-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'docker/production.Dockerfile', 'docker/cargo-cache.Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-production-amd64-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'docker/production.Dockerfile', 'docker/cargo-cache.Dockerfile') }}-
+      - name: Restore Cargo cache mounts
+        if: steps.cargo-cache.outputs.cache-hit != ''
+        env:
+          BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          set -euo pipefail
+          # Change the RUN key without pruning the mounted Cargo cache.
+          docker buildx build --builder "$BUILDER" --platform linux/amd64 \
+            --build-arg "CACHE_TRANSFER_NONCE=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-restore" \
+            --progress plain --file docker/cargo-cache.Dockerfile --target restore --output type=cacheonly "$RUNNER_TEMP/cargo-cache"
       - name: Registry login
         if: github.repository == 'SatoshiAndKin/web3-proxy'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -40,11 +61,29 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.repository == 'SatoshiAndKin/web3-proxy' }}
           tags: ghcr.io/satoshiandkin/web3-proxy:sha-${{ github.sha }}
-          build-args: VCS_REF=${{ github.sha }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            CARGO_CACHE_SEED=${{ steps.cargo-cache.outputs.cache-hit == '' && format('{0}-{1}', github.run_id, github.run_attempt) || '' }}
           cache-from: type=gha,scope=production-amd64
           cache-to: type=gha,scope=production-amd64,mode=max
           provenance: true
           sbom: true
+      - name: Export Cargo cache mounts
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        env:
+          BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cargo-cache-empty"
+          # Export two archive files directly; do not load an intermediate image
+          # into Docker or copy millions of cache files through a container.
+          docker buildx build --builder "$BUILDER" --platform linux/amd64 \
+            --build-arg "CACHE_TRANSFER_NONCE=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-export" \
+            --progress plain --file docker/cargo-cache.Dockerfile --target export --output "type=local,dest=$RUNNER_TEMP/cargo-cache-export" \
+            "$RUNNER_TEMP/cargo-cache-empty"
+          (cd "$RUNNER_TEMP/cargo-cache-export" && sha256sum --check SHA256SUMS)
+          rm -rf "$RUNNER_TEMP/cargo-cache"
+          mv "$RUNNER_TEMP/cargo-cache-export" "$RUNNER_TEMP/cargo-cache"
       - name: Publish latest for the successful current-main build
         if: github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
         env:

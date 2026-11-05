@@ -30,16 +30,22 @@ COPY docs/block-relay.example.toml docs/block-relay.example.toml
 # Compile all test targets; run mock-only libraries and CLI filesystem tests.
 # Never install or start Anvil, an execution client, or a Beacon node here.
 FROM build AS checked
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
+# A cold cache needs fresh execution even when source layers match. A changing
+# argument preserves mounts; --no-cache would prune their contents.
+ARG CARGO_CACHE_SEED=
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    printf 'Cargo cache seed: %s\n' "$CARGO_CACHE_SEED" && \
     cargo fmt --all --check && \
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && \
-    cargo test --locked --all-features -p web3_proxy -p deduped_broadcast -p latency --lib && \
-    cargo test --locked --all-features -p web3_proxy_cli --lib --bin web3_proxy_cli --test compare_rpcs
+    cargo test --locked --all-features -p web3_proxy -p deduped_broadcast -p latency \
+      -p web3_proxy_cli --lib --bin web3_proxy_cli --test compare_rpcs
 
 FROM checked AS binary
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
+ARG CARGO_CACHE_SEED=
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    printf 'Cargo cache seed: %s\n' "$CARGO_CACHE_SEED" && \
     cargo build --release --locked -p web3_proxy_cli && \
     install -m 0755 target/release/web3_proxy_cli /usr/local/bin/web3_proxy_cli
 
