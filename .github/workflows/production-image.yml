@@ -41,10 +41,10 @@ jobs:
           BUILDER: ${{ steps.buildx.outputs.name }}
         run: |
           set -euo pipefail
-          # Cache contents do not invalidate RUN layers. Always execute the helper.
+          # Change the RUN key without pruning the mounted Cargo cache.
           docker buildx build --builder "$BUILDER" --platform linux/amd64 \
-            --no-cache --progress plain --file docker/cargo-cache.Dockerfile \
-            --target restore --output type=cacheonly "$RUNNER_TEMP/cargo-cache"
+            --build-arg "CACHE_TRANSFER_NONCE=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-restore" \
+            --progress plain --file docker/cargo-cache.Dockerfile --target restore --output type=cacheonly "$RUNNER_TEMP/cargo-cache"
       - name: Registry login
         if: github.repository == 'SatoshiAndKin/web3-proxy'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -79,8 +79,8 @@ jobs:
           # Export two archive files directly; do not load an intermediate image
           # into Docker or copy millions of cache files through a container.
           docker buildx build --builder "$BUILDER" --platform linux/amd64 \
-            --no-cache --progress plain --file docker/cargo-cache.Dockerfile \
-            --target export --output "type=local,dest=$RUNNER_TEMP/cargo-cache-export" \
+            --build-arg "CACHE_TRANSFER_NONCE=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-export" \
+            --progress plain --file docker/cargo-cache.Dockerfile --target export --output "type=local,dest=$RUNNER_TEMP/cargo-cache-export" \
             "$RUNNER_TEMP/cargo-cache-empty"
           (cd "$RUNNER_TEMP/cargo-cache-export" && sha256sum --check SHA256SUMS)
           rm -rf "$RUNNER_TEMP/cargo-cache"
