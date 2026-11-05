@@ -421,6 +421,16 @@ impl Web3Rpcs {
         };
 
         match ranked_rpcs.for_request(web3_request) {
+            None if !ranked_rpcs.inner.is_empty()
+                && ranked_rpcs
+                    .inner
+                    .iter()
+                    .all(|rpc| !rpc.supports_request(web3_request)) =>
+            {
+                Err(Web3ProxyError::MethodNotFound(
+                    web3_request.inner.method().to_string().into(),
+                ))
+            }
             None => Err(Web3ProxyError::NoServersSynced),
             Some(x) => Ok(x),
         }
