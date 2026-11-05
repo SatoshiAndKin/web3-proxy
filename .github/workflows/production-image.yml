@@ -61,12 +61,11 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.repository == 'SatoshiAndKin/web3-proxy' }}
           tags: ghcr.io/satoshiandkin/web3-proxy:sha-${{ github.sha }}
-          build-args: VCS_REF=${{ github.sha }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            CARGO_CACHE_SEED=${{ steps.cargo-cache.outputs.cache-hit == '' && format('{0}-{1}', github.run_id, github.run_attempt) || '' }}
           cache-from: type=gha,scope=production-amd64
           cache-to: type=gha,scope=production-amd64,mode=max
-          # Layer-cache hits contain no cache-mount data. Populate fresh Cargo
-          # mounts when no archive exists, even if the source layers are cached.
-          no-cache-filters: ${{ steps.cargo-cache.outputs.cache-hit == '' && 'checked,binary' || '' }}
           provenance: true
           sbom: true
       - name: Export Cargo cache mounts
