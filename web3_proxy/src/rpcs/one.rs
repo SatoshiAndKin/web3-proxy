@@ -3,7 +3,7 @@ use super::blockchain::{
     ArcHeader, BlockHeader, BlockHydrationCoordinator, BlockResponseCache, BlockResponseCacheKey,
     BlocksByHashCache, BlocksByNumberCache, CachedBlockResponse, HeadObservationPublisher,
 };
-use super::provider::{connect_ws, AlloyWsProvider};
+use super::provider::{connect_query_ws, connect_ws, AlloyWsProvider};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
 use crate::config::{
@@ -1071,7 +1071,13 @@ impl Web3Rpc {
         if let Some(url) = self.ws_url.clone() {
             trace!("starting websocket provider on {}", self);
 
-            let x = connect_ws(url).await?;
+            // A WebSocket-only backend carries complete RPC replies as well as
+            // heads. Keep head-only/IPC consumers on the existing frame budget.
+            let x = if self.http_url.is_none() && self.ipc_path.is_none() {
+                connect_query_ws(url).await?
+            } else {
+                connect_ws(url).await?
+            };
 
             let x = Arc::new(x);
 
