@@ -34,6 +34,12 @@ Versus returns the first complete success, including `null`, or execution revert
 
 Later successful completions update the existing median and peak backend latency metrics. They do not change the client answer or its recorded response time. RPC errors, including accepted reverts, do not produce successful latency samples. Local replies and cache hits start no comparison and add no backend timing samples. Transaction submission rules, subscriptions, client IDs, and batch order stay in place. A completed comparison cannot restart through application retries, gas-estimate error handling, or transaction/receipt archive fallback. If every node fails, Versus returns the first completed failure; if the deadline expires, it reports timeout.
 
+Local IPC uses a bounded pool of two persistent streams per logical backend.
+Ordinary calls rotate across the streams; subscriptions use the first stream.
+Both streams share the backend's request permits, capabilities, required-block
+checks, latency estimates, and vote. Alloy owns framing, IDs, and reconnects on
+each stream. Status reports the provider count as `ipc_pool_size`.
+
 Backend WebSocket calls keep Alloy's existing transport, response parsing, and reconnect behavior. Alloy handles backend response IDs, and the proxy returns the original client ID. HTTP backends, including requests from WebSocket clients, use the complete-response validation path described above.
 
 Each server has different limits that can be configured. The `soft_limit` is the number of parallel active requests where a server starts to slow down, while the `hard_limit` is where a server starts giving rate limits or other errors.
