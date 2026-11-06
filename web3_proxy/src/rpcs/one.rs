@@ -1610,7 +1610,11 @@ impl Web3Rpc {
                 let rpc = self.clone();
                 let request = web3_request.clone();
                 Ok(OpenRequestResult::Busy(Box::pin(async move {
+                    let mut timing =
+                        crate::perf::Stage::new(request.perf_sample, "capacity_wait", &rpc.name);
                     let permit = rpc.request_permits.acquire().await?;
+                    timing.finish();
+                    drop(timing);
                     Ok(OpenRequestHandle::new(
                         request,
                         rpc,
@@ -1752,6 +1756,14 @@ impl Serialize for Web3Rpc {
         )?;
 
         state.serialize_field("trace_method_support", &*self.trace_method_support.read())?;
+
+        state.serialize_field(
+            "latency_queues",
+            &(
+                self.peak_latency.as_ref().map(|x| x.queue_stats()),
+                self.median_latency.as_ref().map(|x| x.queue_stats()),
+            ),
+        )?;
 
         state.serialize_field("tier", &self.tier)?;
 

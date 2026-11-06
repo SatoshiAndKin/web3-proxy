@@ -145,6 +145,9 @@ pub struct ValidatedRequest {
 
     pub proxy_mode: ProxyMode,
 
+    /// Internal sampled timing identity. Never taken from client input.
+    pub perf_sample: Option<std::num::NonZeroU64>,
+
     // TODO: everything under here should be behind a single lock. all these atomics need to be updated together!
     /// Instant that the request was received (or at least close to it)
     /// We use Instant and not timestamps to avoid problems with leap seconds and similar issues
@@ -237,6 +240,9 @@ impl ValidatedRequest {
         if Instant::now() >= start_instant + expire_timeout {
             return Err(Web3ProxyError::Timeout(None));
         }
+        let perf_sample = crate::perf::sample();
+        let mut validation =
+            crate::perf::Stage::since(perf_sample, start_instant, "validation", "");
         let request_blocks = if head_block.is_none() {
             RequestBlocks::None
         } else {
@@ -262,10 +268,12 @@ impl ValidatedRequest {
             head_block: head_block.clone(),
             inner: request,
             proxy_mode,
+            perf_sample,
             start_instant,
             request_id,
         };
 
+        validation.finish();
         Ok(Arc::new(x))
     }
 

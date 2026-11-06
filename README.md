@@ -43,6 +43,31 @@ APIs outside the balanced RPC pool. It can run alone against existing Geth, Reth
 and other Engine V4 clients. It starts in observe mode; speed gains need a measured
 comparison before enabling injection.
 
+## Performance diagnostics
+
+Each backend in `/status` includes `latency_queues`: peak EWMA first, then the
+rolling median. Each snapshot reports its queue ID, capacity in use, total capacity,
+and full/closed drop counts. Capacity in use includes reserved channel slots.
+Snapshots read Tokio's existing state. Successful sends do not update a separate
+queue-depth counter.
+
+For a bounded diagnostic run, set
+`RUST_LOG=warn,web3_proxy::perf=info,latency::perf=info`. Request stages sample one in
+1,024 validations per worker thread. Each latency channel separately samples one in
+1,024 reports. Events include validation, selection, backend permit waits, complete
+backend requests, latency-report task waits, and channel residence time. Queue IDs
+match `/status`. `complete=false` marks a scope that ended before its normal finish,
+including cancellation and early errors. No client IDs or payload data enter these
+events or their parent span.
+
+Detailed tracing is off by default. Disabled traces do not read a diagnostic clock
+or increment sampling counters. Compare tracing off/on with the same release build,
+input, concurrency, cache state, and backend state before trusting measurements.
+Sampled events still have observer cost. Use traces to locate work, then score each
+optimization with detailed tracing off. CPU samples describe CPU work; stage and
+channel timings also include asynchronous waits. Neither establishes a bottleneck
+without the matched workload comparison.
+
 ## Quick development
 
 1. Copy `.env.example` to `.env` and set local secrets.

@@ -715,6 +715,12 @@ impl App {
         F: Fn(OpenRequestHandle) -> Fut + Copy + Send + Sync + 'static,
         Fut: std::future::Future<Output = Web3ProxyResult<jsonrpc::SingleResponse>> + Send,
     {
+        let mut timing = crate::perf::Stage::since(
+            web3_request.perf_sample,
+            web3_request.start_instant,
+            "request_total",
+            "",
+        );
         let mut ranked_rpcs_recv = self.balanced_rpcs.watch_ranked_rpcs.subscribe();
         let mut last_success = None;
         let mut last_error = None;
@@ -837,6 +843,7 @@ impl App {
 
         let rpcs = web3_request.backend_rpcs_used();
 
+        timing.finish();
         (code, response, rpcs)
     }
 

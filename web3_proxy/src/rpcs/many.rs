@@ -405,6 +405,7 @@ impl Web3Rpcs {
         &self,
         web3_request: &Arc<ValidatedRequest>,
     ) -> Web3ProxyResult<RpcsForRequest> {
+        let mut timing = crate::perf::Stage::new(web3_request.perf_sample, "selection", "");
         let ranked_rpcs = if self.watch_head_block.is_some() {
             self.watch_ranked_rpcs
                 .borrow()
@@ -420,7 +421,7 @@ impl Web3Rpcs {
             ))
         };
 
-        match ranked_rpcs.for_request(web3_request) {
+        let result = match ranked_rpcs.for_request(web3_request) {
             None if !ranked_rpcs.inner.is_empty()
                 && ranked_rpcs
                     .inner
@@ -433,7 +434,9 @@ impl Web3Rpcs {
             }
             None => Err(Web3ProxyError::NoServersSynced),
             Some(x) => Ok(x),
-        }
+        };
+        timing.finish();
+        result
     }
 
     pub async fn internal_request<P: JsonRpcParams, R: JsonRpcResultData>(

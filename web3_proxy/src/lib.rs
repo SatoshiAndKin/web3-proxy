@@ -10,6 +10,7 @@ pub mod errors;
 pub mod frontend;
 pub mod globals;
 pub mod jsonrpc;
+mod perf;
 pub mod prelude;
 pub mod rpcs;
 pub mod test_utils;
