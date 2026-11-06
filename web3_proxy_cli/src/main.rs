@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::runtime;
 use tracing::{info, warn};
-use tracing_subscriber::{prelude::*, EnvFilter};
+use tracing_subscriber::{filter::FilterExt, prelude::*, EnvFilter};
 use web3_proxy::prelude::alloy::primitives::U256;
 use web3_proxy::{app::APP_USER_AGENT, config::TopConfig};
 use web3_proxy_cli::{sub_commands, DEFAULT_CONFIG_PATH};
@@ -80,7 +80,16 @@ where
 {
     // An unfiltered None layer can keep tracing::enabled! true even when
     // every output rejects the event. Filter the optional layer too.
-    enabled.then(sentry_tracing::layer).with_filter(filter)
+    // This client reports errors and breadcrumbs, not transactions. Filtering
+    // spans inside SentryLayer is too late: its enter/exit callbacks still run
+    // for spans that another layer accepts. Reject spans at the layer boundary
+    // so an HTTP request never clones a Sentry hub or locks its scope per poll.
+    let events = tracing_subscriber::filter::filter_fn(move |metadata| {
+        enabled && metadata.is_event() && *metadata.level() <= tracing::Level::INFO
+    });
+    enabled
+        .then(sentry_tracing::layer)
+        .with_filter(filter.and(events))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -239,6 +248,10 @@ fn main() -> anyhow::Result<()> {
 
     tracing_registry.init();
 
+    info!(
+        sentry_enabled = _sentry_guard.is_enabled(),
+        "Sentry error reporting configured"
+    );
     info!(%APP_USER_AGENT);
 
     // set up tokio's async runtime
@@ -315,11 +328,16 @@ fn load_dotenv() -> anyhow::Result<()> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{config_path, DEFAULT_LOG_DIRECTIVES};
+    use super::{config_path, sentry, DEFAULT_LOG_DIRECTIVES};
     use std::{fs, os::unix::fs::symlink};
+
+    // Callsite interest is process-wide. Keep the temporary dispatchers from
+    // changing each other's cached interests while asserting disabled sites.
+    static TRACING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn default_debug_logging_keeps_timing_targets_opt_in() {
+        let _guard = TRACING_TEST_LOCK.lock().unwrap();
         use tracing_subscriber::{prelude::*, EnvFilter};
         let defaults = DEFAULT_LOG_DIRECTIVES.join(",");
         let subscriber = tracing_subscriber::registry()
@@ -340,6 +358,7 @@ mod tests {
 
     #[test]
     fn optional_sentry_respects_timing_filters_before_sampling() {
+        let _guard = TRACING_TEST_LOCK.lock().unwrap();
         use tracing_subscriber::{prelude::*, EnvFilter};
         for sentry_enabled in [false, true] {
             for (directives, timing_enabled) in [
@@ -366,6 +385,69 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn sentry_reports_errors_without_instrumenting_request_spans() {
+        let _guard = TRACING_TEST_LOCK.lock().unwrap();
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::{prelude::*, EnvFilter};
+
+        #[derive(Default)]
+        struct Capture(Mutex<Vec<sentry::Envelope>>);
+        impl sentry::Transport for Capture {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                self.0.lock().unwrap().push(envelope);
+            }
+        }
+
+        let transport = Arc::new(Capture::default());
+        let transactions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampled = transactions.clone();
+        let client = Arc::new(sentry::Client::from(
+            sentry::ClientOptions::new()
+                .dsn("https://public@sentry.invalid/1")
+                .transport(transport.clone())
+                .traces_sampler(move |_| {
+                    sampled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    0.0
+                }),
+        ));
+        assert!(client.is_enabled());
+        let hub = Arc::new(sentry::Hub::new(Some(client), Arc::default()));
+        let fmt = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(EnvFilter::new("trace"));
+        let sentry = super::optional_sentry_layer(true, EnvFilter::new("trace"));
+        let subscriber = tracing_subscriber::registry().with(fmt).with(sentry);
+        sentry::Hub::run(hub.clone(), || {
+            tracing::subscriber::with_default(subscriber, || {
+                // The HTTP middleware uses this fallback at ordinary log levels.
+                let request = tracing::error_span!("request", id = "synthetic-request");
+                for _ in 0..3 {
+                    let _entered = request.enter();
+                    assert!(Arc::ptr_eq(&sentry::Hub::current(), &hub));
+                    sentry::configure_scope(|scope| assert!(scope.get_span().is_none()));
+                    tracing::trace!("ignored trace");
+                    tracing::debug!("ignored debug");
+                }
+                tracing::info!("synthetic breadcrumb");
+                tracing::warn!("synthetic warning");
+                tracing::error!(diagnostic = true, "synthetic failure");
+            });
+        });
+        let envelopes = transport.0.lock().unwrap();
+        assert_eq!(envelopes.len(), 1);
+        let event = envelopes[0].event().unwrap();
+        assert_eq!(event.message.as_deref(), Some("synthetic failure"));
+        assert_eq!(event.breadcrumbs.len(), 2);
+        let sentry::protocol::Context::Other(fields) = &event.contexts["Rust Tracing Fields"]
+        else {
+            panic!("missing structured tracing fields");
+        };
+        assert_eq!(fields.get("diagnostic"), Some(&serde_json::json!(true)));
+        assert_eq!(transactions.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(event.transaction.is_none());
     }
 
     #[test]

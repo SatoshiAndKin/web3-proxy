@@ -88,6 +88,19 @@ optimization with detailed tracing off. CPU samples describe CPU work; stage and
 channel timings also include asynchronous waits. Neither establishes a bottleneck
 without the matched workload comparison.
 
+## Sentry error reporting
+
+Set `app.sentry_url` in the private config or inject `SENTRY_DSN` into the process.
+The startup log reports `sentry_enabled` without printing the DSN. `SENTRY_ENV`
+defaults to `production`. Keep credentials in the deployment secret store.
+
+Sentry captures ERROR events and INFO/WARN breadcrumbs that pass `RUST_LOG`.
+It does not subscribe to tracing spans or send transactions. A zero transaction
+sample rate alone does not remove the SDK's span and scope work. The Sentry layer
+rejects spans before its callbacks run, including the HTTP request span.
+Panic reporting remains enabled. DEBUG performance diagnostics use the separate
+sampled output described above and do not become Sentry breadcrumbs.
+
 ## Quick development
 
 1. Copy `.env.example` to `.env` and set local secrets.
