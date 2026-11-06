@@ -1,3 +1,7 @@
+mod diagnostics;
+pub use diagnostics::{
+    diagnostic_queue_stats, flush_diagnostics, record_request_stage, DiagnosticQueueStats,
+};
 mod ewma;
 mod peak_ewma;
 mod queue;

@@ -165,6 +165,7 @@ async fn _status(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
         "hostname": app.hostname,
         "pending_txid_firehose": app.pending_txid_firehose,
         "private_rpcs": app.protected_rpcs,
+        "perf_diagnostics": latency::diagnostic_queue_stats(),
         "uptime": app.start.elapsed().as_secs(),
         "version": APP_USER_AGENT,
     });

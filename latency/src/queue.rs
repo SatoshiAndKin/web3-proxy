@@ -61,8 +61,7 @@ pub(crate) struct Sample<T> {
 impl<T> Sample<T> {
     pub(crate) fn received(&self, id: u64, channel: &'static str, remaining: usize) {
         if let Some(start) = self.queued_at {
-            tracing::debug!(target: "latency::perf", parent: None, queue = id, channel, remaining,
-                wait_us = start.elapsed().as_secs_f64() * 1_000_000.0, "latency channel");
+            crate::diagnostics::record_channel(id, channel, remaining, start.elapsed());
         }
     }
 }

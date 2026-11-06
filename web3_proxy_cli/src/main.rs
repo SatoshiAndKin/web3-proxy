@@ -23,6 +23,18 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+// Keep timing diagnostics separate from ordinary application debug logs.
+const DEFAULT_LOG_DIRECTIVES: &[&str] = &[
+    "info",
+    "alloy_provider=error",
+    "alloy_transport=error",
+    "web3_proxy::rpcs::consensus=info",
+    "web3_proxy=debug",
+    "web3_proxy_cli=debug",
+    "web3_proxy::perf=off",
+    "latency::perf=off",
+];
+
 #[cfg(feature = "deadlock_detection")]
 use {parking_lot::deadlock, std::thread, tokio::time::Duration};
 
@@ -107,16 +119,7 @@ fn main() -> anyhow::Result<()> {
                     "web3_proxy_cli=trace",
                 ]
             }
-            _ => {
-                vec![
-                    "info",
-                    "alloy_provider=error",
-                    "alloy_transport=error",
-                    "web3_proxy::rpcs::consensus=info",
-                    "web3_proxy=debug",
-                    "web3_proxy_cli=debug",
-                ]
-            }
+            _ => DEFAULT_LOG_DIRECTIVES.to_vec(),
         }
         .join(","),
     };
@@ -291,6 +294,7 @@ fn main() -> anyhow::Result<()> {
     });
     // Blocking disk or crypto work must not hold container shutdown indefinitely.
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    let _ = web3_proxy::flush_diagnostics(std::time::Duration::from_millis(100));
     result
 }
 
@@ -304,8 +308,28 @@ fn load_dotenv() -> anyhow::Result<()> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::config_path;
+    use super::{config_path, DEFAULT_LOG_DIRECTIVES};
     use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn default_debug_logging_keeps_timing_targets_opt_in() {
+        use tracing_subscriber::{prelude::*, EnvFilter};
+        let defaults = DEFAULT_LOG_DIRECTIVES.join(",");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new(&defaults)));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "web3_proxy", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG));
+        });
+        let explicit = format!("{defaults},web3_proxy::perf=debug,latency::perf=debug");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new(explicit)));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG));
+            assert!(tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG));
+        });
+    }
 
     #[test]
     fn config_reload_follows_rotated_projected_volume() {
