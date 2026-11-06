@@ -180,6 +180,12 @@ You can copy `config/example.toml` to `config/production-$CHAINNAME.toml` and th
 
 ### Production JSON and CPU requirements
 
+The production image builds with the existing `faster_release` profile. It uses
+one code-generation unit and full link-time optimization. Docker keeps debug
+information off and strips the installed binary through that profile's Cargo
+environment settings. Runtime worker counts and resource limits stay in the
+private deployment configuration.
+
 Application JSON decoding and encoding use `sonic-rs`, including cached block
 metadata and full-to-hashes projection. The cache keeps the original full response
 and unknown provider fields intact. Alloy's WebSocket API and required dependency internals still
