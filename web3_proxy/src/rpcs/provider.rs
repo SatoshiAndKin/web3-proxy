@@ -1,11 +1,13 @@
-use alloy::providers::{ProviderBuilder, RootProvider, WsConnect};
+use alloy::providers::{IpcConnect, ProviderBuilder, RootProvider, WsConnect};
 use alloy::transports::ws::WebSocketConfig;
+use std::path::PathBuf;
 use url::Url;
 
 use crate::errors::Web3ProxyResult;
 
 pub type AlloyWsProvider = RootProvider;
 pub type AlloyHttpProvider = RootProvider;
+pub type AlloyIpcProvider = RootProvider;
 
 // Match the owned nodes' 1024-MiB RPC response allowance. Query responses can
 // exceed the default 16-MiB frame size; head-only consumers retain their defaults.
@@ -23,6 +25,12 @@ pub fn connect_http(url: Url) -> Web3ProxyResult<AlloyHttpProvider> {
     }
 
     Ok(ProviderBuilder::default().connect_http(url))
+}
+
+pub(super) async fn connect_ipc(path: PathBuf) -> Web3ProxyResult<AlloyIpcProvider> {
+    Ok(ProviderBuilder::default()
+        .connect_ipc(IpcConnect::new(path))
+        .await?)
 }
 
 pub async fn connect_ws(url: Url) -> Web3ProxyResult<AlloyWsProvider> {

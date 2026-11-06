@@ -3,7 +3,9 @@ use super::blockchain::{
     ArcHeader, BlockHeader, BlockHydrationCoordinator, BlockResponseCache, BlockResponseCacheKey,
     BlocksByHashCache, BlocksByNumberCache, CachedBlockResponse, HeadObservationPublisher,
 };
-use super::provider::{connect_query_ws, connect_ws, AlloyWsProvider};
+use super::provider::{
+    connect_ipc, connect_query_ws, connect_ws, AlloyIpcProvider, AlloyWsProvider,
+};
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
 use crate::config::{
@@ -110,16 +112,17 @@ pub struct Web3Rpc {
     pub(super) block_response_cache: Option<BlockResponseCache>,
     /// created_at is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) created_at: Option<Instant>,
-    /// if no ipc_stream, most all requests prefer to use the http_provider
+    /// HTTP handles ordinary RPC when IPC is not configured.
     pub(super) http_client: Option<reqwest::Client>,
     pub(super) http_url: Option<Url>,
-    /// the websocket url is only used for subscriptions
+    /// Remote WebSocket transport for subscriptions and RPC without HTTP.
     pub(super) ws_url: Option<Url>,
-    /// the websocket provider is only used for subscriptions
+    /// Shared persistent WebSocket provider.
     pub(super) ws_provider: ArcSwapOption<AlloyWsProvider>,
-    /// most all requests prefer the ipc provider.
-    /// TODO: ArcSwapOption?
+    /// IPC takes precedence for local requests and subscriptions.
     pub(super) ipc_path: Option<PathBuf>,
+    pub(super) ipc_allowed_modules: Option<Vec<String>>,
+    pub(super) ipc_provider: ArcSwapOption<AlloyIpcProvider>,
     /// keep track of hard limits
     /// hard_limit_until is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) hard_limit_until: Option<watch::Sender<Instant>>,
@@ -224,6 +227,9 @@ impl Web3Rpc {
             ));
         }
 
+        if config.ipc_allowed_modules.is_some() && config.ipc_path.is_none() {
+            return Err(anyhow!("ipc_allowed_modules requires ipc_path"));
+        }
         if config.max_concurrent_requests == 0 {
             return Err(anyhow!("max_concurrent_requests must be greater than zero"));
         }
@@ -293,6 +299,7 @@ impl Web3Rpc {
             http_url,
             http_client,
             ipc_path: config.ipc_path,
+            ipc_allowed_modules: config.ipc_allowed_modules,
             max_head_block_age,
             name,
             peak_latency: Some(peak_latency),
@@ -1068,11 +1075,14 @@ impl Web3Rpc {
             return Ok(());
         }
 
-        if let Some(url) = self.ws_url.clone() {
+        if let Some(path) = self.ipc_path.clone() {
+            self.ipc_provider
+                .store(Some(Arc::new(connect_ipc(path).await?)));
+        } else if let Some(url) = self.ws_url.clone() {
             trace!("starting websocket provider on {}", self);
 
             // A WebSocket-only backend carries complete RPC replies as well as
-            // heads. Keep head-only/IPC consumers on the existing frame budget.
+            // heads. Head-only consumers retain the existing frame budget.
             let x = if self.http_url.is_none() && self.ipc_path.is_none() {
                 connect_query_ws(url).await?
             } else {
@@ -1261,7 +1271,9 @@ impl Web3Rpc {
         }
 
         // subscribe to new transactions
-        if self.pending_txid_firehose.is_some() && self.ws_provider.load().is_some() {
+        if self.pending_txid_firehose.is_some()
+            && (self.ipc_provider.load().is_some() || self.ws_provider.load().is_some())
+        {
             let clone = self.clone();
 
             let f = async move {
@@ -1300,6 +1312,7 @@ impl Web3Rpc {
         }
 
         self.ws_provider.store(None);
+        self.ipc_provider.store(None);
 
         Ok(())
     }
@@ -1309,21 +1322,24 @@ impl Web3Rpc {
 
         let pending_txid_firehose = self.pending_txid_firehose.as_ref().unwrap();
 
-        if let Some(ws_provider) = self.ws_provider.load().as_ref() {
+        if let Some(provider) = self
+            .ipc_provider
+            .load_full()
+            .or_else(|| self.ws_provider.load_full())
+        {
             // todo: move subscribe_blocks onto the request handle instead of having a seperate wait_for_throttle
             self.wait_for_throttle(Instant::now() + Duration::from_secs(5))
                 .await?;
 
             // TODO: only subscribe if a user has subscribed
-            let subscription = ws_provider.subscribe_pending_transactions().await?;
+            let subscription = provider.subscribe_pending_transactions().await?;
             let mut pending_txs_sub = subscription.into_stream();
 
             while let Some(x) = pending_txs_sub.next().await {
                 pending_txid_firehose.send(x).await;
             }
         } else {
-            // only websockets subscribe to pending transactions
-            // its possible to do with http, but not recommended
+            // Pending subscriptions require an IPC or WebSocket provider.
             // TODO: what should we do here?
             unimplemented!()
         }
@@ -1341,11 +1357,15 @@ impl Web3Rpc {
             Some(Level::ERROR.into())
         };
 
-        if let Some(ws_provider) = self.ws_provider.load().as_ref() {
+        if let Some(provider) = self
+            .ipc_provider
+            .load_full()
+            .or_else(|| self.ws_provider.load_full())
+        {
             self.wait_for_throttle(Instant::now() + Duration::from_secs(5))
                 .await?;
 
-            let subscription = ws_provider.subscribe_blocks().await?;
+            let subscription = provider.subscribe_blocks().await?;
             let mut headers = subscription.into_stream();
 
             // query the block once since the subscription doesn't send the current block
@@ -1445,7 +1465,7 @@ impl Web3Rpc {
     }
 
     pub(crate) fn supports_batch(&self) -> bool {
-        self.http_client.is_some() && self.http_url.is_some()
+        self.ipc_path.is_none() && self.http_client.is_some() && self.http_url.is_some()
     }
 
     /// Recheck mutable backend state while holding the reserved slot.

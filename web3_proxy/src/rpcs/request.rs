@@ -13,8 +13,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{timeout_at, Duration, Instant};
 use tracing::{debug, error, info, trace, warn, Level};
@@ -225,6 +223,17 @@ impl BackendRequest {
         if self.web3_request.expired() {
             return Err(Web3ProxyError::Timeout(None));
         }
+        if self.rpc.ipc_path.is_some() {
+            if let Some(allowed) = &self.rpc.ipc_allowed_modules {
+                let method = self.web3_request.inner.method();
+                if !method
+                    .split_once('_')
+                    .is_some_and(|(module, _)| allowed.iter().any(|allowed| allowed == module))
+                {
+                    return Err(Web3ProxyError::MethodNotFound(method.to_owned().into()));
+                }
+            }
+        }
         if !self
             .rpc
             .can_submit(&self.web3_request, self.allow_unhealthy)
@@ -256,32 +265,13 @@ impl BackendRequest {
         self.rpc
             .total_requests
             .fetch_add(1, atomic::Ordering::Relaxed);
-        let response = if let Some(ipc_path) = self.rpc.ipc_path.as_ref() {
-            // first, prefer the unix stream
-            let request = self
-                .web3_request
-                .inner
-                .jsonrpc_request()
-                .context("there should always be a request here")?;
-
-            // TODO: instead of connecting every time, use a connection pool
-            let mut ipc_stream = UnixStream::connect(ipc_path).await?;
-
-            ipc_stream.writable().await?;
-
-            let x = sonic_rs::to_vec(request)?;
-
-            let _ = ipc_stream.write(&x).await?;
-
-            ipc_stream.readable().await?;
-
-            let mut buf = Vec::new();
-
-            let n = ipc_stream.try_read(&mut buf)?;
-
-            let x: ParsedResponse<R> = sonic_rs::from_slice(&buf[..n])?;
-
-            Ok(x.into())
+        let response = if self.rpc.ipc_path.is_some() {
+            let provider = self
+                .rpc
+                .ipc_provider
+                .load_full()
+                .context("IPC provider is not connected")?;
+            self.pubsub_request(&provider).await
         } else if let (Some(url), Some(client)) = (self.rpc.http_url.clone(), &self.rpc.http_client)
         {
             // second, prefer the http provider
@@ -321,34 +311,55 @@ impl BackendRequest {
             let response: ParsedResponse<R> = sonic_rs::from_slice(&bytes)?;
             Ok(response.into())
         } else if let Some(p) = self.rpc.ws_provider.load().as_ref() {
-            // use the websocket provider if no other provider is available
-            let method = self.web3_request.inner.method();
-            let params = self.web3_request.inner.params();
-            let params = sonic_rs::to_string(params)?;
-            let params =
-                serde_json::value::RawValue::from_string(params).map_err(anyhow::Error::from)?;
-
-            let response = match p.raw_request_dyn(method.to_string().into(), &params).await {
-                Ok(value) => {
-                    let value = sonic_rs::from_str::<R>(value.get())?;
-                    jsonrpc::ParsedResponse::from_result(value, self.web3_request.id())
-                }
-                Err(transport_error) => match JsonRpcErrorData::try_from(&transport_error) {
-                    Ok(x) => jsonrpc::ParsedResponse::from_error(x, self.web3_request.id()),
-                    Err(err) => {
-                        warn!(?err, "error from {}", self.rpc);
-
-                        return Err(transport_error.into());
-                    }
-                },
-            };
-
-            Ok(response.into())
+            self.pubsub_request(p).await
         } else {
             // this must be a test
             Err(anyhow::anyhow!("no provider configured!").into())
         };
         response
+    }
+
+    async fn pubsub_request<R: JsonRpcResultData>(
+        &self,
+        provider: &alloy::providers::RootProvider,
+    ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
+        let method = self.web3_request.inner.method();
+        let params = self.web3_request.inner.params();
+        let params = sonic_rs::to_string(params)?;
+        let params =
+            serde_json::value::RawValue::from_string(params).map_err(anyhow::Error::from)?;
+
+        let response = match provider
+            .raw_request_dyn(method.to_string().into(), &params)
+            .await
+        {
+            Ok(value) => {
+                let value = match (
+                    method,
+                    self.rpc.ipc_path.as_ref(),
+                    self.rpc.ipc_allowed_modules.as_ref(),
+                ) {
+                    ("rpc_modules", Some(_), Some(allowed)) => {
+                        let mut modules: hashbrown::HashMap<String, String> =
+                            sonic_rs::from_str(value.get())?;
+                        modules.retain(|module, _| allowed.contains(module));
+                        sonic_rs::from_str::<R>(&sonic_rs::to_string(&modules)?)?
+                    }
+                    _ => sonic_rs::from_str::<R>(value.get())?,
+                };
+                jsonrpc::ParsedResponse::from_result(value, self.web3_request.id())
+            }
+            Err(transport_error) => match JsonRpcErrorData::try_from(&transport_error) {
+                Ok(x) => jsonrpc::ParsedResponse::from_error(x, self.web3_request.id()),
+                Err(err) => {
+                    warn!(?err, "error from {}", self.rpc);
+
+                    return Err(transport_error.into());
+                }
+            },
+        };
+
+        Ok(response.into())
     }
 
     fn check_transport_error(&self, error: &Web3ProxyError, start: Instant) {

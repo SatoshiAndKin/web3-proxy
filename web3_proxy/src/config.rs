@@ -271,6 +271,8 @@ pub struct Web3RpcConfig {
     pub http_url: Option<String>,
     /// while not absolutely required, a ipc connection should be fastest
     pub ipc_path: Option<PathBuf>,
+    /// Restrict IPC to the modules available on the backend's public RPC endpoint.
+    pub ipc_allowed_modules: Option<Vec<String>>,
     /// Maximum number of physical requests sent concurrently to this backend.
     /// Each batch packet occupies one slot, regardless of its item count.
     #[serde_inline_default(448usize)]
@@ -309,6 +311,7 @@ impl fmt::Debug for Web3RpcConfig {
             .field("display_name", &self.display_name)
             .field("http_url", &self.http_url.as_ref().map(|_| "[REDACTED]"))
             .field("ipc_path", &self.ipc_path)
+            .field("ipc_allowed_modules", &self.ipc_allowed_modules)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("max_backend_batch_items", &self.max_backend_batch_items)
             .field("soft_limit", &self.soft_limit)
@@ -415,7 +418,7 @@ mod tests {
 
         assert_eq!(
             format!("{config:?}"),
-            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
+            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, ipc_allowed_modules: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
         );
     }
 
