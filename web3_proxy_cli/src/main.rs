@@ -74,6 +74,15 @@ fn config_path(path: &str) -> anyhow::Result<PathBuf> {
     absolute(path).with_context(|| format!("making config path absolute: {path}"))
 }
 
+fn optional_sentry_layer<S>(enabled: bool, filter: EnvFilter) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    // An unfiltered None layer can keep tracing::enabled! true even when
+    // every output rejects the event. Filter the optional layer too.
+    enabled.then(sentry_tracing::layer).with_filter(filter)
+}
+
 fn main() -> anyhow::Result<()> {
     load_dotenv()?;
 
@@ -212,9 +221,7 @@ fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::builder().parse(rust_log)?;
     // A disabled client cannot collect events. Avoid the layer's per-span hub
     // and scope locks when Sentry is not configured.
-    let sentry_layer = _sentry_guard
-        .is_enabled()
-        .then(|| sentry_tracing::layer().with_filter(env_filter));
+    let sentry_layer = optional_sentry_layer(_sentry_guard.is_enabled(), env_filter);
 
     // build a `Subscriber` by combining layers
     let tracing_registry = tracing_subscriber::registry()
@@ -329,6 +336,36 @@ mod tests {
             assert!(tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG));
             assert!(tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG));
         });
+    }
+
+    #[test]
+    fn optional_sentry_respects_timing_filters_before_sampling() {
+        use tracing_subscriber::{prelude::*, EnvFilter};
+        for sentry_enabled in [false, true] {
+            for (directives, timing_enabled) in [
+                (DEFAULT_LOG_DIRECTIVES.join(","), false),
+                ("info".to_owned(), false),
+                (
+                    "info,web3_proxy::perf=debug,latency::perf=debug".to_owned(),
+                    true,
+                ),
+            ] {
+                let fmt = tracing_subscriber::fmt::layer().with_filter(EnvFilter::new(&directives));
+                let sentry =
+                    super::optional_sentry_layer(sentry_enabled, EnvFilter::new(&directives));
+                let subscriber = tracing_subscriber::registry().with(fmt).with(sentry);
+                tracing::subscriber::with_default(subscriber, || {
+                    assert_eq!(
+                        tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG),
+                        timing_enabled
+                    );
+                    assert_eq!(
+                        tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG),
+                        timing_enabled
+                    );
+                });
+            }
+        }
     }
 
     #[test]
