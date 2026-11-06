@@ -153,7 +153,31 @@ async fn _status(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
     // TODO: get out of app.balanced_rpcs instead?
     let head_block = app.watch_consensus_head_receiver.borrow().clone();
 
-    // TODO: what else should we include? CPU load and memory use.
+    // Read counters Tokio already maintains. Do not enable poll histograms or
+    // add per-request clocks to observe scheduler pressure.
+    let runtime = tokio::runtime::Handle::current().metrics();
+    let workers = (0..runtime.num_workers())
+        .map(|worker| {
+            json!({
+                "id": worker,
+                "local_queue_depth": runtime.worker_local_queue_depth(worker),
+                "poll_count": runtime.worker_poll_count(worker),
+                "total_busy_us": runtime.worker_total_busy_duration(worker).as_secs_f64() * 1_000_000.0,
+                "mean_poll_us": runtime.worker_mean_poll_time(worker).as_secs_f64() * 1_000_000.0,
+                "overflow_count": runtime.worker_overflow_count(worker),
+                "steal_count": runtime.worker_steal_count(worker),
+                "park_count": runtime.worker_park_count(worker),
+            })
+        })
+        .collect::<Vec<_>>();
+    let scheduler = json!({
+        "alive_tasks": runtime.num_alive_tasks(),
+        "global_queue_depth": runtime.global_queue_depth(),
+        "blocking_threads": runtime.num_blocking_threads(),
+        "blocking_queue_depth": runtime.blocking_queue_depth(),
+        "workers": workers,
+    });
+
     // TODO: the hostname is probably not going to change. only get once at the start?
     let body = json!({
         "balanced_rpcs": app.balanced_rpcs,
@@ -166,6 +190,7 @@ async fn _status(app: Arc<App>) -> (StatusCode, &'static str, Bytes) {
         "pending_txid_firehose": app.pending_txid_firehose,
         "private_rpcs": app.protected_rpcs,
         "perf_diagnostics": latency::diagnostic_queue_stats(),
+        "scheduler": scheduler,
         "uptime": app.start.elapsed().as_secs(),
         "version": APP_USER_AGENT,
     });
