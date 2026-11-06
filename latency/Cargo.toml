@@ -14,3 +14,4 @@ watermill = "0.1.2"
 
 [dev-dependencies]
 tokio = { version = "1.53.3", default-features = false, features = ["macros", "rt", "sync", "test-util", "time"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

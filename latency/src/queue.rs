@@ -31,7 +31,7 @@ impl QueueMetrics {
         }
     }
     pub(crate) fn sample<T>(&self, value: T) -> Sample<T> {
-        let enabled = tracing::enabled!(target: "latency::perf", tracing::Level::INFO);
+        let enabled = tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG);
         let queued_at = (enabled && self.sampled.fetch_add(1, Ordering::Relaxed) & 1023 == 0)
             .then(Instant::now);
         Sample { value, queued_at }
@@ -61,7 +61,7 @@ pub(crate) struct Sample<T> {
 impl<T> Sample<T> {
     pub(crate) fn received(&self, id: u64, channel: &'static str, remaining: usize) {
         if let Some(start) = self.queued_at {
-            tracing::info!(target: "latency::perf", parent: None, queue = id, channel, remaining,
+            tracing::debug!(target: "latency::perf", parent: None, queue = id, channel, remaining,
                 wait_us = start.elapsed().as_secs_f64() * 1_000_000.0, "latency channel");
         }
     }
@@ -71,6 +71,27 @@ impl<T> Sample<T> {
 mod tests {
     use super::QueueMetrics;
     use tokio::sync::mpsc;
+    #[test]
+    fn info_logging_does_not_timestamp_or_count_channel_samples() {
+        let metrics = QueueMetrics::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(metrics.sample(7).queued_at.is_none());
+        });
+        assert_eq!(
+            metrics.sampled.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(metrics.sample(7).queued_at.is_some());
+            assert!(metrics.sample(8).queued_at.is_none());
+        });
+    }
     #[test]
     fn snapshots_distinguish_full_and_closed_without_changing_queued_data() {
         let metrics = QueueMetrics::new();

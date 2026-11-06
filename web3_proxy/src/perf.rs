@@ -1,4 +1,4 @@
-//! Sampled wall-time diagnostics. Enable only `web3_proxy::perf=info`.
+//! Sampled wall-time diagnostics. Enable only `web3_proxy::perf=debug`.
 //! No RPC parameters, client IDs, headers, or response data enter these events.
 use std::{
     cell::Cell,
@@ -12,7 +12,7 @@ thread_local! { static SAMPLES: Cell<u16> = const { Cell::new(0) }; }
 static NEXT_SAMPLE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn sample() -> Option<NonZeroU64> {
-    if !tracing::enabled!(target: "web3_proxy::perf", tracing::Level::INFO) {
+    if !tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG) {
         return None;
     }
     SAMPLES.with(|counter| {
@@ -59,7 +59,7 @@ impl<'a> Stage<'a> {
 impl Drop for Stage<'_> {
     fn drop(&mut self) {
         if let Some((sample, start)) = self.sample {
-            tracing::info!(target: "web3_proxy::perf", parent: None, sample = sample.get(), stage = self.stage,
+            tracing::debug!(target: "web3_proxy::perf", parent: None, sample = sample.get(), stage = self.stage,
                 backend = self.backend, elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0,
                 complete = self.complete, "request stage");
         }
@@ -86,13 +86,30 @@ mod tests {
         }
     }
     #[test]
+    fn info_logging_does_not_start_request_sampling() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let before = super::SAMPLES.with(|counter| counter.get());
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(super::sample().is_none());
+        });
+        assert_eq!(super::SAMPLES.with(|counter| counter.get()), before);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!((0..1024).filter_map(|_| super::sample()).count(), 1);
+        });
+    }
+    #[test]
     fn sampled_scopes_report_completion_and_drop_without_client_context() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = Writer(output.clone());
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
             .without_time()
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::DEBUG)
             .with_writer(move || writer.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
