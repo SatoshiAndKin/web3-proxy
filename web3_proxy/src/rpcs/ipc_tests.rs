@@ -342,3 +342,123 @@ async fn ipc_retains_the_configured_public_module_surface() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn ipc_only_configuration_starts_healthy_and_publishes_heads() {
+    test_support::with_cleanup(async {
+        use super::blockchain::{new_block_response_cache, HeadObservationPublisher};
+        use crate::config::Web3RpcConfig;
+        use alloy::rpc::types::Header;
+        use tokio::sync::mpsc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("node.ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let block = |number, hash, parent_hash| {
+            let header = Header {
+                hash,
+                inner: alloy::consensus::Header { number, parent_hash, timestamp, ..Default::default() },
+                ..Default::default()
+            };
+            let mut value = serde_json::to_value(header).unwrap();
+            value["transactions"] = json!([]);
+            value["uncles"] = json!([]);
+            value
+        };
+        let initial = block(42, B256::repeat_byte(0x42), B256::repeat_byte(0x41));
+        let pushed = block(43, B256::repeat_byte(0x43), B256::repeat_byte(0x42));
+        let server = test_support::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            loop {
+                let request = read_request(&mut socket, &mut buffer).await;
+                let response = match request["method"].as_str().unwrap() {
+                    "web3_clientVersion" => json!({"result":"ipc-startup-fixture"}),
+                    "eth_chainId" => json!({"result":"0x1"}),
+                    "eth_blockNumber" => json!({"result":"0x2a"}),
+                    "eth_getBlockByNumber" => json!({"result":initial}),
+                    "eth_getBlockByHash" => json!({"result":if request["params"][0] == pushed["hash"] { &pushed } else { &initial }}),
+                    "eth_call" => json!({"result":request["params"][0]}),
+                    "eth_subscribe" => {
+                        assert_eq!(request["params"], json!(["newHeads"]));
+                        json!({"result":"0x1"})
+                    }
+                    _ => json!({"error":{"code":-32601,"message":"method not found"}}),
+                };
+                let mut response = response;
+                response["jsonrpc"] = json!("2.0");
+                response["id"] = request["id"].clone();
+                socket.write_all(response.to_string().as_bytes()).await.unwrap();
+                if request["method"] == "eth_subscribe" {
+                    socket.write_all(json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":pushed}}).to_string().as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let config: Web3RpcConfig = sonic_rs::from_str(&json!({
+            "ipc_path":path,
+            "ipc_allowed_modules":["debug","eth","net","rpc","txpool","web3"],
+            "block_data_limit":"archive", "log_data_limit":"archive"
+        }).to_string()).unwrap();
+        assert!(config.http_url.is_none() && config.ws_url.is_none());
+        let (sender, heads) = mpsc::unbounded_channel();
+        let heads = Arc::new(tokio::sync::Mutex::new(heads));
+        let (rpc, task) = Web3Rpc::spawn(
+            config, "ipc-only-startup".into(), 1, None, Duration::from_secs(12),
+            moka::future::Cache::new(16), moka::future::Cache::new(16),
+            new_block_response_cache(1_000_000), Some(HeadObservationPublisher::new(sender)),
+            None, None, Duration::from_secs(60),
+        ).await.expect("an IPC-only backend must enter the real startup path");
+        let cleanup_rpc = rpc.clone();
+        let cleanup_heads = heads.clone();
+        test_support::on_cleanup(async move {
+            cleanup_rpc.disconnect_watch.as_ref().unwrap().send_replace(true);
+            server.abort();
+            let _ = server.await;
+            timeout(Duration::from_secs(12), task).await.expect("startup tasks must stop").unwrap().unwrap();
+            drop(cleanup_heads);
+        });
+        let observation = timeout(Duration::from_secs(5), async {
+            loop {
+                let head = heads.lock().await.recv().await.expect("head publisher stays open");
+                if head.block.as_ref().is_some_and(|block| block.number().to::<u64>() == 43) {
+                    break head;
+                }
+            }
+        }).await.expect("the IPC subscription must publish the pushed head");
+        assert!(Arc::ptr_eq(&observation.rpc, &rpc));
+        let status = serde_json::to_value(rpc.as_ref()).unwrap();
+        assert_eq!(status["healthy"], true);
+        assert_eq!(status["web3_clientVersion"], "ipc-startup-fixture");
+        assert_eq!(call::<u64>(&rpc, 7).await, 7);
+        assert!(rpc.ipc_provider.load().is_some());
+        assert!(rpc.http_client.is_none() && rpc.ws_provider.load().is_none());
+    }).await;
+}
+
+#[tokio::test]
+async fn startup_rejects_a_backend_without_any_transport() {
+    let config = sonic_rs::from_str("{}").unwrap();
+    let result = Web3Rpc::spawn(
+        config,
+        "missing-transport".into(),
+        1,
+        None,
+        Duration::from_secs(12),
+        moka::future::Cache::new(16),
+        moka::future::Cache::new(16),
+        super::blockchain::new_block_response_cache(1_000_000),
+        None,
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        result
+            .expect_err("empty transport must remain invalid")
+            .to_string(),
+        "one of ipc_path, ws_url, or http_url is required"
+    );
+}
