@@ -55,6 +55,8 @@ The `scheduler` snapshot reads Tokio's existing global, worker, and blocking que
 counters. Per-worker busy time and poll counts are cumulative; compare snapshots
 to separate runnable work from backend waits. These snapshots do not enable poll
 histograms or add per-request clock reads.
+DEBUG diagnostics also trace each low-rate full-block hydration operation, so
+background transfers can be compared with sampled query delays.
 
 For a bounded diagnostic run, set
 `RUST_LOG=warn,web3_proxy::perf=debug,latency::perf=debug`. General `INFO` logging

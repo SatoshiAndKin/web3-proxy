@@ -24,6 +24,14 @@ pub(crate) fn sample() -> Option<NonZeroU64> {
     })
 }
 
+// Periodic background work is already low rate. Trace each operation so that a
+// full-block transfer can be correlated with sampled query and queue delays.
+pub(crate) fn background_sample() -> Option<NonZeroU64> {
+    tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG)
+        .then(|| NEXT_SAMPLE.fetch_add(1, Ordering::Relaxed))
+        .and_then(NonZeroU64::new)
+}
+
 pub(crate) struct Stage<'a> {
     sample: Option<(NonZeroU64, Instant)>,
     stage: &'static str,
@@ -97,6 +105,7 @@ mod tests {
         let before = super::SAMPLES.with(|counter| counter.get());
         tracing::subscriber::with_default(subscriber, || {
             assert!(super::sample().is_none());
+            assert!(super::background_sample().is_none());
         });
         assert_eq!(super::SAMPLES.with(|counter| counter.get()), before);
         let subscriber = tracing_subscriber::fmt()
@@ -104,6 +113,7 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             assert_eq!((0..1024).filter_map(|_| super::sample()).count(), 1);
+            assert!(super::background_sample().is_some());
         });
     }
     #[test]

@@ -940,6 +940,11 @@ impl Web3Rpc {
         self: &Arc<Self>,
         block_hash: B256,
     ) -> Web3ProxyResult<(CachedBlockResponse, CachedBlockResponse)> {
+        let mut stage = crate::perf::Stage::new(
+            crate::perf::background_sample(),
+            "block_hydration",
+            &self.name,
+        );
         let result = self
             .internal_request::<_, Option<Arc<OwnedLazyValue>>>(
                 "eth_getBlockByHash".into(),
@@ -949,7 +954,9 @@ impl Web3Rpc {
             )
             .await?
             .ok_or_else(|| Web3ProxyError::BadResponse("hydrated block result was null".into()))?;
-        CachedBlockResponse::from_full(result, block_hash)
+        let blocks = CachedBlockResponse::from_full(result, block_hash)?;
+        stage.finish();
+        Ok(blocks)
     }
 
     async fn latest_block_header(
