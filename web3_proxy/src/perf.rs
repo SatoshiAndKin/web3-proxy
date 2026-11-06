@@ -59,9 +59,13 @@ impl<'a> Stage<'a> {
 impl Drop for Stage<'_> {
     fn drop(&mut self) {
         if let Some((sample, start)) = self.sample {
-            tracing::debug!(target: "web3_proxy::perf", parent: None, sample = sample.get(), stage = self.stage,
-                backend = self.backend, elapsed_us = start.elapsed().as_secs_f64() * 1_000_000.0,
-                complete = self.complete, "request stage");
+            latency::record_request_stage(
+                sample.get(),
+                self.stage,
+                self.backend,
+                start.elapsed(),
+                self.complete,
+            );
         }
     }
 }
@@ -121,6 +125,9 @@ mod tests {
             drop(Stage::new(NonZeroU64::new(2), "cancelled", "node"));
             drop(Stage::new(None, "disabled", "node"));
         });
+        assert!(latency::flush_diagnostics(std::time::Duration::from_secs(
+            2
+        )));
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert_eq!(text.lines().count(), 2, "{text}");
         assert!(!text.contains("private-client-value"));

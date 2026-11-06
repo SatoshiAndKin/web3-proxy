@@ -9,6 +9,7 @@ pub mod config;
 pub mod errors;
 pub mod frontend;
 pub mod globals;
+pub use latency::flush_diagnostics;
 pub mod jsonrpc;
 mod perf;
 pub mod prelude;

@@ -23,6 +23,18 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+// Keep timing diagnostics separate from ordinary application debug logs.
+const DEFAULT_LOG_DIRECTIVES: &[&str] = &[
+    "info",
+    "alloy_provider=error",
+    "alloy_transport=error",
+    "web3_proxy::rpcs::consensus=info",
+    "web3_proxy=debug",
+    "web3_proxy_cli=debug",
+    "web3_proxy::perf=off",
+    "latency::perf=off",
+];
+
 #[cfg(feature = "deadlock_detection")]
 use {parking_lot::deadlock, std::thread, tokio::time::Duration};
 
@@ -60,6 +72,15 @@ enum SubCommand {
 fn config_path(path: &str) -> anyhow::Result<PathBuf> {
     // Keep the logical filename: kubelet replaces its symlink target on reload.
     absolute(path).with_context(|| format!("making config path absolute: {path}"))
+}
+
+fn optional_sentry_layer<S>(enabled: bool, filter: EnvFilter) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    // An unfiltered None layer can keep tracing::enabled! true even when
+    // every output rejects the event. Filter the optional layer too.
+    enabled.then(sentry_tracing::layer).with_filter(filter)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -107,16 +128,7 @@ fn main() -> anyhow::Result<()> {
                     "web3_proxy_cli=trace",
                 ]
             }
-            _ => {
-                vec![
-                    "info",
-                    "alloy_provider=error",
-                    "alloy_transport=error",
-                    "web3_proxy::rpcs::consensus=info",
-                    "web3_proxy=debug",
-                    "web3_proxy_cli=debug",
-                ]
-            }
+            _ => DEFAULT_LOG_DIRECTIVES.to_vec(),
         }
         .join(","),
     };
@@ -209,9 +221,7 @@ fn main() -> anyhow::Result<()> {
     let env_filter = EnvFilter::builder().parse(rust_log)?;
     // A disabled client cannot collect events. Avoid the layer's per-span hub
     // and scope locks when Sentry is not configured.
-    let sentry_layer = _sentry_guard
-        .is_enabled()
-        .then(|| sentry_tracing::layer().with_filter(env_filter));
+    let sentry_layer = optional_sentry_layer(_sentry_guard.is_enabled(), env_filter);
 
     // build a `Subscriber` by combining layers
     let tracing_registry = tracing_subscriber::registry()
@@ -291,6 +301,7 @@ fn main() -> anyhow::Result<()> {
     });
     // Blocking disk or crypto work must not hold container shutdown indefinitely.
     rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    let _ = web3_proxy::flush_diagnostics(std::time::Duration::from_millis(100));
     result
 }
 
@@ -304,8 +315,58 @@ fn load_dotenv() -> anyhow::Result<()> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::config_path;
+    use super::{config_path, DEFAULT_LOG_DIRECTIVES};
     use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn default_debug_logging_keeps_timing_targets_opt_in() {
+        use tracing_subscriber::{prelude::*, EnvFilter};
+        let defaults = DEFAULT_LOG_DIRECTIVES.join(",");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new(&defaults)));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "web3_proxy", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG));
+        });
+        let explicit = format!("{defaults},web3_proxy::perf=debug,latency::perf=debug");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new(explicit)));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG));
+            assert!(tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG));
+        });
+    }
+
+    #[test]
+    fn optional_sentry_respects_timing_filters_before_sampling() {
+        use tracing_subscriber::{prelude::*, EnvFilter};
+        for sentry_enabled in [false, true] {
+            for (directives, timing_enabled) in [
+                (DEFAULT_LOG_DIRECTIVES.join(","), false),
+                ("info".to_owned(), false),
+                (
+                    "info,web3_proxy::perf=debug,latency::perf=debug".to_owned(),
+                    true,
+                ),
+            ] {
+                let fmt = tracing_subscriber::fmt::layer().with_filter(EnvFilter::new(&directives));
+                let sentry =
+                    super::optional_sentry_layer(sentry_enabled, EnvFilter::new(&directives));
+                let subscriber = tracing_subscriber::registry().with(fmt).with(sentry);
+                tracing::subscriber::with_default(subscriber, || {
+                    assert_eq!(
+                        tracing::enabled!(target: "web3_proxy::perf", tracing::Level::DEBUG),
+                        timing_enabled
+                    );
+                    assert_eq!(
+                        tracing::enabled!(target: "latency::perf", tracing::Level::DEBUG),
+                        timing_enabled
+                    );
+                });
+            }
+        }
+    }
 
     #[test]
     fn config_reload_follows_rotated_projected_volume() {

@@ -53,7 +53,13 @@ queue-depth counter.
 
 For a bounded diagnostic run, set
 `RUST_LOG=warn,web3_proxy::perf=debug,latency::perf=debug`. General `INFO` logging
-keeps these timing diagnostics off. Request stages sample one in
+keeps these timing diagnostics off. The CLI default also excludes them from its
+application debug logs. Sampled events use a bounded queue and a dedicated output
+thread. Durations and `observed_unix_us` are captured before enqueueing. The
+`diagnostic_queue_wait_us` field separates diagnostic queue time from the measured stage.
+`perf_diagnostics` in `/status` shows this queue's capacity and full/closed drops;
+it is null before the worker starts. A full queue drops diagnostic records without
+waiting on RPC workers. Request stages sample one in
 1,024 validations per worker thread. Each latency channel separately samples one in
 1,024 reports. Events include validation, selection, backend permit waits, complete
 backend requests, latency-report task waits, and channel residence time. Queue IDs
