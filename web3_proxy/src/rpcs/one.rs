@@ -221,10 +221,8 @@ impl Web3Rpc {
         // and track on servers that have a configured hard limit
         let (hard_limit_until, _) = watch::channel(Instant::now());
 
-        if config.ws_url.is_none() && config.http_url.is_none() {
-            return Err(anyhow!(
-                "either ws_url or http_url are required. it is best to set both. they must both point to the same server!"
-            ));
+        if config.ipc_path.is_none() && config.ws_url.is_none() && config.http_url.is_none() {
+            return Err(anyhow!("one of ipc_path, ws_url, or http_url is required"));
         }
 
         if config.ipc_allowed_modules.is_some() && config.ipc_path.is_none() {
