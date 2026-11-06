@@ -15,7 +15,8 @@ nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 
 # TODO: regex has several "perf" features that we might want to use
 anyhow = { version = "1.0.104", features = ["backtrace"] }
-alloy = { version = "2.5.0", default-features = false, features = [
+# Pin the release-based IPC duplex fix; keep all direct Alloy SDK types on one source.
+alloy = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "5e6b65dd36a4cf8b08e78abf5c8b5a3d732e681f", default-features = false, features = [
     "consensus",
     "eips",
     "node-bindings",
@@ -31,8 +32,8 @@ alloy = { version = "2.5.0", default-features = false, features = [
     "signer-local",
     "std",
 ] }
-alloy-rpc-types-beacon = { version = "2.5.0", features = ["ssz"] }
-alloy-rpc-types-engine = { version = "2.5.0", features = ["jwt-aws-lc-rs"] }
+alloy-rpc-types-beacon = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "5e6b65dd36a4cf8b08e78abf5c8b5a3d732e681f", features = ["ssz"] }
+alloy-rpc-types-engine = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "5e6b65dd36a4cf8b08e78abf5c8b5a3d732e681f", features = ["jwt-aws-lc-rs"] }
 eventsource-stream = "0.2.3"
 arc-swap = { version = "1.9.3" }
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
