@@ -52,7 +52,8 @@ Snapshots read Tokio's existing state. Successful sends do not update a separate
 queue-depth counter.
 
 For a bounded diagnostic run, set
-`RUST_LOG=warn,web3_proxy::perf=info,latency::perf=info`. Request stages sample one in
+`RUST_LOG=warn,web3_proxy::perf=debug,latency::perf=debug`. General `INFO` logging
+keeps these timing diagnostics off. Request stages sample one in
 1,024 validations per worker thread. Each latency channel separately samples one in
 1,024 reports. Events include validation, selection, backend permit waits, complete
 backend requests, latency-report task waits, and channel residence time. Queue IDs
