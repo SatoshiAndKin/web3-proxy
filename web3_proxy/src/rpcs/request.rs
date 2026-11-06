@@ -271,7 +271,7 @@ impl BackendRequest {
                 .ipc_provider
                 .load_full()
                 .context("IPC provider is not connected")?;
-            self.pubsub_request(&provider).await
+            self.pubsub_request(provider.query()).await
         } else if let (Some(url), Some(client)) = (self.rpc.http_url.clone(), &self.rpc.http_client)
         {
             // second, prefer the http provider

@@ -4,7 +4,7 @@ use super::blockchain::{
     BlocksByHashCache, BlocksByNumberCache, CachedBlockResponse, HeadObservationPublisher,
 };
 use super::provider::{
-    connect_ipc, connect_query_ws, connect_ws, AlloyIpcProvider, AlloyWsProvider,
+    connect_ipc_pool, connect_query_ws, connect_ws, AlloyWsProvider, IpcProviderPool,
 };
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
@@ -122,7 +122,7 @@ pub struct Web3Rpc {
     /// IPC takes precedence for local requests and subscriptions.
     pub(super) ipc_path: Option<PathBuf>,
     pub(super) ipc_allowed_modules: Option<Vec<String>>,
-    pub(super) ipc_provider: ArcSwapOption<AlloyIpcProvider>,
+    pub(super) ipc_provider: ArcSwapOption<IpcProviderPool>,
     /// keep track of hard limits
     /// hard_limit_until is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) hard_limit_until: Option<watch::Sender<Instant>>,
@@ -1082,7 +1082,7 @@ impl Web3Rpc {
 
         if let Some(path) = self.ipc_path.clone() {
             self.ipc_provider
-                .store(Some(Arc::new(connect_ipc(path).await?)));
+                .store(Some(Arc::new(connect_ipc_pool(path).await?)));
         } else if let Some(url) = self.ws_url.clone() {
             trace!("starting websocket provider on {}", self);
 
@@ -1262,6 +1262,14 @@ impl Web3Rpc {
         abort_handles.push(health_handle.abort_handle());
         futures.push(health_handle);
 
+        // Subscriptions observe the first stream. Retire the same backend
+        // generation if the query-only stream exhausts Alloy's reconnects.
+        if let Some(pool) = self.ipc_provider.load_full() {
+            let monitor = tokio::spawn(async move { pool.wait_closed().await });
+            abort_handles.push(monitor.abort_handle());
+            futures.push(monitor);
+        }
+
         // subscribe to new heads
         if self.head_observation_publisher.is_some() {
             let clone = self.clone();
@@ -1330,6 +1338,7 @@ impl Web3Rpc {
         if let Some(provider) = self
             .ipc_provider
             .load_full()
+            .map(|pool| pool.subscription())
             .or_else(|| self.ws_provider.load_full())
         {
             // todo: move subscribe_blocks onto the request handle instead of having a seperate wait_for_throttle
@@ -1365,6 +1374,7 @@ impl Web3Rpc {
         if let Some(provider) = self
             .ipc_provider
             .load_full()
+            .map(|pool| pool.subscription())
             .or_else(|| self.ws_provider.load_full())
         {
             self.wait_for_throttle(Instant::now() + Duration::from_secs(5))
@@ -1728,10 +1738,18 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 19)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 20)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
+        state.serialize_field(
+            "ipc_pool_size",
+            &self
+                .ipc_provider
+                .load()
+                .as_ref()
+                .map_or(0, |pool| pool.size()),
+        )?;
         // a longer name for display to users
         state.serialize_field("display_name", &self.display_name)?;
 

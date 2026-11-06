@@ -1,6 +1,12 @@
-use alloy::providers::{IpcConnect, ProviderBuilder, RootProvider, WsConnect};
+use alloy::providers::{IpcConnect, Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy::transports::ws::WebSocketConfig;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use url::Url;
 
 use crate::errors::Web3ProxyResult;
@@ -8,6 +14,54 @@ use crate::errors::Web3ProxyResult;
 pub type AlloyWsProvider = RootProvider;
 pub type AlloyHttpProvider = RootProvider;
 pub type AlloyIpcProvider = RootProvider;
+
+/// Two physical streams share one logical backend and its admission budget.
+/// Alloy owns framing, request IDs, subscriptions, and reconnects on each stream.
+pub(super) struct IpcProviderPool {
+    providers: [Arc<AlloyIpcProvider>; 2],
+    next: AtomicUsize,
+}
+
+impl IpcProviderPool {
+    pub(super) fn query(&self) -> &AlloyIpcProvider {
+        // This counter only selects an immutable, already-published provider.
+        // ArcSwap publishes the pool; the selector establishes no happens-before
+        // relationship. Wrapping is harmless because the pool has two entries.
+        let index = self.next.fetch_add(1, Ordering::Relaxed) & 1;
+        &self.providers[index]
+    }
+
+    pub(super) fn subscription(&self) -> Arc<AlloyIpcProvider> {
+        self.providers[0].clone()
+    }
+
+    /// A failed query-only service must retire this generation too. A temporary
+    /// reconnect keeps the frontend ready; Alloy retains its own retry policy.
+    pub(super) async fn wait_closed(&self) -> Web3ProxyResult<()> {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            for provider in &self.providers {
+                let mut transport = provider.client().transport().clone();
+                std::future::poll_fn(|cx| tower_service::Service::poll_ready(&mut transport, cx))
+                    .await?;
+            }
+        }
+    }
+
+    pub(super) fn size(&self) -> usize {
+        self.providers.len()
+    }
+}
+
+pub(super) async fn connect_ipc_pool(path: PathBuf) -> Web3ProxyResult<IpcProviderPool> {
+    let (first, second) = tokio::try_join!(connect_ipc(path.clone()), connect_ipc(path))?;
+    Ok(IpcProviderPool {
+        providers: [Arc::new(first), Arc::new(second)],
+        next: AtomicUsize::new(0),
+    })
+}
 
 // Match the owned nodes' 1024-MiB RPC response allowance. Query responses can
 // exceed the default 16-MiB frame size; head-only consumers retain their defaults.
@@ -68,6 +122,43 @@ mod tests {
     use std::{sync::Arc, time::Duration};
     use tokio::net::TcpListener;
     use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+    #[tokio::test]
+    async fn a_closed_query_service_retires_the_pool_with_a_live_primary() {
+        use alloy::{pubsub::PubSubFrontend, rpc::client::RpcClient};
+        let (first_tx, first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (second_tx, second_rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = Arc::new(IpcProviderPool {
+            providers: [
+                Arc::new(RootProvider::new(RpcClient::new(
+                    PubSubFrontend::new(first_tx),
+                    true,
+                ))),
+                Arc::new(RootProvider::new(RpcClient::new(
+                    PubSubFrontend::new(second_tx),
+                    true,
+                ))),
+            ],
+            next: AtomicUsize::new(0),
+        });
+        let watched = pool.clone();
+        let monitor = tokio::spawn(async move { watched.wait_closed().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !monitor.is_finished(),
+            "healthy services must keep the generation alive"
+        );
+        drop(second_rx);
+        assert!(tokio::time::timeout(Duration::from_secs(2), monitor)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(
+            !first_rx.is_closed(),
+            "the primary stayed alive throughout the failure"
+        );
+    }
 
     #[test]
     fn query_websocket_retains_a_finite_response_budget() {
