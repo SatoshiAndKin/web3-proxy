@@ -1041,6 +1041,12 @@ mod tests {
             http_url: Some(format!("http://{address}").parse().unwrap()),
             hard_limit_until: Some(hard_limit_until),
             request_permits: RequestPermits::new(2, 2),
+            peak_latency: Some(latency::PeakEwmaLatency::spawn(
+                Duration::from_secs(15),
+                100,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(latency::RollingQuantileLatency::spawn_median(100).await),
             ..Default::default()
         });
 
