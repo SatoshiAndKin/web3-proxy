@@ -207,7 +207,11 @@ fn main() -> anyhow::Result<()> {
         .with_filter(env_filter);
 
     let env_filter = EnvFilter::builder().parse(rust_log)?;
-    let sentry_layer = sentry_tracing::layer().with_filter(env_filter);
+    // A disabled client cannot collect events. Avoid the layer's per-span hub
+    // and scope locks when Sentry is not configured.
+    let sentry_layer = _sentry_guard
+        .is_enabled()
+        .then(|| sentry_tracing::layer().with_filter(env_filter));
 
     // build a `Subscriber` by combining layers
     let tracing_registry = tracing_subscriber::registry()
