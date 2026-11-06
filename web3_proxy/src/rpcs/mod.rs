@@ -26,3 +26,6 @@ mod test_support;
 
 #[cfg(test)]
 mod header_lookup_tests;
+
+#[cfg(test)]
+mod ipc_tests;
