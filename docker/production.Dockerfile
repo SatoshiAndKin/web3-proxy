@@ -46,7 +46,7 @@ ARG CARGO_CACHE_SEED=
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     printf 'Cargo cache seed: %s\n' "$CARGO_CACHE_SEED" && \
-    cargo build --release --locked -p web3_proxy_cli && \
+    cargo build --release --locked -p web3_proxy_cli --features mimalloc && \
     install -m 0755 target/release/web3_proxy_cli /usr/local/bin/web3_proxy_cli
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
