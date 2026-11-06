@@ -1,3 +1,4 @@
+use crate::queue::{LatencyQueueStats, QueueMetrics, Sample};
 use std::sync::Arc;
 
 use portable_atomic::{AtomicF32, Ordering};
@@ -13,7 +14,8 @@ pub struct RollingQuantileLatency {
     /// Join handle for the latency calculation task.
     pub join_handle: JoinHandle<()>,
     /// Send to update with each request duration.
-    latency_tx: mpsc::Sender<f32>,
+    latency_tx: mpsc::Sender<Sample<f32>>,
+    queue: QueueMetrics,
     /// rolling quantile latency in seconds. Updated async.
     seconds: Arc<AtomicF32>,
 }
@@ -21,7 +23,8 @@ pub struct RollingQuantileLatency {
 /// Task to be spawned per-RollingMedianLatency for calculating the value
 struct RollingQuantileLatencyTask {
     /// Receive to update each request duration
-    latency_rx: mpsc::Receiver<f32>,
+    latency_rx: mpsc::Receiver<Sample<f32>>,
+    queue_id: u64,
     /// Current estimate and update time
     seconds: Arc<AtomicF32>,
     /// quantile value.
@@ -30,7 +33,8 @@ struct RollingQuantileLatencyTask {
 
 impl RollingQuantileLatencyTask {
     fn new(
-        latency_rx: mpsc::Receiver<f32>,
+        latency_rx: mpsc::Receiver<Sample<f32>>,
+        queue_id: u64,
         seconds: Arc<AtomicF32>,
         q: f32,
         window_size: usize,
@@ -38,6 +42,7 @@ impl RollingQuantileLatencyTask {
         let quantile = RollingQuantile::new(q, window_size).unwrap();
 
         Self {
+            queue_id,
             latency_rx,
             seconds,
             quantile,
@@ -47,7 +52,8 @@ impl RollingQuantileLatencyTask {
     /// Run the loop for updating latency.
     async fn run(mut self) {
         while let Some(rtt) = self.latency_rx.recv().await {
-            self.update(rtt);
+            rtt.received(self.queue_id, "rolling_quantile", self.latency_rx.len());
+            self.update(rtt.value);
         }
     }
 
@@ -71,7 +77,13 @@ impl RollingQuantileLatency {
     #[inline]
     pub fn record_secs(&self, secs: f32) {
         // self.latency_tx.send_async(secs).await.unwrap()
-        let _ = self.latency_tx.try_send(secs);
+        if let Err(error) = self.latency_tx.try_send(self.queue.sample(secs)) {
+            self.queue.dropped(&error);
+        }
+    }
+
+    pub fn queue_stats(&self) -> LatencyQueueStats {
+        self.queue.snapshot(&self.latency_tx)
     }
 
     /// Current .
@@ -94,8 +106,10 @@ impl RollingQuantileLatency {
 
         let seconds = Arc::new(AtomicF32::new(0.0));
 
+        let queue = QueueMetrics::new();
         let task = RollingQuantileLatencyTask::new(
             latency_rx,
+            queue.id,
             seconds.clone(),
             quantile_value,
             window_size,
@@ -106,6 +120,7 @@ impl RollingQuantileLatency {
         Self {
             join_handle,
             latency_tx,
+            queue,
             seconds,
         }
     }

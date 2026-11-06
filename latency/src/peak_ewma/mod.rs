@@ -1,6 +1,7 @@
 mod rtt_estimate;
 
 use self::rtt_estimate::AtomicRttEstimate;
+use crate::queue::{LatencyQueueStats, QueueMetrics, Sample};
 use crate::util::nanos::nanos;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -17,7 +18,8 @@ pub struct PeakEwmaLatency {
     /// Join handle for the latency calculation task
     pub join_handle: JoinHandle<()>,
     /// Send to update with each request duration
-    request_tx: mpsc::Sender<Duration>,
+    request_tx: mpsc::Sender<Sample<Duration>>,
+    queue: QueueMetrics,
     /// Latency average and last update time
     rtt_estimate: Arc<AtomicRttEstimate>,
     /// Decay time
@@ -36,7 +38,9 @@ impl PeakEwmaLatency {
 
         let (request_tx, request_rx) = mpsc::channel(buf_size);
         let rtt_estimate = Arc::new(AtomicRttEstimate::new(start_latency));
+        let queue = QueueMetrics::new();
         let task = PeakEwmaLatencyTask {
+            queue_id: queue.id,
             request_rx,
             rtt_estimate: rtt_estimate.clone(),
             update_at: Instant::now(),
@@ -46,6 +50,7 @@ impl PeakEwmaLatency {
         Self {
             join_handle,
             request_tx,
+            queue,
             rtt_estimate,
             decay_ns,
         }
@@ -71,13 +76,17 @@ impl PeakEwmaLatency {
         }
     }
 
-    /// Report latency from a single request
-    ///
-    /// Should only be called with a duration from the Web3Rpc that owns it.
+    /// Current channel capacity use and dropped reports.
+    pub fn queue_stats(&self) -> LatencyQueueStats {
+        self.queue.snapshot(&self.request_tx)
+    }
+
+    /// Report latency from a single request from the owning backend.
     pub fn report(&self, duration: Duration) {
-        match self.request_tx.try_send(duration) {
+        match self.request_tx.try_send(self.queue.sample(duration)) {
             Ok(()) => {}
             Err(err) => {
+                self.queue.dropped(&err);
                 // We don't want to block if the channel is full, just
                 // report the error
                 error!("Latency report channel full. {}", err);
@@ -91,7 +100,8 @@ impl PeakEwmaLatency {
 #[derive(Debug)]
 struct PeakEwmaLatencyTask {
     /// Receive new request timings for update
-    request_rx: mpsc::Receiver<Duration>,
+    request_rx: mpsc::Receiver<Sample<Duration>>,
+    queue_id: u64,
     /// Current estimate and update time
     rtt_estimate: Arc<AtomicRttEstimate>,
     /// Last update time, used for decay calculation
@@ -104,7 +114,8 @@ impl PeakEwmaLatencyTask {
     /// Run the loop for updating latency
     async fn run(mut self) {
         while let Some(rtt) = self.request_rx.recv().await {
-            self.update(rtt);
+            rtt.received(self.queue_id, "peak_ewma", self.request_rx.len());
+            self.update(rtt.value);
         }
         trace!("latency loop exited");
     }

@@ -1,6 +1,8 @@
 mod ewma;
 mod peak_ewma;
+mod queue;
 mod rolling_quantile;
+pub use queue::LatencyQueueStats;
 mod util;
 
 pub use self::ewma::EwmaLatency;

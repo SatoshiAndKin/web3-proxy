@@ -415,7 +415,18 @@ impl BackendRequest {
         if response_is_success {
             // only track latency for successful requests
             let rpc = self.rpc.clone();
+            let sample = self.web3_request.perf_sample;
+            let queued_at = sample.map(|_| Instant::now());
             tokio::spawn(async move {
+                if let Some(queued_at) = queued_at {
+                    let mut timing = crate::perf::Stage::since(
+                        sample,
+                        queued_at,
+                        "latency_task_wait",
+                        &rpc.name,
+                    );
+                    timing.finish();
+                }
                 rpc.peak_latency.as_ref().unwrap().report(latency);
                 rpc.median_latency.as_ref().unwrap().record(latency);
 
@@ -636,11 +647,18 @@ impl OpenRequestHandle {
         let Self { request, permit } = self;
         request.check_submission()?;
         let _active = ActiveRequestGuard::new(&request.rpc, permit);
+        let mut timing = crate::perf::Stage::new(
+            request.web3_request.perf_sample,
+            "backend",
+            &request.rpc.name,
+        );
         let start = Instant::now();
         let response = timeout_at(request.web3_request.expire_at(), request._request())
             .await
             .unwrap_or_else(|error| Err(error.into()));
-        request.check_response(response, start)
+        let result = request.check_response(response, start);
+        timing.finish();
+        result
     }
 
     /// Send one physical request, batching calls when the transport supports it.
@@ -1023,6 +1041,12 @@ mod tests {
             http_url: Some(format!("http://{address}").parse().unwrap()),
             hard_limit_until: Some(hard_limit_until),
             request_permits: RequestPermits::new(2, 2),
+            peak_latency: Some(latency::PeakEwmaLatency::spawn(
+                Duration::from_secs(15),
+                100,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(latency::RollingQuantileLatency::spawn_median(100).await),
             ..Default::default()
         });
 
