@@ -3,7 +3,9 @@
 # belong in the operator's private deployment repository.
 FROM rust:slim-bookworm@sha256:86234e857a413004348b471d11a4ebe1aa92d2eae2b6b143cac68fd1ac3c48be AS build
 WORKDIR /app
-RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install --no-install-recommends -y \
+COPY --chmod=0755 docker/apt-retry /usr/local/sbin/apt-retry
+COPY docker/80-deployment-retries /etc/apt/apt.conf.d/80-deployment-retries
+RUN apt-retry update && apt-retry install --no-install-recommends -y \
     build-essential clang cmake pkg-config libssl-dev ca-certificates
 COPY rust-toolchain.toml ./
 RUN rustup show active-toolchain && rustup component add clippy rustfmt
@@ -50,7 +52,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     install -m 0755 target/faster_release/web3_proxy_cli /usr/local/bin/web3_proxy_cli
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
-RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install --no-install-recommends -y ca-certificates curl libssl3 && \
+COPY --chmod=0755 docker/apt-retry /usr/local/sbin/apt-retry
+COPY docker/80-deployment-retries /etc/apt/apt.conf.d/80-deployment-retries
+RUN apt-retry update && apt-retry install --no-install-recommends -y ca-certificates curl libssl3 && \
     sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
       -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' /etc/ca-certificates.conf && \
     update-ca-certificates && \

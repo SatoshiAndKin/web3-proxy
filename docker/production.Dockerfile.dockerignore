@@ -33,3 +33,6 @@
 !config/example.toml
 !docs/
 !docs/block-relay.example.toml
+!docker/
+!docker/apt-retry
+!docker/80-deployment-retries
