@@ -1,0 +1,7 @@
+// Retry whole commands in apt-retry instead of the old APT download path.
+// Acquire::Retries must stay zero until this pinned image includes the fix
+// for CVE-2026-109518. Keep index failures fatal on every attempt.
+Acquire::Retries "0";
+APT::Update::Error-Mode "any";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";

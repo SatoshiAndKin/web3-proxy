@@ -8,3 +8,5 @@ perf.data.old
 /config/*.toml
 /data
 /target
+
+/docker/tests/__pycache__/
