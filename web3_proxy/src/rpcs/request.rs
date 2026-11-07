@@ -271,7 +271,8 @@ impl BackendRequest {
                 .ipc_provider
                 .load_full()
                 .context("IPC provider is not connected")?;
-            self.pubsub_request(provider.query()).await
+            let query = provider.query();
+            self.pubsub_request(&query).await
         } else if let (Some(url), Some(client)) = (self.rpc.http_url.clone(), &self.rpc.http_client)
         {
             // second, prefer the http provider
@@ -310,8 +311,9 @@ impl BackendRequest {
             let bytes = response.bytes().await?;
             let response: ParsedResponse<R> = sonic_rs::from_slice(&bytes)?;
             Ok(response.into())
-        } else if let Some(p) = self.rpc.ws_provider.load().as_ref() {
-            self.pubsub_request(p).await
+        } else if let Some(pool) = self.rpc.ws_query_pool.load_full() {
+            let query = pool.query();
+            self.pubsub_request(&query).await
         } else {
             // this must be a test
             Err(anyhow::anyhow!("no provider configured!").into())

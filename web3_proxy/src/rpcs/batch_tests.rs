@@ -792,6 +792,7 @@ pub(super) struct WebSocketHarness {
 impl Drop for WebSocketHarness {
     fn drop(&mut self) {
         self.rpc.ws_provider.store(None);
+        self.rpc.ws_query_pool.store(None);
         self.incoming.close();
         self.shutdown.cancel();
     }
@@ -821,14 +822,16 @@ impl WebSocketHarness {
             tasks.close();
             tasks.wait().await;
         });
-        let provider = super::provider::connect_ws(format!("ws://{address}").parse().unwrap())
-            .await
-            .unwrap();
+        let provider =
+            super::provider::connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
+                .await
+                .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
         let rpc = Arc::new(Web3Rpc {
             name: "ws-only".into(),
             healthy: AtomicBool::new(true),
-            ws_provider: ArcSwapOption::from(Some(Arc::new(provider))),
+            ws_provider: ArcSwapOption::from(Some(provider.subscription())),
+            ws_query_pool: ArcSwapOption::from(Some(Arc::new(provider))),
             hard_limit_until: Some(hard_limit_until),
             request_permits: RequestPermits::new(concurrency, 64),
             peak_latency: Some(PeakEwmaLatency::spawn(
@@ -1951,3 +1954,28 @@ mod latency_bench;
 
 #[path = "method_routing_tests.rs"]
 mod method_routing_tests;
+
+#[tokio::test]
+async fn http_pool_completes_an_unrelated_packet_while_a_body_is_stalled() {
+    super::test_support::with_cleanup(async {
+        let mut h = Harness::new(2, 64).await;
+        let slow = h.start(1);
+        let incoming = h.next().await;
+        let held_body = send_stalled_body(incoming, "[".into()).await;
+        let fast = h.start(1);
+        h.next().await.succeed();
+        assert_answers(
+            timeout(Duration::from_secs(2), fast)
+                .await
+                .expect("HTTP requests need independent pooled connections")
+                .unwrap(),
+            1,
+        );
+        assert!(!slow.is_finished());
+        slow.abort();
+        assert!(slow.await.unwrap_err().is_cancelled());
+        drop(held_body);
+        h.idle();
+    })
+    .await;
+}

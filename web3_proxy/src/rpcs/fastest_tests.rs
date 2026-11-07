@@ -1392,3 +1392,41 @@ async fn fastest_local_response_needs_no_backend_request() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn websocket_frontend_returns_a_fast_call_before_an_earlier_slow_call() {
+    super::test_support::with_cleanup(async {
+        let mut fleet = Fleet::new(1, 1).await;
+        let (port, server) = fleet.frontend().await;
+        let mut client = websocket_client_at(port, "/").await;
+        websocket_send(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":11,"method":"eth_call","params":[{"data":"0x01"},"0x2a"]}"#,
+        )
+        .await;
+        let slow = fleet.nodes[0].next().await;
+        websocket_send(
+            &mut client,
+            br#"{"jsonrpc":"2.0","id":22,"method":"eth_call","params":[{"data":"0x02"},"0x2a"]}"#,
+        )
+        .await;
+        let incoming = fleet.nodes[0].next().await;
+        let id = incoming.body["id"].clone();
+        incoming.respond(json!({"jsonrpc":"2.0","id":id,"result":"0x02"}));
+        let fast = timeout(Duration::from_secs(2), websocket_response(&mut client))
+            .await
+            .expect("frontend must not await the first RPC before responding to the second");
+        assert_eq!(fast, json!({"jsonrpc":"2.0","id":22,"result":"0x02"}));
+        let id = slow.body["id"].clone();
+        slow.respond(json!({"jsonrpc":"2.0","id":id,"result":"0x01"}));
+        assert_eq!(
+            timeout(Duration::from_secs(2), websocket_response(&mut client))
+                .await
+                .unwrap(),
+            json!({"jsonrpc":"2.0","id":11,"result":"0x01"})
+        );
+        drop(client);
+        drop(server);
+    })
+    .await;
+}
