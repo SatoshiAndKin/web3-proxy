@@ -59,14 +59,15 @@ async fn rpc(path: &Path) -> Arc<Web3Rpc> {
     Arc::new(rpc)
 }
 
-async fn serve_pair<F, Fut>(listener: UnixListener, handler: F)
+async fn serve_pool<F, Fut>(listener: UnixListener, handler: F)
 where
     F: Fn(UnixStream) -> Fut + Send,
     Fut: Future<Output = ()> + Send,
 {
     let (first, _) = listener.accept().await.unwrap();
     let (second, _) = listener.accept().await.unwrap();
-    tokio::join!(handler(first), handler(second));
+    let (subscriptions, _) = listener.accept().await.unwrap();
+    tokio::join!(handler(first), handler(second), handler(subscriptions));
 }
 
 async fn call<R: JsonRpcResultData>(rpc: &Arc<Web3Rpc>, value: u64) -> R {
@@ -88,7 +89,7 @@ async fn ipc_pool_preserves_fragmented_large_and_out_of_order_replies() {
         let listener = UnixListener::bind(&path).unwrap();
         let payload: Arc<str> = format!("0x{}", "a".repeat(17 * 1024 * 1024)).into();
         let expected = payload.clone();
-        let server = test_support::spawn(serve_pair(listener, move |mut socket| {
+        let server = test_support::spawn(serve_pool(listener, move |mut socket| {
             let payload = payload.clone();
             async move {
                 let mut buffer = Vec::new();
@@ -150,7 +151,7 @@ async fn ipc_preserves_reverts_and_does_not_mix_a_late_reply_with_the_next_call(
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("node.ipc");
         let listener = UnixListener::bind(&path).unwrap();
-        let server = test_support::spawn(serve_pair(listener, |mut socket| async move {
+        let server = test_support::spawn(serve_pool(listener, |mut socket| async move {
             let mut buffer = Vec::new();
             loop {
                 let request = read_request(&mut socket, &mut buffer).await;
@@ -273,7 +274,7 @@ async fn ipc_retains_the_configured_public_module_surface() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("node.ipc");
         let listener = UnixListener::bind(&path).unwrap();
-        let server = test_support::spawn(serve_pair(listener, |mut socket| async move {
+        let server = test_support::spawn(serve_pool(listener, |mut socket| async move {
             let mut buffer = Vec::new();
             loop {
                 let request = read_request(&mut socket, &mut buffer).await;
@@ -334,7 +335,7 @@ async fn ipc_only_configuration_starts_healthy_and_publishes_heads() {
         let server_subscriptions = subscriptions.clone();
         let initial = Arc::new(initial);
         let pushed = Arc::new(pushed);
-        let server = test_support::spawn(serve_pair(listener, move |mut socket| {
+        let server = test_support::spawn(serve_pool(listener, move |mut socket| {
             let initial = initial.clone();
             let pushed = pushed.clone();
             let subscriptions = server_subscriptions.clone();
@@ -420,7 +421,7 @@ async fn ipc_pool_shares_one_admission_budget_across_both_streams() {
         let gate = Arc::new(Semaphore::new(0));
         let server_gate = gate.clone();
         let (seen, mut received) = mpsc::unbounded_channel();
-        let server = test_support::spawn(serve_pair(listener, move |socket| {
+        let server = test_support::spawn(serve_pool(listener, move |socket| {
             let gate = server_gate.clone();
             let seen = seen.clone();
             async move {
@@ -529,18 +530,18 @@ async fn ipc_pool_recovers_one_query_stream_and_a_replaced_socket() {
         });
         let rpc = rpc(&path).await;
         assert_eq!(call::<u64>(&rpc, 0).await, 0);
-        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(connections.load(Ordering::SeqCst), 3);
         let values = timeout(Duration::from_secs(5), async { tokio::join!(call::<u64>(&rpc, 1), call::<u64>(&rpc, 2)) }).await.unwrap();
         assert_eq!(values, (1, 2));
-        assert_eq!(connections.load(Ordering::SeqCst), 3, "only the failed stream should reconnect");
+        assert_eq!(connections.load(Ordering::SeqCst), 4, "only the failed stream should reconnect");
         for value in 3..7 { assert_eq!(call::<u64>(&rpc, value).await, value); }
-        assert_eq!(connections.load(Ordering::SeqCst), 3, "ordinary calls must reuse the pool");
+        assert_eq!(connections.load(Ordering::SeqCst), 4, "ordinary calls must reuse the pool");
         let (ack, replaced) = oneshot::channel();
         replace.send(ack).await.unwrap();
         replaced.await.unwrap();
         let values = timeout(Duration::from_secs(5), async { tokio::join!(call::<u64>(&rpc, 100), call::<u64>(&rpc, 101)) }).await.unwrap();
         assert_eq!(values, (100, 101));
-        assert_eq!(connections.load(Ordering::SeqCst), 5, "both streams should reconnect to the new inode");
+        assert_eq!(connections.load(Ordering::SeqCst), 7, "all streams should reconnect to the new inode");
         assert_eq!(rpc.active_requests.load(Ordering::SeqCst), 0);
         stop.cancel();
         server.await.unwrap();
@@ -572,4 +573,145 @@ async fn startup_rejects_a_backend_without_any_transport() {
             .to_string(),
         "one of ipc_path, ws_url, or http_url is required"
     );
+}
+
+#[tokio::test]
+async fn ipc_pool_does_not_queue_fast_calls_behind_a_partial_response() {
+    test_support::with_cleanup(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("node.ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_release = release.clone();
+        let (started, mut partial) = tokio::sync::mpsc::unbounded_channel();
+        let server = test_support::spawn(serve_pool(listener, move |socket| {
+            let release = server_release.clone();
+            let started = started.clone();
+            async move {
+                let (mut reader, writer) = socket.into_split();
+                let writer = Arc::new(tokio::sync::Mutex::new(writer));
+                let mut buffer = Vec::new();
+                let mut responses = futures::stream::FuturesUnordered::new();
+                loop {
+                    tokio::select! {
+                        request = read_request(&mut reader, &mut buffer) => {
+                            let writer = writer.clone();
+                            let release = release.clone();
+                            let started = started.clone();
+                            responses.push(async move {
+                                let value = request["params"][0].as_u64().unwrap();
+                                let mut writer = writer.lock().await;
+                                if value == 0 {
+                                    // A partially transferred JSON value owns this byte stream.
+                                    // Keep reading requests, but never interleave response bytes.
+                                    let prefix = format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":", request["id"]);
+                                    writer.write_all(prefix.as_bytes()).await.unwrap();
+                                    started.send(()).unwrap();
+                                    release.acquire().await.unwrap().forget();
+                                    writer.write_all(b"0}").await.unwrap();
+                                } else {
+                                    let response = json!({"jsonrpc":"2.0","id":request["id"],"result":value});
+                                    writer.write_all(response.to_string().as_bytes()).await.unwrap();
+                                }
+                            });
+                        }
+                        Some(()) = responses.next(), if !responses.is_empty() => {}
+                    }
+                }
+            }
+        }));
+        let rpc = rpc(&path).await;
+        let slow_rpc = rpc.clone();
+        let slow = test_support::spawn(async move { call::<u64>(&slow_rpc, 0).await });
+        timeout(Duration::from_secs(2), partial.recv()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), async {
+            for value in 1..=8 {
+                assert_eq!(call::<u64>(&rpc, value).await, value);
+            }
+        }).await.expect("fast calls must use the other IPC stream while a response is incomplete");
+        assert!(!slow.is_finished());
+        assert_eq!(rpc.active_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.add_permits(1);
+        assert_eq!(timeout(Duration::from_secs(2), slow).await.unwrap().unwrap(), 0);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        drop(rpc);
+    }).await;
+}
+
+#[tokio::test]
+async fn ipc_subscription_progresses_while_a_query_frame_is_incomplete() {
+    test_support::with_cleanup(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("node.ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_release = release.clone();
+        let (started, mut partial) = tokio::sync::mpsc::unbounded_channel();
+        let (pulse, head_update) = watch::channel(false);
+        let server = test_support::spawn(serve_pool(listener, move |socket| {
+            let release = server_release.clone();
+            let started = started.clone();
+            let mut head_update = head_update.clone();
+            async move {
+                let (mut reader, writer) = socket.into_split();
+                let writer = Arc::new(tokio::sync::Mutex::new(writer));
+                let mut buffer = Vec::new();
+                let mut subscribed = false;
+                let mut responses = futures::stream::FuturesUnordered::new();
+                loop {
+                    tokio::select! {
+                        request = read_request(&mut reader, &mut buffer) => {
+                            if request["method"] == "eth_subscribe" {
+                                assert!(!subscribed);
+                                subscribed = true;
+                                let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":"0x1"});
+                                writer.lock().await.write_all(reply.to_string().as_bytes()).await.unwrap();
+                            } else {
+                                let writer = writer.clone();
+                                let release = release.clone();
+                                let started = started.clone();
+                                responses.push(async move {
+                                    let value = request["params"][0].as_u64().unwrap();
+                                    let mut writer = writer.lock().await;
+                                    if value == 0 {
+                                        let prefix = format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":", request["id"]);
+                                        writer.write_all(prefix.as_bytes()).await.unwrap();
+                                        started.send(()).unwrap();
+                                        release.acquire().await.unwrap().forget();
+                                        writer.write_all(b"0}").await.unwrap();
+                                    } else {
+                                        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":value});
+                                        writer.write_all(reply.to_string().as_bytes()).await.unwrap();
+                                    }
+                                });
+                            }
+                        }
+                        _ = head_update.changed(), if subscribed => {
+                            let notification = json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":B256::repeat_byte(0x77)}});
+                            writer.lock().await.write_all(notification.to_string().as_bytes()).await.unwrap();
+                        }
+                        Some(()) = responses.next(), if !responses.is_empty() => {}
+                    }
+                }
+            }
+        }));
+        let rpc = rpc(&path).await;
+        let provider = rpc.ipc_provider.load_full().unwrap().subscription();
+        let subscription = provider.subscribe_pending_transactions().await.unwrap();
+        let mut heads = subscription.into_stream();
+        let slow_rpc = rpc.clone();
+        let slow = test_support::spawn(async move { call::<u64>(&slow_rpc, 0).await });
+        timeout(Duration::from_secs(2), partial.recv()).await.unwrap().unwrap();
+        pulse.send_replace(true);
+        assert_eq!(timeout(Duration::from_secs(2), heads.next()).await.expect("query framing must not block subscriptions"), Some(B256::repeat_byte(0x77)));
+        assert_eq!(timeout(Duration::from_secs(2), call::<u64>(&rpc, 7)).await.unwrap(), 7);
+        assert!(!slow.is_finished());
+        release.add_permits(1);
+        assert_eq!(timeout(Duration::from_secs(2), slow).await.unwrap().unwrap(), 0);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        drop(heads);
+        drop(rpc);
+    }).await;
 }

@@ -6421,6 +6421,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tokio-util",
  "toml",
  "tower-http 0.7.1",

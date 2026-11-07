@@ -34,13 +34,33 @@ Versus returns the first complete success, including `null`, or execution revert
 
 Later successful completions update the existing median and peak backend latency metrics. They do not change the client answer or its recorded response time. RPC errors, including accepted reverts, do not produce successful latency samples. Local replies and cache hits start no comparison and add no backend timing samples. Transaction submission rules, subscriptions, client IDs, and batch order stay in place. A completed comparison cannot restart through application retries, gas-estimate error handling, or transaction/receipt archive fallback. If every node fails, Versus returns the first completed failure; if the deadline expires, it reports timeout.
 
-Local IPC uses a bounded pool of two persistent streams per logical backend.
-Ordinary calls rotate across the streams; subscriptions use the first stream.
-Both streams share the backend's request permits, capabilities, required-block
-checks, latency estimates, and vote. Alloy owns framing, IDs, and reconnects on
-each stream. Status reports the provider count as `ipc_pool_size`.
+IPC and WebSocket-only backends use two persistent query connections and one
+separate subscription connection per logical backend. New calls use the query
+connection with fewer unfinished calls, alternating equal-load choices. A query
+keeps its connection counted until its complete response is parsed, it fails,
+or its caller cancels. Cancellation releases the routing count; it does not
+confirm that a late response has finished transferring.
 
-Backend WebSocket calls keep Alloy's existing transport, response parsing, and reconnect behavior. Alloy handles backend response IDs, and the proxy returns the original client ID. HTTP backends, including requests from WebSocket clients, use the complete-response validation path described above.
+The connections share one backend's request permits, capabilities, required-block
+checks, latency estimates, and vote. They do not add backend capacity or votes.
+Alloy owns framing, IDs, and reconnects. A terminal failure of any pool member
+retires the published generation. HTTP-backed nodes keep their shared HTTP client
+pool and a separate WebSocket subscription connection when configured.
+
+Status reports query counts as `ipc_pool_size` and `ws_query_pool_size`, and
+subscription counts as `ipc_subscription_connections` and
+`ws_subscription_connections`. `ipc_query_inflight` and `ws_query_inflight` are
+advisory per-query-connection snapshots. Routing uses atomic counters without
+per-request clocks or diagnostic messages; the logical admission budget remains
+separate and authoritative.
+
+These pools limit head-of-line blocking across backend connections. A partially
+transferred IPC value or WebSocket data message still occupies its own byte
+stream. Two busy query connections, TCP packet loss, and a slow client can still
+delay work. HTTP/1 pipelined responses and data messages on one client WebSocket
+must retain their wire order. Use separate client connections for bulk replies
+and latency-sensitive calls. Independent HTTP requests use the client's pool;
+a JSON-RPC batch remains one HTTP response and waits for its complete result.
 
 Each server has different limits that can be configured. The `soft_limit` is the number of parallel active requests where a server starts to slow down, while the `hard_limit` is where a server starts giving rate limits or other errors.
 

@@ -4,7 +4,7 @@ use super::blockchain::{
     BlocksByHashCache, BlocksByNumberCache, CachedBlockResponse, HeadObservationPublisher,
 };
 use super::provider::{
-    connect_ipc_pool, connect_query_ws, connect_ws, AlloyWsProvider, IpcProviderPool,
+    connect_ipc_pool, connect_query_ws_pool, connect_ws, AlloyWsProvider, PubSubProviderPool,
 };
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
@@ -119,10 +119,12 @@ pub struct Web3Rpc {
     pub(super) ws_url: Option<Url>,
     /// Shared persistent WebSocket provider.
     pub(super) ws_provider: ArcSwapOption<AlloyWsProvider>,
+    /// WebSocket-only backends use independent query streams.
+    pub(super) ws_query_pool: ArcSwapOption<PubSubProviderPool>,
     /// IPC takes precedence for local requests and subscriptions.
     pub(super) ipc_path: Option<PathBuf>,
     pub(super) ipc_allowed_modules: Option<Vec<String>>,
-    pub(super) ipc_provider: ArcSwapOption<IpcProviderPool>,
+    pub(super) ipc_provider: ArcSwapOption<PubSubProviderPool>,
     /// keep track of hard limits
     /// hard_limit_until is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) hard_limit_until: Option<watch::Sender<Instant>>,
@@ -1088,15 +1090,14 @@ impl Web3Rpc {
 
             // A WebSocket-only backend carries complete RPC replies as well as
             // heads. Head-only consumers retain the existing frame budget.
-            let x = if self.http_url.is_none() && self.ipc_path.is_none() {
-                connect_query_ws(url).await?
+            if self.http_url.is_none() {
+                let pool = Arc::new(connect_query_ws_pool(url).await?);
+                self.ws_provider.store(Some(pool.subscription()));
+                self.ws_query_pool.store(Some(pool));
             } else {
-                connect_ws(url).await?
-            };
-
-            let x = Arc::new(x);
-
-            self.ws_provider.store(Some(x));
+                self.ws_provider
+                    .store(Some(Arc::new(connect_ws(url).await?)));
+            }
         }
 
         if self.should_disconnect() {
@@ -1262,9 +1263,13 @@ impl Web3Rpc {
         abort_handles.push(health_handle.abort_handle());
         futures.push(health_handle);
 
-        // Subscriptions observe the first stream. Retire the same backend
-        // generation if the query-only stream exhausts Alloy's reconnects.
-        if let Some(pool) = self.ipc_provider.load_full() {
+        // Retire this logical backend generation when any query or subscription
+        // service exhausts Alloy's reconnects.
+        if let Some(pool) = self
+            .ipc_provider
+            .load_full()
+            .or_else(|| self.ws_query_pool.load_full())
+        {
             let monitor = tokio::spawn(async move { pool.wait_closed().await });
             abort_handles.push(monitor.abort_handle());
             futures.push(monitor);
@@ -1325,6 +1330,7 @@ impl Web3Rpc {
         }
 
         self.ws_provider.store(None);
+        self.ws_query_pool.store(None);
         self.ipc_provider.store(None);
 
         Ok(())
@@ -1738,7 +1744,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 20)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 25)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
@@ -1749,6 +1755,38 @@ impl Serialize for Web3Rpc {
                 .load()
                 .as_ref()
                 .map_or(0, |pool| pool.size()),
+        )?;
+        state.serialize_field(
+            "ipc_subscription_connections",
+            &usize::from(self.ipc_provider.load().is_some()),
+        )?;
+        state.serialize_field(
+            "ws_query_pool_size",
+            &self
+                .ws_query_pool
+                .load()
+                .as_ref()
+                .map_or(0, |pool| pool.size()),
+        )?;
+        state.serialize_field(
+            "ws_subscription_connections",
+            &usize::from(self.ws_provider.load().is_some()),
+        )?;
+        state.serialize_field(
+            "ipc_query_inflight",
+            &self
+                .ipc_provider
+                .load()
+                .as_ref()
+                .map(|pool| pool.in_flight()),
+        )?;
+        state.serialize_field(
+            "ws_query_inflight",
+            &self
+                .ws_query_pool
+                .load()
+                .as_ref()
+                .map(|pool| pool.in_flight()),
         )?;
         // a longer name for display to users
         state.serialize_field("display_name", &self.display_name)?;
@@ -1928,6 +1966,7 @@ mod tests {
         hydration_sent: Arc<Notify>,
         hydration_started: Arc<Notify>,
         latest_block: serde_json::Value,
+        head_updates: tokio::sync::broadcast::Sender<()>,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
@@ -1939,7 +1978,22 @@ mod tests {
     }
 
     async fn websocket_stub(mut socket: WebSocket, state: WebSocketStubState) {
-        while let Some(Ok(WsMessage::Text(request))) = socket.next().await {
+        let mut head_updates = state.head_updates.subscribe();
+        let mut subscribed = false;
+        loop {
+            let request = tokio::select! {
+                message = socket.next() => match message {
+                    Some(Ok(WsMessage::Text(request))) => request,
+                    _ => break,
+                },
+                Ok(()) = head_updates.recv(), if subscribed => {
+                    let notification = serde_json::json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":&state.header}});
+                    for _ in 0..2 {
+                        socket.send(WsMessage::Text(notification.to_string().into())).await.unwrap();
+                    }
+                    continue;
+                }
+            };
             let request: serde_json::Value = serde_json::from_str(request.as_str()).unwrap();
             let method = request["method"].as_str().unwrap();
 
@@ -1991,21 +2045,11 @@ mod tests {
                 state.hydration_sent.notify_one();
             }
 
+            if method == "eth_subscribe" {
+                subscribed = true;
+            }
             if method == "eth_getBlockByNumber" {
-                let notification = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "eth_subscription",
-                    "params": {
-                        "subscription": "0x1",
-                        "result": &state.header,
-                    },
-                });
-                for _ in 0..2 {
-                    socket
-                        .send(WsMessage::Text(notification.to_string().into()))
-                        .await
-                        .unwrap();
-                }
+                let _ = state.head_updates.send(());
             }
         }
     }
@@ -2059,6 +2103,7 @@ mod tests {
             hydration_release: hydration_release.clone(),
             hydration_sent: hydration_sent.clone(),
             hydration_started: hydration_started.clone(),
+            head_updates: tokio::sync::broadcast::channel(8).0,
             latest_block: serde_json::Value::Null,
             requests: requests.clone(),
         };
@@ -2068,7 +2113,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let provider = connect_ws(format!("ws://{address}").parse().unwrap())
+        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
             .await
             .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
@@ -2088,7 +2133,8 @@ mod tests {
             disconnect_watch: Some(disconnect_watch),
             ..Default::default()
         });
-        rpc.ws_provider.store(Some(Arc::new(provider)));
+        rpc.ws_provider.store(Some(provider.subscription()));
+        rpc.ws_query_pool.store(Some(Arc::new(provider)));
 
         HydrationStub {
             rpc,
@@ -2546,6 +2592,7 @@ mod tests {
             hydration_release: hydration_release.clone(),
             hydration_sent: Arc::new(Notify::new()),
             hydration_started: hydration_started.clone(),
+            head_updates: tokio::sync::broadcast::channel(8).0,
             latest_block: serde_json::Value::Null,
             requests: requests.clone(),
         };
@@ -2556,7 +2603,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-        let provider = connect_ws(format!("ws://{address}").parse().unwrap())
+        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
             .await
             .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
@@ -2586,7 +2633,8 @@ mod tests {
             disconnect_watch: Some(disconnect_watch),
             ..Default::default()
         });
-        rpc.ws_provider.store(Some(Arc::new(provider)));
+        rpc.ws_provider.store(Some(provider.subscription()));
+        rpc.ws_query_pool.store(Some(Arc::new(provider)));
 
         let rpc_for_subscription = rpc.clone();
         let subscription =
@@ -2746,6 +2794,7 @@ mod tests {
             hydration_release: Arc::new(Semaphore::new(0)),
             hydration_sent: Arc::new(Notify::new()),
             hydration_started: Arc::new(Notify::new()),
+            head_updates: tokio::sync::broadcast::channel(8).0,
             latest_block: latest_block.clone(),
             requests: requests.clone(),
         };
@@ -2756,7 +2805,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-        let provider = connect_ws(format!("ws://{address}").parse().unwrap())
+        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
             .await
             .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
@@ -2778,7 +2827,8 @@ mod tests {
             disconnect_watch: Some(disconnect_watch),
             ..Default::default()
         });
-        rpc.ws_provider.store(Some(Arc::new(provider)));
+        rpc.ws_provider.store(Some(provider.subscription()));
+        rpc.ws_query_pool.store(Some(Arc::new(provider)));
 
         let latest_header = rpc.latest_block_header(None).await.unwrap().unwrap();
 
