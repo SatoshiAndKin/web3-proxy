@@ -1211,6 +1211,7 @@ mod tests {
     use crate::rpcs::blockchain::{BlockResponseCacheKey, CachedBlockResponse};
     use alloy::rpc::types::Header;
     use sonic_rs::OwnedLazyValue;
+    use std::io::Write;
 
     async fn app_with_no_backend() -> Arc<App> {
         let frontend_tasks = tokio_util::task::TaskTracker::new();
@@ -1244,6 +1245,37 @@ mod tests {
             start: Instant::now(),
             tx_subscriptions: Semaphore::new(1),
         })
+    }
+
+    #[tokio::test]
+    async fn gzip_requests_reach_the_production_http_router() {
+        let app = app_with_no_backend().await;
+        let mut router = crate::frontend::make_router(app.clone());
+        let payload = br#"{"jsonrpc":"2.0","id":7,"method":"eth_chainId","params":[]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        for route in ["/", "/fastest", "/versus"] {
+            let request = axum::http::Request::post(route)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::CONTENT_ENCODING, "gzip")
+                .header(axum::http::header::CONTENT_LENGTH, compressed.len())
+                .body(axum::body::Body::from(compressed.clone()))
+                .unwrap();
+            let response = tower_service::Service::call(&mut router, request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                sonic_rs::from_slice::<sonic_rs::Value>(&body).unwrap(),
+                sonic_rs::json!({"jsonrpc":"2.0","id":7,"result":"0x1"})
+            );
+        }
+        app.frontend_shutdown.send_replace(true);
+        app.frontend_tasks.close();
     }
 
     fn head(number: u64, hash: B256) -> BlockHeader {

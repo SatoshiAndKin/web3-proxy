@@ -37,6 +37,7 @@ eventsource-stream = "0.2.3"
 arc-swap = { version = "1.9.3" }
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
 async-stream = "0.3.6"
+async-compression = { version = "=0.4.51", default-features = false, features = ["tokio", "gzip"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "tokio", "tracing", "ws"] }
 axum-macros = "0.5.1"
 base64 = "0.23.1"
@@ -70,9 +71,9 @@ shellexpand = { version = "3.1.2", default-features = false, features = ["base-0
 sonic-rs = "0.5.10"
 tokio = { version = "1.53.3", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
 tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
-tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["rt", "io"] }
 toml = "1.1.8"
-tower-http = { version = "0.7.1", features = ["cors", "normalize-path", "sensitive-headers", "trace"] }
+tower-http = { version = "0.7.1", features = ["cors", "limit", "normalize-path", "sensitive-headers", "trace"] }
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
@@ -83,6 +84,7 @@ url = { version = "2.5.8" }
 # check-if-email-exists = "0.9.0"
 
 [dev-dependencies]
+flate2 = "1.1.10"
 # Use the existing locked transport to generate incomplete WebSocket frames.
 tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
 tempfile = "3.27.0"

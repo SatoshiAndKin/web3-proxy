@@ -5,6 +5,7 @@
 //! There are a lot of things in tower/axum that i should have used instead of implementing here.
 // TODO: these are only public so docs are generated. What's a better way to do this?
 pub mod errors;
+mod request_body;
 pub mod request_id;
 pub mod rpc_proxy_http;
 pub mod rpc_proxy_ws;
@@ -14,7 +15,6 @@ use crate::app::App;
 use crate::errors::Web3ProxyResult;
 use axum::{
     body::Body,
-    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -34,7 +34,6 @@ use tracing::{error, error_span, info, trace_span};
 use listenfd::ListenFd;
 
 const LISTEN_BACKLOG: u32 = i32::MAX as u32;
-const MAX_HTTP_REQUEST_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     info!(%addr, requested_backlog = LISTEN_BACKLOG, "binding TCP listener");
@@ -91,14 +90,12 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
     // Axum layers
     // layers are ordered bottom up
     // the last layer is first for requests and last for responses
-    let router: Router = router
+    let router: Router = request_body::with_body_limits(router)
         // Remove trailing slashes
         // TODO: this isn't working for me. why?
         .layer(NormalizePathLayer::trim_trailing_slash())
         // handle cors. we expect queries from all sorts of places
         .layer(CorsLayer::very_permissive())
-        // Accept large JSON-RPC batches and transaction payloads.
-        .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_SIZE))
         // request id
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
@@ -220,29 +217,12 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_tcp_listener, MAX_HTTP_REQUEST_BODY_SIZE};
-    use axum::{
-        body::{Body, Bytes},
-        extract::DefaultBodyLimit,
-        http::{Request, StatusCode},
-        routing::post,
-        Router,
-    };
+    use super::bind_tcp_listener;
     use std::net::SocketAddr;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
     };
-    use tower_service::Service;
-
-    async fn request_body_status(size: usize) -> StatusCode {
-        let mut router = Router::new()
-            .route("/", post(|_: Bytes| async {}))
-            .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_SIZE));
-        let request = Request::post("/").body(Body::from(vec![0; size])).unwrap();
-
-        router.call(request).await.unwrap().status()
-    }
 
     #[tokio::test]
     async fn bound_tcp_listener_accepts_connections() {
@@ -259,21 +239,5 @@ mod tests {
         let mut received = [0; 5];
         server.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"ready");
-    }
-
-    #[tokio::test]
-    async fn http_request_body_limit_accepts_32_mib() {
-        assert_eq!(
-            request_body_status(MAX_HTTP_REQUEST_BODY_SIZE).await,
-            StatusCode::OK
-        );
-    }
-
-    #[tokio::test]
-    async fn http_request_body_limit_rejects_more_than_32_mib() {
-        assert_eq!(
-            request_body_status(MAX_HTTP_REQUEST_BODY_SIZE + 1).await,
-            StatusCode::PAYLOAD_TOO_LARGE
-        );
     }
 }
