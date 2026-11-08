@@ -18,6 +18,13 @@ Best, Fastest, Versus, and batches use suitable primaries first. For head-bound 
 
 Full-block cache fetches follow the same primary-first rule. A backup header one block ahead does not trigger a backup full-block download while primary consensus remains within the allowed lag. Backup head subscriptions or polls and health checks remain active and can still generate provider traffic. The `backups_needed` status field describes consensus votes, not every request fallback. For now, `latest` uses the primary consensus head within the lag limit rather than waiting for the newer local head; see the follow-up in `TODO.md`.
 
+HTTP clients can send gzip-compressed JSON-RPC bodies with `Content-Encoding: gzip`
+and `Content-Type: application/json`. The proxy accepts plain and `identity`
+bodies too. Both encoded and decoded bodies have a 32 MiB limit. Gzip decoding
+validates every member and trailer; truncated or corrupt bodies are rejected.
+Unsupported or stacked content encodings return HTTP 415. Clients must opt in;
+measure compression CPU cost and the full request latency on their actual workload.
+
 HTTP backend responses are read completely into memory before the proxy accepts or returns them. This includes responses larger than 128 KiB. The proxy validates the JSON-RPC envelope and decoded response ID before recording a successful latency sample. The backend permit stays held through the body read and validation. Large replies therefore use memory proportional to their complete size; an incomplete or stalled body cannot become a client response.
 
 Use `/fastest` for HTTP or WebSocket tests that should race multiple fast nodes. Set `app.fastest_rpcs` in the TOML config (default `2`). Fastest uses the same latency tiers, then load-weighted latency within each tier. It starts requests on the best available synced nodes. With one synced node, it sends one request. With three synced nodes and a count of two, it selects the top two. Set the count to `1` for one node, or `0` for all synced eligible nodes.
