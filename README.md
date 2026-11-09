@@ -41,9 +41,12 @@ Versus returns the first complete success, including `null`, or execution revert
 
 Later successful completions update the existing median and peak backend latency metrics. They do not change the client answer or its recorded response time. RPC errors, including accepted reverts, do not produce successful latency samples. Local replies and cache hits start no comparison and add no backend timing samples. Transaction submission rules, subscriptions, client IDs, and batch order stay in place. A completed comparison cannot restart through application retries, gas-estimate error handling, or transaction/receipt archive fallback. If every node fails, Versus returns the first completed failure; if the deadline expires, it reports timeout.
 
-IPC and WebSocket-only backends use two persistent query connections and one
-separate subscription connection per logical backend. New calls use the query
-connection with fewer unfinished calls, alternating equal-load choices. A query
+IPC backends use a bounded pool of persistent query connections. Set
+`ipc_query_connections` on each backend to a value from 1 through 32 (default: 2).
+Choose the pool size with matched workload tests; more connections do not increase
+the backend request budget. WebSocket-only backends use two query connections.
+Both transports use one separate subscription connection per logical backend. New calls use the query
+connection with the fewest unfinished calls, rotating equal-load choices. A query
 keeps its connection counted until its complete response is parsed, it fails,
 or its caller cancels. Cancellation releases the routing count; it does not
 confirm that a late response has finished transferring.
@@ -63,7 +66,7 @@ separate and authoritative.
 
 These pools limit head-of-line blocking across backend connections. A partially
 transferred IPC value or WebSocket data message still occupies its own byte
-stream. Two busy query connections, TCP packet loss, and a slow client can still
+stream. A fully occupied query pool, TCP packet loss, and a slow client can still
 delay work. HTTP/1 pipelined responses and data messages on one client WebSocket
 must retain their wire order. Use separate client connections for bulk replies
 and latency-sensitive calls. Independent HTTP requests use the client's pool;

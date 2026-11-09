@@ -38,6 +38,10 @@ async fn read_request<S: tokio::io::AsyncRead + Unpin>(
 }
 
 async fn rpc(path: &Path) -> Arc<Web3Rpc> {
+    rpc_with_connections(path, 2).await
+}
+
+async fn rpc_with_connections(path: &Path, connections: usize) -> Arc<Web3Rpc> {
     let (hard_limit_until, _) = watch::channel(Instant::now());
     let rpc = Web3Rpc {
         name: "local-ipc".into(),
@@ -54,8 +58,9 @@ async fn rpc(path: &Path) -> Arc<Web3Rpc> {
         median_latency: Some(RollingQuantileLatency::spawn_median(100).await),
         ..Default::default()
     };
-    rpc.ipc_provider
-        .store(Some(Arc::new(connect_ipc_pool(path.into()).await.unwrap())));
+    rpc.ipc_provider.store(Some(Arc::new(
+        connect_ipc_pool(path.into(), connections).await.unwrap(),
+    )));
     Arc::new(rpc)
 }
 
@@ -64,10 +69,19 @@ where
     F: Fn(UnixStream) -> Fut + Send,
     Fut: Future<Output = ()> + Send,
 {
-    let (first, _) = listener.accept().await.unwrap();
-    let (second, _) = listener.accept().await.unwrap();
-    let (subscriptions, _) = listener.accept().await.unwrap();
-    tokio::join!(handler(first), handler(second), handler(subscriptions));
+    serve_connections(listener, 2, handler).await;
+}
+
+async fn serve_connections<F, Fut>(listener: UnixListener, connections: usize, handler: F)
+where
+    F: Fn(UnixStream) -> Fut + Send,
+    Fut: Future<Output = ()> + Send,
+{
+    let mut sockets = Vec::new();
+    for _ in 0..=connections {
+        sockets.push(listener.accept().await.unwrap().0);
+    }
+    futures::future::join_all(sockets.into_iter().map(handler)).await;
 }
 
 async fn call<R: JsonRpcResultData>(rpc: &Arc<Web3Rpc>, value: u64) -> R {
@@ -411,7 +425,7 @@ async fn ipc_only_configuration_starts_healthy_and_publishes_heads() {
 }
 
 #[tokio::test]
-async fn ipc_pool_shares_one_admission_budget_across_both_streams() {
+async fn ipc_pool_shares_one_admission_budget_across_all_configured_streams() {
     test_support::with_cleanup(async {
         use super::one::RequestPermits;
         use tokio::sync::{mpsc, Semaphore};
@@ -421,7 +435,7 @@ async fn ipc_pool_shares_one_admission_budget_across_both_streams() {
         let gate = Arc::new(Semaphore::new(0));
         let server_gate = gate.clone();
         let (seen, mut received) = mpsc::unbounded_channel();
-        let server = test_support::spawn(serve_pool(listener, move |socket| {
+        let server = test_support::spawn(serve_connections(listener, 4, move |socket| {
             let gate = server_gate.clone();
             let seen = seen.clone();
             async move {
@@ -446,7 +460,7 @@ async fn ipc_pool_shares_one_admission_budget_across_both_streams() {
                 }
             }
         }));
-        let mut rpc = rpc(&path).await;
+        let mut rpc = rpc_with_connections(&path, 4).await;
         Arc::get_mut(&mut rpc).unwrap().request_permits = RequestPermits::new(2, 64);
         let a = rpc.clone();
         let a = test_support::spawn(async move { call::<u64>(&a, 10).await });
@@ -576,7 +590,7 @@ async fn startup_rejects_a_backend_without_any_transport() {
 }
 
 #[tokio::test]
-async fn ipc_pool_does_not_queue_fast_calls_behind_a_partial_response() {
+async fn ipc_pool_does_not_queue_fast_calls_behind_two_partial_responses() {
     test_support::with_cleanup(async {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("node.ipc");
@@ -584,7 +598,7 @@ async fn ipc_pool_does_not_queue_fast_calls_behind_a_partial_response() {
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let server_release = release.clone();
         let (started, mut partial) = tokio::sync::mpsc::unbounded_channel();
-        let server = test_support::spawn(serve_pool(listener, move |socket| {
+        let server = test_support::spawn(serve_connections(listener, 4, move |socket| {
             let release = server_release.clone();
             let started = started.clone();
             async move {
@@ -601,14 +615,14 @@ async fn ipc_pool_does_not_queue_fast_calls_behind_a_partial_response() {
                             responses.push(async move {
                                 let value = request["params"][0].as_u64().unwrap();
                                 let mut writer = writer.lock().await;
-                                if value == 0 {
+                                if value < 2 {
                                     // A partially transferred JSON value owns this byte stream.
                                     // Keep reading requests, but never interleave response bytes.
                                     let prefix = format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":", request["id"]);
                                     writer.write_all(prefix.as_bytes()).await.unwrap();
                                     started.send(()).unwrap();
                                     release.acquire().await.unwrap().forget();
-                                    writer.write_all(b"0}").await.unwrap();
+                                    writer.write_all(format!("{value}}}").as_bytes()).await.unwrap();
                                 } else {
                                     let response = json!({"jsonrpc":"2.0","id":request["id"],"result":value});
                                     writer.write_all(response.to_string().as_bytes()).await.unwrap();
@@ -620,19 +634,23 @@ async fn ipc_pool_does_not_queue_fast_calls_behind_a_partial_response() {
                 }
             }
         }));
-        let rpc = rpc(&path).await;
+        let rpc = rpc_with_connections(&path, 4).await;
         let slow_rpc = rpc.clone();
         let slow = test_support::spawn(async move { call::<u64>(&slow_rpc, 0).await });
         timeout(Duration::from_secs(2), partial.recv()).await.unwrap().unwrap();
+        let other_rpc = rpc.clone();
+        let other = test_support::spawn(async move { call::<u64>(&other_rpc, 1).await });
+        timeout(Duration::from_secs(2), partial.recv()).await.unwrap().unwrap();
         timeout(Duration::from_secs(2), async {
-            for value in 1..=8 {
+            for value in 2..=9 {
                 assert_eq!(call::<u64>(&rpc, value).await, value);
             }
-        }).await.expect("fast calls must use the other IPC stream while a response is incomplete");
-        assert!(!slow.is_finished());
-        assert_eq!(rpc.active_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
-        release.add_permits(1);
+        }).await.expect("fast calls must use an idle IPC stream while a response is incomplete");
+        assert!(!slow.is_finished() && !other.is_finished());
+        assert_eq!(rpc.active_requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        release.add_permits(2);
         assert_eq!(timeout(Duration::from_secs(2), slow).await.unwrap().unwrap(), 0);
+        assert_eq!(timeout(Duration::from_secs(2), other).await.unwrap().unwrap(), 1);
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
         drop(rpc);
@@ -714,4 +732,103 @@ async fn ipc_subscription_progresses_while_a_query_frame_is_incomplete() {
         drop(heads);
         drop(rpc);
     }).await;
+}
+
+#[tokio::test]
+async fn configured_ipc_pool_uses_each_query_stream_and_a_separate_subscription_stream() {
+    for connections in [4, 8] {
+        test_support::with_cleanup(async move {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio::sync::{mpsc, Semaphore};
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("pool.ipc");
+            let listener = UnixListener::bind(&path).unwrap();
+            let gate = Arc::new(Semaphore::new(0));
+            let server_gate = gate.clone();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let server_accepted = accepted.clone();
+            let (seen, mut received) = mpsc::unbounded_channel();
+            let server = test_support::spawn(serve_connections(listener, connections, move |mut socket| {
+                let index = server_accepted.fetch_add(1, Ordering::Relaxed);
+                let gate = server_gate.clone();
+                let seen = seen.clone();
+                async move {
+                    let mut buffer = Vec::new();
+                    loop {
+                        let request = read_request(&mut socket, &mut buffer).await;
+                        seen.send((index, request["params"][0].as_u64().unwrap())).unwrap();
+                        gate.acquire().await.unwrap().forget();
+                        socket.write_all(json!({"jsonrpc":"2.0", "id":request["id"], "result":request["params"][0]}).to_string().as_bytes()).await.unwrap();
+                    }
+                }
+            }));
+            let pool = Arc::new(connect_ipc_pool(path, connections).await.unwrap());
+            assert_eq!(pool.size(), connections);
+            let calls = (0..connections).map(|value| {
+                let pool = pool.clone();
+                test_support::spawn(async move {
+                    let provider = pool.query();
+                    provider.raw_request::<_, u64>("eth_call".into(), [value]).await.unwrap()
+                })
+            }).collect::<Vec<_>>();
+            let mut streams = std::collections::HashSet::new();
+            let mut values = std::collections::HashSet::new();
+            for _ in 0..connections {
+                let (stream, value) = timeout(Duration::from_secs(2), received.recv()).await.unwrap().unwrap();
+                assert!(streams.insert(stream), "queries must use distinct idle streams");
+                assert!(values.insert(value));
+            }
+            assert_eq!(accepted.load(Ordering::Relaxed), connections + 1);
+            assert_eq!(pool.in_flight(), vec![1; connections]);
+            gate.add_permits(connections + 1);
+            for (value, call) in calls.into_iter().enumerate() {
+                assert_eq!(call.await.unwrap(), value as u64);
+            }
+            assert_eq!(pool.in_flight(), vec![0; connections]);
+            assert_eq!(pool.subscription().raw_request::<_, u64>("eth_call".into(), [999]).await.unwrap(), 999);
+            let (subscription_stream, value) = received.recv().await.unwrap();
+            assert_eq!(value, 999);
+            assert!(!streams.contains(&subscription_stream));
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }).await;
+    }
+}
+
+#[tokio::test]
+async fn ipc_pool_rejects_zero_and_excessive_connections_before_connecting() {
+    for connections in [0, crate::config::MAX_IPC_QUERY_CONNECTIONS + 1] {
+        let result = connect_ipc_pool("/not-an-ipc-socket".into(), connections).await;
+        assert!(result.is_err_and(|error| error.to_string().contains("pool size")));
+    }
+}
+
+#[tokio::test]
+async fn startup_rejects_invalid_ipc_pool_sizes() {
+    for connections in [0, crate::config::MAX_IPC_QUERY_CONNECTIONS + 1] {
+        let config = crate::config::Web3RpcConfig {
+            ipc_path: Some("/not-an-ipc-socket".into()),
+            ipc_query_connections: connections,
+            ..Default::default()
+        };
+        let result = Web3Rpc::spawn(
+            config,
+            "invalid-ipc-pool".into(),
+            1,
+            None,
+            Duration::from_secs(12),
+            moka::future::Cache::new(16),
+            moka::future::Cache::new(16),
+            super::blockchain::new_block_response_cache(1_000_000),
+            None,
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(result
+            .expect_err("invalid sizes must fail before connecting")
+            .to_string()
+            .contains("ipc_query_connections must be between"));
+    }
 }

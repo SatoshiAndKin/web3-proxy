@@ -15,12 +15,12 @@ pub type AlloyWsProvider = RootProvider;
 pub type AlloyHttpProvider = RootProvider;
 pub type AlloyIpcProvider = RootProvider;
 
-/// Two query streams and a separate subscription stream share one logical backend.
+/// A bounded set of query streams and a separate subscription stream share one backend.
 /// Alloy owns framing, request IDs, subscriptions, and reconnects on each stream.
 pub(super) struct PubSubProviderPool {
-    providers: [Arc<RootProvider>; 2],
+    providers: Box<[Arc<RootProvider>]>,
     subscriptions: Arc<RootProvider>,
-    active: [AtomicUsize; 2],
+    active: Box<[AtomicUsize]>,
     next: AtomicUsize,
 }
 
@@ -45,11 +45,17 @@ impl Drop for PubSubQuery<'_> {
 }
 
 impl PubSubProviderPool {
-    pub(super) fn new(providers: [Arc<RootProvider>; 2], subscriptions: Arc<RootProvider>) -> Self {
+    pub(super) fn new(
+        providers: impl IntoIterator<Item = Arc<RootProvider>>,
+        subscriptions: Arc<RootProvider>,
+    ) -> Self {
+        let providers: Box<[_]> = providers.into_iter().collect();
+        assert!(!providers.is_empty());
+        let active = (0..providers.len()).map(|_| AtomicUsize::new(0)).collect();
         Self {
             providers,
             subscriptions,
-            active: Default::default(),
+            active,
             next: AtomicUsize::new(0),
         }
     }
@@ -57,14 +63,18 @@ impl PubSubProviderPool {
     pub(super) fn query(&self) -> PubSubQuery<'_> {
         // These counters guide routing; they do not publish data or enforce the
         // logical backend's admission budget. ArcSwap publishes the immutable
-        // pool. Concurrent snapshots may tie, so alternate equal-load choices.
-        let first = self.active[0].load(Ordering::Relaxed);
-        let second = self.active[1].load(Ordering::Relaxed);
-        let index = match first.cmp(&second) {
-            std::cmp::Ordering::Less => 0,
-            std::cmp::Ordering::Greater => 1,
-            std::cmp::Ordering::Equal => self.next.fetch_add(1, Ordering::Relaxed) & 1,
-        };
+        // pool. Rotate the starting point so equal-load streams share requests.
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.active.len();
+        let mut index = start;
+        let mut least = self.active[index].load(Ordering::Relaxed);
+        for offset in 1..self.active.len() {
+            let candidate = (start + offset) % self.active.len();
+            let load = self.active[candidate].load(Ordering::Relaxed);
+            if load < least {
+                index = candidate;
+                least = load;
+            }
+        }
         self.active[index].fetch_add(1, Ordering::Relaxed);
         PubSubQuery { pool: self, index }
     }
@@ -91,10 +101,11 @@ impl PubSubProviderPool {
         }
     }
 
-    pub(super) fn in_flight(&self) -> [usize; 2] {
+    pub(super) fn in_flight(&self) -> Vec<usize> {
         self.active
-            .each_ref()
+            .iter()
             .map(|active| active.load(Ordering::Relaxed))
+            .collect()
     }
 
     /// Number of query streams; the subscription stream is separate.
@@ -103,14 +114,18 @@ impl PubSubProviderPool {
     }
 }
 
-pub(super) async fn connect_ipc_pool(path: PathBuf) -> Web3ProxyResult<PubSubProviderPool> {
-    let (first, second, subscriptions) = tokio::try_join!(
-        connect_ipc(path.clone()),
-        connect_ipc(path.clone()),
-        connect_ipc(path)
-    )?;
+pub(super) async fn connect_ipc_pool(
+    path: PathBuf,
+    connections: usize,
+) -> Web3ProxyResult<PubSubProviderPool> {
+    if !(1..=crate::config::MAX_IPC_QUERY_CONNECTIONS).contains(&connections) {
+        return Err(anyhow::anyhow!("IPC query pool size is outside its configured bounds").into());
+    }
+    let paths = vec![path.clone(); connections];
+    let queries = futures::future::try_join_all(paths.into_iter().map(connect_ipc));
+    let (providers, subscriptions) = tokio::try_join!(queries, connect_ipc(path))?;
     Ok(PubSubProviderPool::new(
-        [Arc::new(first), Arc::new(second)],
+        providers.into_iter().map(Arc::new),
         Arc::new(subscriptions),
     ))
 }
@@ -190,34 +205,34 @@ mod tests {
     #[tokio::test]
     async fn terminal_failure_of_any_query_or_subscription_retires_pool() {
         use alloy::{pubsub::PubSubFrontend, rpc::client::RpcClient};
-        for failed in 0..3 {
-            let mut receivers = Vec::new();
-            let mut provider = || {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                receivers.push(rx);
-                Arc::new(RootProvider::new(RpcClient::new(
-                    PubSubFrontend::new(tx),
-                    true,
-                )))
-            };
-            let pool = Arc::new(PubSubProviderPool::new(
-                [provider(), provider()],
-                provider(),
-            ));
-            let watched = pool.clone();
-            let monitor = tokio::spawn(async move { watched.wait_closed().await });
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            assert!(!monitor.is_finished());
-            drop(receivers.remove(failed));
-            assert!(tokio::time::timeout(Duration::from_secs(2), monitor)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err());
-            assert!(
-                receivers.iter().all(|receiver| !receiver.is_closed()),
-                "unrelated streams stayed live"
-            );
+        for connections in [1, 2, 4, 8] {
+            for failed in 0..=connections {
+                let mut receivers = Vec::new();
+                let mut provider = || {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    receivers.push(rx);
+                    Arc::new(RootProvider::new(RpcClient::new(
+                        PubSubFrontend::new(tx),
+                        true,
+                    )))
+                };
+                let providers = (0..connections).map(|_| provider()).collect::<Vec<_>>();
+                let pool = Arc::new(PubSubProviderPool::new(providers, provider()));
+                let watched = pool.clone();
+                let monitor = tokio::spawn(async move { watched.wait_closed().await });
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(!monitor.is_finished());
+                drop(receivers.remove(failed));
+                assert!(tokio::time::timeout(Duration::from_secs(2), monitor)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err());
+                assert!(
+                    receivers.iter().all(|receiver| !receiver.is_closed()),
+                    "unrelated streams stayed live"
+                );
+            }
         }
     }
 

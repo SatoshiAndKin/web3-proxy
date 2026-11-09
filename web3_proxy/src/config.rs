@@ -20,6 +20,8 @@ use tracing::warn;
 pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 448;
 pub(crate) const DEFAULT_MAX_BACKEND_BATCH_ITEMS: usize = 64;
 pub(crate) const DEFAULT_FASTEST_RPCS: usize = 2;
+pub(crate) const DEFAULT_IPC_QUERY_CONNECTIONS: usize = 2;
+pub(crate) const MAX_IPC_QUERY_CONNECTIONS: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TopConfig {
@@ -271,6 +273,10 @@ pub struct Web3RpcConfig {
     pub http_url: Option<String>,
     /// while not absolutely required, a ipc connection should be fastest
     pub ipc_path: Option<PathBuf>,
+    /// Persistent IPC query streams, excluding the separate subscription stream.
+    /// All streams share this backend's request admission budget.
+    #[serde_inline_default(DEFAULT_IPC_QUERY_CONNECTIONS)]
+    pub ipc_query_connections: usize,
     /// Restrict IPC to the modules available on the backend's public RPC endpoint.
     pub ipc_allowed_modules: Option<Vec<String>>,
     /// Maximum number of physical requests sent concurrently to this backend.
@@ -311,6 +317,7 @@ impl fmt::Debug for Web3RpcConfig {
             .field("display_name", &self.display_name)
             .field("http_url", &self.http_url.as_ref().map(|_| "[REDACTED]"))
             .field("ipc_path", &self.ipc_path)
+            .field("ipc_query_connections", &self.ipc_query_connections)
             .field("ipc_allowed_modules", &self.ipc_allowed_modules)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("max_backend_batch_items", &self.max_backend_batch_items)
@@ -396,16 +403,31 @@ mod tests {
         let a: Web3RpcConfig = sonic_rs::from_str("{}").unwrap();
 
         assert_eq!(a.soft_limit, 1);
+        assert_eq!(
+            a.ipc_query_connections,
+            super::DEFAULT_IPC_QUERY_CONNECTIONS
+        );
         assert_eq!(a.max_concurrent_requests, DEFAULT_MAX_CONCURRENT_REQUESTS);
         assert_eq!(a.max_backend_batch_items, DEFAULT_MAX_BACKEND_BATCH_ITEMS);
 
         let b: Web3RpcConfig = Default::default();
 
         assert_eq!(b.soft_limit, 1);
+        assert_eq!(
+            b.ipc_query_connections,
+            super::DEFAULT_IPC_QUERY_CONNECTIONS
+        );
         assert_eq!(b.max_concurrent_requests, DEFAULT_MAX_CONCURRENT_REQUESTS);
         assert_eq!(b.max_backend_batch_items, DEFAULT_MAX_BACKEND_BATCH_ITEMS);
 
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ipc_pool_configuration_is_not_an_unknown_option() {
+        let config: Web3RpcConfig = toml::from_str("ipc_query_connections = 8").unwrap();
+        assert_eq!(config.ipc_query_connections, 8);
+        assert!(config.extra.is_empty());
     }
 
     #[test]
@@ -418,7 +440,7 @@ mod tests {
 
         assert_eq!(
             format!("{config:?}"),
-            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, ipc_allowed_modules: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
+            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, ipc_query_connections: 2, ipc_allowed_modules: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
         );
     }
 
