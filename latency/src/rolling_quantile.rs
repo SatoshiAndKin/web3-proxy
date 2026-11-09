@@ -12,6 +12,8 @@ use watermill::stats::Univariate;
 
 // Reporting bursts and the statistical window have independent bounds.
 const REPORT_QUEUE_CAPACITY: usize = 4_096;
+const RECEIVE_BATCH: usize = 128;
+const REPORTS_PER_TURN: usize = 1_024;
 
 pub struct RollingQuantileLatency {
     /// Join handle for the latency calculation task.
@@ -54,9 +56,29 @@ impl RollingQuantileLatencyTask {
 
     /// Run the loop for updating latency.
     async fn run(mut self) {
-        while let Some(rtt) = self.latency_rx.recv().await {
-            rtt.received(self.queue_id, "rolling_quantile", self.latency_rx.len());
-            self.update(rtt.value);
+        let mut reports = Vec::with_capacity(RECEIVE_BATCH);
+        let mut processed = 0;
+        loop {
+            let count = self.latency_rx.recv_many(&mut reports, RECEIVE_BATCH).await;
+            if count == 0 {
+                break;
+            }
+            // One receive per batch avoids spending the cooperative task budget
+            // on every report. Preserve sample order and the statistical window.
+            for (index, rtt) in reports.drain(..).enumerate() {
+                rtt.received(
+                    self.queue_id,
+                    "rolling_quantile",
+                    self.latency_rx.len() + count - index - 1,
+                );
+                self.update(rtt.value);
+            }
+            processed += count;
+            // Bound uninterrupted work even when producers keep the queue full.
+            if processed >= REPORTS_PER_TURN {
+                processed = 0;
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -154,11 +176,11 @@ mod tests {
         // The current-thread runtime cannot drain the receiver until we yield.
         // This burst is larger than both the window and the former 1,000-slot
         // production queue, but the final median still uses only three samples.
-        for value in 1..=2_048 {
+        for value in 1..=2_051 {
             median.record_secs(value as f32);
         }
         assert_eq!(median.queue_stats().dropped_full, 0);
-        assert_eq!(median.queue_stats().used_capacity, 2_048);
+        assert_eq!(median.queue_stats().used_capacity, 2_051);
         let RollingQuantileLatency {
             join_handle,
             latency_tx,
@@ -170,6 +192,30 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(seconds.load(Ordering::Relaxed), 2_047.0);
+        assert_eq!(seconds.load(Ordering::Relaxed), 2_050.0);
+    }
+
+    #[tokio::test]
+    async fn a_sparse_report_does_not_wait_for_a_full_receive_batch() {
+        let median = RollingQuantileLatency::spawn_median(3).await;
+        median.record_secs(7.0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while median.seconds() != 7.0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(median.queue_stats().dropped_full, 0);
+        let RollingQuantileLatency {
+            join_handle,
+            latency_tx,
+            ..
+        } = median;
+        drop(latency_tx);
+        tokio::time::timeout(Duration::from_secs(2), join_handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
