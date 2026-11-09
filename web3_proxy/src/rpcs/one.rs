@@ -10,6 +10,7 @@ use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::Web3ProxyJoinHandle;
 use crate::config::{
     Web3RpcConfig, DEFAULT_MAX_BACKEND_BATCH_ITEMS, DEFAULT_MAX_CONCURRENT_REQUESTS,
+    MAX_IPC_QUERY_CONNECTIONS,
 };
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::globals;
@@ -123,6 +124,7 @@ pub struct Web3Rpc {
     pub(super) ws_query_pool: ArcSwapOption<PubSubProviderPool>,
     /// IPC takes precedence for local requests and subscriptions.
     pub(super) ipc_path: Option<PathBuf>,
+    pub(super) ipc_query_connections: usize,
     pub(super) ipc_allowed_modules: Option<Vec<String>>,
     pub(super) ipc_provider: ArcSwapOption<PubSubProviderPool>,
     /// keep track of hard limits
@@ -230,6 +232,11 @@ impl Web3Rpc {
         if config.ipc_allowed_modules.is_some() && config.ipc_path.is_none() {
             return Err(anyhow!("ipc_allowed_modules requires ipc_path"));
         }
+        if !(1..=MAX_IPC_QUERY_CONNECTIONS).contains(&config.ipc_query_connections) {
+            return Err(anyhow!(
+                "ipc_query_connections must be between 1 and {MAX_IPC_QUERY_CONNECTIONS}"
+            ));
+        }
         if config.max_concurrent_requests == 0 {
             return Err(anyhow!("max_concurrent_requests must be greater than zero"));
         }
@@ -299,6 +306,7 @@ impl Web3Rpc {
             http_url,
             http_client,
             ipc_path: config.ipc_path,
+            ipc_query_connections: config.ipc_query_connections,
             ipc_allowed_modules: config.ipc_allowed_modules,
             max_head_block_age,
             name,
@@ -1083,8 +1091,9 @@ impl Web3Rpc {
         }
 
         if let Some(path) = self.ipc_path.clone() {
-            self.ipc_provider
-                .store(Some(Arc::new(connect_ipc_pool(path).await?)));
+            self.ipc_provider.store(Some(Arc::new(
+                connect_ipc_pool(path, self.ipc_query_connections).await?,
+            )));
         } else if let Some(url) = self.ws_url.clone() {
             trace!("starting websocket provider on {}", self);
 
