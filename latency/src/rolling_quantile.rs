@@ -10,6 +10,9 @@ use tokio::time::Duration;
 use watermill::quantile::RollingQuantile;
 use watermill::stats::Univariate;
 
+// Reporting bursts and the statistical window have independent bounds.
+const REPORT_QUEUE_CAPACITY: usize = 4_096;
+
 pub struct RollingQuantileLatency {
     /// Join handle for the latency calculation task.
     pub join_handle: JoinHandle<()>,
@@ -101,8 +104,8 @@ impl RollingQuantileLatency {
 
 impl RollingQuantileLatency {
     pub async fn spawn(quantile_value: f32, window_size: usize) -> Self {
-        // TODO: how should queue size and window size be related?
-        let (latency_tx, latency_rx) = mpsc::channel(window_size);
+        // Absorb short reporting bursts without increasing the rolling window.
+        let (latency_tx, latency_rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
 
         let seconds = Arc::new(AtomicF32::new(0.0));
 
@@ -138,5 +141,35 @@ impl Serialize for RollingQuantileLatency {
         S: Serializer,
     {
         serializer.serialize_f32(self.seconds.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reporting_burst_preserves_the_requested_rolling_window() {
+        let median = RollingQuantileLatency::spawn_median(3).await;
+        // The current-thread runtime cannot drain the receiver until we yield.
+        // This burst is larger than both the window and the former 1,000-slot
+        // production queue, but the final median still uses only three samples.
+        for value in 1..=2_048 {
+            median.record_secs(value as f32);
+        }
+        assert_eq!(median.queue_stats().dropped_full, 0);
+        assert_eq!(median.queue_stats().used_capacity, 2_048);
+        let RollingQuantileLatency {
+            join_handle,
+            latency_tx,
+            seconds,
+            ..
+        } = median;
+        drop(latency_tx);
+        tokio::time::timeout(Duration::from_secs(2), join_handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seconds.load(Ordering::Relaxed), 2_047.0);
     }
 }

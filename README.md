@@ -85,7 +85,8 @@ Each backend in `/status` includes `latency_queues`: peak EWMA first, then the
 rolling median. Each snapshot reports its queue ID, capacity in use, total capacity,
 and full/closed drop counts. Capacity in use includes reserved channel slots.
 Snapshots read Tokio's existing state. Successful sends do not update a separate
-queue-depth counter.
+queue-depth counter. The rolling-median report queue holds up to 4,096 samples
+independently of its 1,000-sample statistical window. Reports remain nonblocking.
 
 The `scheduler` snapshot reads Tokio's existing global, worker, and blocking queue
 counters. Per-worker busy time and poll counts are cumulative; compare snapshots
