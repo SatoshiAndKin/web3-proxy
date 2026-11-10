@@ -9,11 +9,12 @@ RUN apt-retry update && apt-retry install --no-install-recommends -y \
     build-essential clang cmake pkg-config libssl-dev ca-certificates
 COPY rust-toolchain.toml ./
 RUN rustup show active-toolchain && rustup component add clippy rustfmt
+# Keep function names for production profiles without hot-path instrumentation.
 ENV CARGO_BUILD_JOBS=2 \
     CARGO_PROFILE_DEV_DEBUG=0 \
     CARGO_PROFILE_TEST_DEBUG=0 \
     CARGO_PROFILE_FASTER_RELEASE_DEBUG=0 \
-    CARGO_PROFILE_FASTER_RELEASE_STRIP=symbols \
+    CARGO_PROFILE_FASTER_RELEASE_STRIP=none \
     RUSTFLAGS="--cfg tokio_unstable --cfg uuid_unstable -C target-cpu=x86-64"
 COPY Cargo.toml Cargo.lock ./
 COPY deduped_broadcast/Cargo.toml deduped_broadcast/Cargo.toml
