@@ -16,7 +16,7 @@ nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 # TODO: regex has several "perf" features that we might want to use
 anyhow = { version = "1.0.104", features = ["backtrace"] }
 # Keep all direct Alloy SDK types on the release-based IPC duplex fix.
-alloy = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "0be01f005cff03b8afbb4044e8980fa086ebea04", default-features = false, features = [
+alloy = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "d58ade9ede3534f2337b2a8abf55af9221ce650b", default-features = false, features = [
     "consensus",
     "eips",
     "node-bindings",
@@ -32,8 +32,8 @@ alloy = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev
     "signer-local",
     "std",
 ] }
-alloy-rpc-types-beacon = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "0be01f005cff03b8afbb4044e8980fa086ebea04", features = ["ssz"] }
-alloy-rpc-types-engine = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "0be01f005cff03b8afbb4044e8980fa086ebea04", features = ["jwt-aws-lc-rs"] }
+alloy-rpc-types-beacon = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "d58ade9ede3534f2337b2a8abf55af9221ce650b", features = ["ssz"] }
+alloy-rpc-types-engine = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "d58ade9ede3534f2337b2a8abf55af9221ce650b", features = ["jwt-aws-lc-rs"] }
 eventsource-stream = "0.2.3"
 arc-swap = { version = "1.9.3" }
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
