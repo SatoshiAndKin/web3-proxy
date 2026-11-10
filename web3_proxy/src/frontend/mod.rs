@@ -87,57 +87,55 @@ pub fn make_router(app: Arc<App>) -> Router<()> {
         .route("/status/backups_needed", get(status::backups_needed))
         .route("/status/debug_request", get(status::debug_request));
 
-    // Axum layers
-    // layers are ordered bottom up
-    // the last layer is first for requests and last for responses
-    let router: Router = request_body::with_body_limits(router)
-        // Remove trailing slashes
-        // TODO: this isn't working for me. why?
-        .layer(NormalizePathLayer::trim_trailing_slash())
-        // handle cors. we expect queries from all sorts of places
-        .layer(CorsLayer::very_permissive())
-        // request id
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
-                // We get the request id from the header
-                // If no header, a new Ulid is created
-                // TODO: move this header name to config
-                /*
-                let request_id = request
-                    .headers()
-                    .get("x-amzn-trace-id")
-                    .and_then(|x| x.to_str().ok())
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| Ulid::new().to_string());
-                */
-                let request_id = &request.extensions().get::<RequestId>().unwrap().0;
-
-                // And then we put it along with other information into the `request` span
-                // TODO: what other info should we attach? how can we attach an error and a tracing span here?
-                // TODO: how can we do a tracing_span OR an error_span?
-                let s = trace_span!(
-                    "request",
-                    id = %request_id,
-                    method = %request.method(),
-                    path = %request.uri().path(),
-                );
-
-                if s.is_disabled() {
-                    error_span!(
-                        "request",
-                        id = %request_id,
-                    )
-                } else {
-                    s
-                }
-            }), // .on_failure(|| todo!("on failure that has the request and response body so we can debug more easily")),
-        )
-        .layer(request_id::RequestIdLayer)
+    with_layers(router)
         // 404 for any unknown routes
         .fallback(errors::handler_404)
-        .with_state(app);
+        .with_state(app)
+}
 
-    router
+fn with_layers<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    // Tuple layers run in request order. Compose them before Axum boxes the route.
+    request_body::with_body_limits(router).layer((
+        request_id::RequestIdLayer,
+        TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+            // We get the request id from the header
+            // If no header, a new Ulid is created
+            // TODO: move this header name to config
+            /*
+            let request_id = request
+                .headers()
+                .get("x-amzn-trace-id")
+                .and_then(|x| x.to_str().ok())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| Ulid::new().to_string());
+            */
+            let request_id = &request.extensions().get::<RequestId>().unwrap().0;
+
+            // And then we put it along with other information into the `request` span
+            // TODO: what other info should we attach? how can we attach an error and a tracing span here?
+            // TODO: how can we do a tracing_span OR an error_span?
+            let s = trace_span!(
+                "request",
+                id = %request_id,
+                method = %request.method(),
+                path = %request.uri().path(),
+            );
+
+            if s.is_disabled() {
+                error_span!(
+                    "request",
+                    id = %request_id,
+                )
+            } else {
+                s
+            }
+        }),
+        CorsLayer::very_permissive(),
+        NormalizePathLayer::trim_trailing_slash(),
+    ))
 }
 
 /// Start the frontend server.
@@ -239,5 +237,122 @@ mod tests {
         let mut received = [0; 5];
         server.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"ready");
+    }
+}
+
+#[cfg(test)]
+mod middleware_tests {
+    use super::{with_layers, RequestId};
+    use axum::{
+        body::{to_bytes, Body, Bytes},
+        extract::Extension,
+        http::{header, Request, StatusCode, Uri},
+        routing::post,
+        Router,
+    };
+    use tower_service::Service;
+
+    async fn echo(Extension(id): Extension<RequestId>, uri: Uri, body: Bytes) -> String {
+        format!(
+            "{}|{}|{}",
+            id.0,
+            uri.path(),
+            String::from_utf8(body.to_vec()).unwrap()
+        )
+    }
+
+    fn router() -> Router {
+        with_layers(
+            Router::new()
+                .route("/probe", post(echo))
+                .route("/probe/", post(echo)),
+        )
+    }
+
+    #[tokio::test]
+    async fn request_id_and_normalized_path_reach_handler() {
+        let response = router()
+            .call(
+                Request::post("/probe/")
+                    .header("x-amzn-trace-id", "known-id")
+                    .header(header::ORIGIN, "https://client.example")
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://client.example"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            "known-id|/probe|payload"
+        );
+
+        let response = router()
+            .call(Request::post("/probe").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let (id, rest) = body.split_once('|').unwrap();
+        ulid::Ulid::from_string(id).unwrap();
+        assert_eq!(rest, "/probe|");
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_precedes_body_decoding() {
+        let response = router()
+            .call(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/probe")
+                    .header(header::ORIGIN, "https://client.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::CONTENT_ENCODING, "unsupported")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://client.example"
+        );
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+            "POST"
+        );
+        assert!(to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn encoding_errors_keep_cors_headers() {
+        let response = router()
+            .call(
+                Request::post("/probe")
+                    .header(header::ORIGIN, "https://client.example")
+                    .header(header::CONTENT_ENCODING, "unsupported")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://client.example"
+        );
+        assert_eq!(
+            response.headers()[header::ACCEPT_ENCODING],
+            "gzip, identity"
+        );
     }
 }
