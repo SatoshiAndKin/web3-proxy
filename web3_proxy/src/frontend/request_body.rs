@@ -20,10 +20,13 @@ where
     S: Clone + Send + Sync + 'static,
 {
     router
-        // Bytes extractors apply this limit to the decoded body.
-        .layer(DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_SIZE))
-        .layer(middleware::from_fn(decode_gzip))
-        // This outer limit also bounds encoded/chunked input.
+        .layer((
+            middleware::from_fn(decode_gzip),
+            // Bytes extractors apply this limit to the decoded body.
+            DefaultBodyLimit::max(MAX_HTTP_REQUEST_BODY_SIZE),
+        ))
+        // The wire limit changes the body type. Keep an Axum route boundary
+        // here to convert Limited<Body> before the decoding middleware.
         .layer(RequestBodyLimitLayer::new(MAX_HTTP_REQUEST_BODY_SIZE))
 }
 
