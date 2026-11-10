@@ -415,25 +415,16 @@ impl BackendRequest {
         };
 
         if response_is_success {
-            // only track latency for successful requests
-            let rpc = self.rpc.clone();
-            let sample = self.web3_request.perf_sample;
-            let queued_at = sample.map(|_| Instant::now());
-            tokio::spawn(async move {
-                if let Some(queued_at) = queued_at {
-                    let mut timing = crate::perf::Stage::since(
-                        sample,
-                        queued_at,
-                        "latency_task_wait",
-                        &rpc.name,
-                    );
-                    timing.finish();
-                }
-                rpc.peak_latency.as_ref().unwrap().report(latency);
-                rpc.median_latency.as_ref().unwrap().record(latency);
-
-                // TODO: app-wide median and peak latency?
-            });
+            // Both reporters enqueue without waiting. Their existing workers process
+            // the samples; another task per response only delays that submission.
+            let mut timing = crate::perf::Stage::new(
+                self.web3_request.perf_sample,
+                "latency_report_enqueue",
+                &self.rpc.name,
+            );
+            self.rpc.peak_latency.as_ref().unwrap().report(latency);
+            self.rpc.median_latency.as_ref().unwrap().record(latency);
+            timing.finish();
         } else {
             // only save reverts for some types of calls
             // we do **NOT** use self.error_handler here because it might have been modified
@@ -1021,6 +1012,57 @@ mod tests {
 
         assert_eq!(diagnostic, "http_connect");
         assert!(!diagnostic.contains("private-backend-token"));
+    }
+
+    #[tokio::test]
+    async fn response_latency_submission_is_immediate_and_bounded() {
+        let rpc = Arc::new(Web3Rpc {
+            name: "latency-submission".into(),
+            peak_latency: Some(latency::PeakEwmaLatency::spawn(
+                Duration::from_secs(15),
+                1,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(latency::RollingQuantileLatency::spawn_median(1).await),
+            ..Default::default()
+        });
+        let web3_request =
+            ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+                .await
+                .unwrap();
+        let backend = super::BackendRequest {
+            web3_request,
+            error_handler: Default::default(),
+            rpc: rpc.clone(),
+            allow_unhealthy: false,
+        };
+        // Do not yield on this current-thread runtime. A completed response must
+        // enqueue its sample even before another Tokio task can be scheduled.
+        for _ in 0..2 {
+            let response = crate::jsonrpc::ParsedResponse::from_result(
+                sonic_rs::to_lazyvalue(&"0x1").unwrap(),
+                backend.web3_request.id(),
+            );
+            backend
+                .check_response(Ok(response.into()), Instant::now())
+                .unwrap();
+        }
+        let mismatch = crate::jsonrpc::ParsedResponse::from_result(
+            sonic_rs::to_lazyvalue(&"0x1").unwrap(),
+            sonic_rs::to_lazyvalue(&"wrong-id").unwrap(),
+        );
+        assert!(backend
+            .check_response(Ok(mismatch.into()), Instant::now())
+            .is_err());
+        let peak = rpc.peak_latency.as_ref().unwrap().queue_stats();
+        assert_eq!(peak.used_capacity, 1);
+        assert_eq!(peak.dropped_full, 1);
+        assert_eq!(peak.dropped_closed, 0);
+        // The median's separate burst queue can still accept both samples.
+        let median = rpc.median_latency.as_ref().unwrap().queue_stats();
+        assert_eq!(median.used_capacity, 2);
+        assert_eq!(median.dropped_full, 0);
+        assert_eq!(median.dropped_closed, 0);
     }
 
     #[tokio::test]
