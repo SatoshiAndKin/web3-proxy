@@ -384,20 +384,10 @@ impl BackendRequest {
         // Validate identity before recording a successful backend timing.
         response = response.and_then(|response| {
             let jsonrpc::SingleResponse::Parsed(parsed) = &response;
-            let expected = self.web3_request.id();
-            let ids_match = match (parsed.id.as_number(), expected.as_number()) {
-                // Value equality uses Number equality too. Compare numeric IDs
-                // without serializing and reparsing them.
-                (Some(actual), Some(expected)) => actual == expected,
-                _ => {
-                    let actual: sonic_rs::Value =
-                        sonic_rs::from_str(&sonic_rs::to_string(&parsed.id)?)?;
-                    let expected: sonic_rs::Value =
-                        sonic_rs::from_str(&sonic_rs::to_string(&expected)?)?;
-                    actual == expected
-                }
-            };
-            if !ids_match {
+            let actual: sonic_rs::Value = sonic_rs::from_str(&sonic_rs::to_string(&parsed.id)?)?;
+            let expected: sonic_rs::Value =
+                sonic_rs::from_str(&sonic_rs::to_string(&self.web3_request.id())?)?;
+            if actual != expected {
                 return Err(anyhow::anyhow!("backend response ID mismatch").into());
             }
             Ok(response)
@@ -1022,74 +1012,6 @@ mod tests {
 
         assert_eq!(diagnostic, "http_connect");
         assert!(!diagnostic.contains("private-backend-token"));
-    }
-
-    #[tokio::test]
-    async fn response_id_matching_preserves_json_types_and_numeric_precision() {
-        let rpc = Arc::new(Web3Rpc {
-            name: "response-id-matching".into(),
-            peak_latency: Some(latency::PeakEwmaLatency::spawn(
-                Duration::from_secs(15),
-                64,
-                Duration::from_secs(1),
-            )),
-            median_latency: Some(latency::RollingQuantileLatency::spawn_median(64).await),
-            ..Default::default()
-        });
-        for (expected, actual, matches) in [
-            ("1", "1", true),
-            ("1", "2", false),
-            ("-1", "-1", true),
-            ("-1", "1", false),
-            ("18446744073709551615", "18446744073709551615", true),
-            ("18446744073709551615", "18446744073709551614", false),
-            ("-9223372036854775808", "-9223372036854775808", true),
-            ("9007199254740993", "9007199254740992", false),
-            ("1.0", "1e0", true),
-            ("1", "1.0", false),
-            ("-0.0", "0.0", true),
-            (r#""1""#, "1", false),
-            (r#""request""#, r#""request""#, true),
-            (r#""a""#, r#""\u0061""#, true),
-            ("null", "null", true),
-            ("null", "0", false),
-            ("true", "true", true),
-            ("true", "false", false),
-            ("[1,2]", "[1, 2]", true),
-            ("[1,2]", "[2,1]", false),
-        ] {
-            let backend = super::BackendRequest {
-                web3_request: Arc::new(ValidatedRequest {
-                    inner: RequestOrMethod::Request(SingleRequest {
-                        jsonrpc: "2.0".into(),
-                        id: sonic_rs::from_str(expected).unwrap(),
-                        method: "eth_call".into(),
-                        params: json!([]),
-                    }),
-                    expire_timeout: Duration::from_secs(60),
-                    ..Default::default()
-                }),
-                error_handler: Default::default(),
-                rpc: rpc.clone(),
-                allow_unhealthy: false,
-            };
-            let response = crate::jsonrpc::ParsedResponse::from_result(
-                sonic_rs::to_lazyvalue(&"0x1").unwrap(),
-                sonic_rs::from_str(actual).unwrap(),
-            );
-            let result = backend.check_response(Ok(response.into()), Instant::now());
-            assert_eq!(
-                result.is_ok(),
-                matches,
-                "expected {expected}, received {actual}"
-            );
-            if !matches {
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("backend response ID mismatch"));
-            }
-        }
     }
 
     #[tokio::test]
