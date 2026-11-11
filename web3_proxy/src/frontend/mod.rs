@@ -16,7 +16,6 @@ use crate::errors::Web3ProxyResult;
 use axum::{
     body::Body,
     routing::{get, post},
-    serve::ListenerExt,
     Router,
 };
 use http::Request;
@@ -173,12 +172,6 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
     // rightmost address from X-Forwarded-For.
     let make_service = router.into_make_service();
 
-    // Apply this to accepted sockets, including sockets from an inherited listener.
-    let listener = listener.tap_io(|stream| {
-        if let Err(error) = stream.set_nodelay(true) {
-            error!(%error, "failed to disable Nagle on frontend connection");
-        }
-    });
     let server = axum::serve(listener, make_service);
 
     let port = server.local_addr()?.port();
