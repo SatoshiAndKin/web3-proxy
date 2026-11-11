@@ -173,11 +173,6 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
 
     // The frontend runs behind a trusted proxy. Client IP extraction uses the
     // rightmost address from X-Forwarded-For.
-    #[cfg(unix)]
-    let unix = match &app.config.frontend_unix_socket {
-        Some(path) => Some(unix::bind(path).await?),
-        None => None,
-    };
     #[cfg(not(unix))]
     if app.config.frontend_unix_socket.is_some() {
         anyhow::bail!("a Unix frontend requires a Unix host");
@@ -215,10 +210,18 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
     let tcp = server.with_graceful_shutdown(shutdown.clone());
     let result = async {
         #[cfg(unix)]
-        if let Some((listener, _socket_path)) = unix {
-            let server =
-                axum::serve(listener, router.into_make_service()).with_graceful_shutdown(shutdown);
-            tokio::try_join!(async { tcp.await }, async { server.await })?;
+        if let Some(path) = &app.config.frontend_unix_socket {
+            let unix_server = async {
+                let Some((listener, _socket_path)) =
+                    unix::bind_when_available(path, app.frontend_shutdown.subscribe()).await?
+                else {
+                    return Ok(());
+                };
+                axum::serve(listener, router.into_make_service())
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            };
+            tokio::try_join!(async { tcp.await }, unix_server)?;
             return Ok(());
         }
         tcp.await

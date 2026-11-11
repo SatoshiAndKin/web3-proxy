@@ -6,7 +6,11 @@ use std::{
     time::Duration,
 };
 
-use tokio::net::{UnixListener, UnixSocket, UnixStream};
+use tokio::{
+    net::{UnixListener, UnixSocket, UnixStream},
+    sync::watch,
+    time::{sleep, timeout},
+};
 
 use super::LISTEN_BACKLOG;
 
@@ -30,7 +34,7 @@ impl Drop for SocketPath {
     }
 }
 
-pub(super) async fn bind(path: &Path) -> io::Result<(UnixListener, SocketPath)> {
+async fn bind(path: &Path) -> io::Result<(UnixListener, SocketPath)> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -50,7 +54,7 @@ pub(super) async fn bind(path: &Path) -> io::Result<(UnixListener, SocketPath)> 
         Ok(old) if old.file_type().is_socket() && old.uid() == lock.metadata()?.uid() => {
             // The lease serializes proxy instances. Check for a live listener
             // before removing a socket created by another program.
-            let probe = tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(path));
+            let probe = timeout(Duration::from_millis(250), UnixStream::connect(path));
             match probe.await {
                 Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
                     fs::remove_file(path)?;
@@ -86,6 +90,28 @@ pub(super) async fn bind(path: &Path) -> io::Result<(UnixListener, SocketPath)> 
     let listener = socket.listen(LISTEN_BACKLOG)?;
     tracing::info!(path = %path.display(), "listening on Unix socket");
     Ok((listener, guard))
+}
+
+/// Keep TCP ready while the previous pod drains its Unix connections.
+pub(super) async fn bind_when_available(
+    path: &Path,
+    mut shutdown: watch::Receiver<bool>,
+) -> io::Result<Option<(UnixListener, SocketPath)>> {
+    let acquire = async {
+        loop {
+            match bind(path).await {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    sleep(Duration::from_millis(200)).await;
+                }
+                result => return result.map(Some),
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stopping| *stopping) => Ok(None),
+        result = acquire => result,
+    }
 }
 
 #[cfg(test)]

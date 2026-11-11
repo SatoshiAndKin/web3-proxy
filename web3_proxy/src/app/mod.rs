@@ -1353,6 +1353,104 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_serves_tcp_before_taking_the_unix_socket() {
+        let dir = tempfile::Builder::new()
+            .prefix("w3p")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join("rpc");
+
+        let mut first = app_with_no_backend().await;
+        Arc::get_mut(&mut first)
+            .unwrap()
+            .config
+            .frontend_unix_socket = Some(path.clone());
+        let first_server = tokio::spawn(crate::frontend::serve(first.clone()));
+
+        let unix = reqwest::Client::builder()
+            .unix_socket(path.clone())
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
+        async fn chain_id(client: &reqwest::Client, url: &str) -> Option<String> {
+            let response = client
+                .post(url)
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":7,"method":"eth_chainId","params":[]}"#)
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .ok()?;
+            let reply = response.json::<serde_json::Value>().await.ok()?;
+            reply["result"].as_str().map(str::to_owned)
+        }
+        let unix_chain = |expected: &'static str| {
+            let unix = &unix;
+            async move {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if chain_id(unix, "http://localhost/").await.as_deref() == Some(expected) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        };
+        unix_chain("0x1").await;
+
+        let mut replacement = app_with_no_backend().await;
+        let config = &mut Arc::get_mut(&mut replacement).unwrap().config;
+        config.chain_id = 2;
+        config.frontend_unix_socket = Some(path.clone());
+        let replacement_server = tokio::spawn(crate::frontend::serve(replacement.clone()));
+        let port = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let port = replacement
+                    .frontend_port
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if port != 0 {
+                    break port;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let tcp = reqwest::Client::new();
+        assert_eq!(
+            chain_id(&tcp, &format!("http://127.0.0.1:{port}/"))
+                .await
+                .as_deref(),
+            Some("0x2")
+        );
+        assert_eq!(
+            chain_id(&unix, "http://localhost/").await.as_deref(),
+            Some("0x1")
+        );
+
+        first.frontend_shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), first_server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        unix_chain("0x2").await;
+
+        replacement.frontend_shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), replacement_server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+    }
+
     fn head(number: u64, hash: B256) -> BlockHeader {
         let mut header: Header = Header {
             hash,
