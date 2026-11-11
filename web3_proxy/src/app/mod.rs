@@ -1355,7 +1355,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn replacement_serves_tcp_before_taking_the_unix_socket() {
+    async fn replacement_publishes_unix_before_old_executor_drains() {
         let dir = tempfile::Builder::new()
             .prefix("w3p")
             .tempdir_in("/tmp")
@@ -1429,10 +1429,8 @@ mod tests {
                 .as_deref(),
             Some("0x2")
         );
-        assert_eq!(
-            chain_id(&unix, "http://localhost/").await.as_deref(),
-            Some("0x1")
-        );
+        unix_chain("0x2").await;
+        assert!(!first_server.is_finished());
 
         first.frontend_shutdown.send_replace(true);
         tokio::time::timeout(Duration::from_secs(2), first_server)

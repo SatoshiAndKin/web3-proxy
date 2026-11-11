@@ -112,6 +112,7 @@ pub struct AppConfig {
     pub redirect_public_url: Option<String>,
 
     /// Optional Unix socket for HTTP from a same-host ingress.
+    /// Its directory and socket path are owned by this proxy.
     pub frontend_unix_socket: Option<PathBuf>,
 
     /// optional script to run before shutting the frontend down.

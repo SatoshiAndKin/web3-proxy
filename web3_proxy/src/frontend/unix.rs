@@ -7,23 +7,30 @@ use std::{
 };
 
 use tokio::{
-    net::{UnixListener, UnixSocket, UnixStream},
+    net::{UnixListener, UnixSocket},
     sync::watch,
-    time::{sleep, timeout},
+    time::sleep,
 };
+use ulid::Ulid;
 
 use super::LISTEN_BACKLOG;
 
-/// Keep the lease until the listener and its in-flight requests have stopped.
+/// Remove this socket after it drains if a replacement has not published.
 pub(super) struct SocketPath {
     path: PathBuf,
     device: u64,
     inode: u64,
-    _lock: File,
+    publication_lock: Option<File>,
 }
 
 impl Drop for SocketPath {
     fn drop(&mut self) {
+        if let Some(lock) = &self.publication_lock {
+            // A publisher holding the lock may already have replaced this path.
+            if lock.try_lock().is_err() {
+                return;
+            }
+        }
         if fs::symlink_metadata(&self.path)
             .is_ok_and(|m| m.dev() == self.device && m.ino() == self.inode)
         {
@@ -34,74 +41,92 @@ impl Drop for SocketPath {
     }
 }
 
-async fn bind(path: &Path) -> io::Result<(UnixListener, SocketPath)> {
-    if !path.is_absolute() {
+fn bind(path: &Path) -> io::Result<(UnixListener, SocketPath)> {
+    if !path.is_absolute() || path.file_name().is_none() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "frontend Unix socket path must be absolute",
+            "frontend Unix socket path must be absolute and include a file name",
+        ));
+    }
+    let directory =
+        fs::symlink_metadata(path.parent().expect("absolute socket path has a parent"))?;
+    if !directory.is_dir() || directory.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "frontend Unix socket directory must permit writes only by its owner",
         ));
     }
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.is_file() && metadata.uid() == directory.uid() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                "frontend socket publication lock has an unexpected type or owner",
+            ))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
         .open(lock_path)?;
+    if lock.metadata()?.uid() != directory.uid() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "frontend Unix socket directory must be owned by the proxy",
+        ));
+    }
     lock.try_lock().map_err(io::Error::from)?;
     match fs::symlink_metadata(path) {
-        Ok(old) if old.file_type().is_socket() && old.uid() == lock.metadata()?.uid() => {
-            // The lease serializes proxy instances. Check for a live listener
-            // before removing a socket created by another program.
-            let probe = timeout(Duration::from_millis(250), UnixStream::connect(path));
-            match probe.await {
-                Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
-                    fs::remove_file(path)?;
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        ErrorKind::AddrInUse,
-                        "frontend socket is in use",
-                    ))
-                }
-            }
-        }
+        Ok(old) if old.file_type().is_socket() && old.uid() == directory.uid() => {}
         Ok(_) => {
             return Err(io::Error::new(
                 ErrorKind::AlreadyExists,
-                "frontend socket path exists",
+                "frontend socket path has an unexpected type or owner",
             ))
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
 
+    let staged_path = path.with_file_name(format!(".w3p-{}", Ulid::generate()));
     let socket = UnixSocket::new_stream()?;
-    socket.bind(path)?;
-    let metadata = fs::symlink_metadata(path)?;
-    let guard = SocketPath {
-        path: path.to_owned(),
+    socket.bind(&staged_path)?;
+    let metadata = fs::symlink_metadata(&staged_path)?;
+    let mut guard = SocketPath {
+        path: staged_path,
         device: metadata.dev(),
         inode: metadata.ino(),
-        _lock: lock,
+        publication_lock: None,
     };
-    fs::set_permissions(path, Permissions::from_mode(0o660))?;
+    fs::set_permissions(&guard.path, Permissions::from_mode(0o660))?;
     let listener = socket.listen(LISTEN_BACKLOG)?;
+    // Publish only after listen succeeds. Connections already accepted by the
+    // old listener continue to use it while new dials use the replacement.
+    fs::rename(&guard.path, path)?;
+    guard.path = path.to_owned();
+    let unlocked = lock.unlock();
+    guard.publication_lock = Some(lock);
+    unlocked?;
     tracing::info!(path = %path.display(), "listening on Unix socket");
     Ok((listener, guard))
 }
 
-/// Keep TCP ready while the previous pod drains its Unix connections.
+/// Keep TCP serving if another executor is publishing the Unix socket.
 pub(super) async fn bind_when_available(
     path: &Path,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<Option<(UnixListener, SocketPath)>> {
     let acquire = async {
         loop {
-            match bind(path).await {
+            match bind(path) {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(Duration::from_millis(50)).await;
                 }
                 result => return result.map(Some),
             }
@@ -117,6 +142,10 @@ pub(super) async fn bind_when_available(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixStream,
+    };
 
     #[tokio::test]
     async fn socket_is_private_and_recovers_after_an_unclean_exit() {
@@ -125,22 +154,45 @@ mod tests {
             .tempdir_in("/tmp")
             .unwrap();
         let path = dir.path().join("q");
-        let stale = UnixListener::bind(&path).unwrap();
-        drop(stale);
-
-        let (listener, lease) = bind(&path).await.unwrap();
+        drop(UnixListener::bind(&path).unwrap());
+        let (listener, guard) = bind(&path).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o660
         );
-        assert!(bind(&path).await.is_err());
         let _peer = UnixStream::connect(&path).await.unwrap();
         assert!(listener.accept().await.is_ok());
-
         drop(listener);
-        drop(lease);
+        drop(guard);
         assert!(!path.exists());
-        assert!(bind(&path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn publication_preserves_old_connections_and_the_replacement_path() {
+        let dir = tempfile::Builder::new()
+            .prefix("w3p")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join("q");
+        let (first, first_guard) = bind(&path).unwrap();
+        let mut old_peer = UnixStream::connect(&path).await.unwrap();
+        let (mut old_connection, _) = first.accept().await.unwrap();
+
+        let (replacement, replacement_guard) = bind(&path).unwrap();
+        let mut new_peer = UnixStream::connect(&path).await.unwrap();
+        let (mut new_connection, _) = replacement.accept().await.unwrap();
+        old_peer.write_all(b"o").await.unwrap();
+        new_peer.write_all(b"n").await.unwrap();
+        assert_eq!(old_connection.read_u8().await.unwrap(), b'o');
+        assert_eq!(new_connection.read_u8().await.unwrap(), b'n');
+
+        drop(first);
+        drop(first_guard);
+        let _peer = UnixStream::connect(&path).await.unwrap();
+        assert!(replacement.accept().await.is_ok());
+        drop(replacement);
+        drop(replacement_guard);
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -151,7 +203,7 @@ mod tests {
             .unwrap();
         let path = dir.path().join("q");
         fs::write(&path, "original").unwrap();
-        assert!(bind(&path).await.is_err());
+        assert!(bind(&path).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "original");
     }
 }
