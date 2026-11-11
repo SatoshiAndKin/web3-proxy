@@ -258,6 +258,8 @@ Inspect the container and Linux host values:
 
 The startup log shows the backlog that the proxy requests. If `listenfd` supplies a socket, the socket owner controls its backlog instead.
 
+Set `frontend_bind_ip = "127.0.0.1"` in `[app]` to serve HTTP and WebSocket requests on IPv4 loopback. The default TCP bind address is `0.0.0.0`. Restart the proxy to apply this setting. An activated TCP listener must match an explicitly configured bind IP.
+
 Compare 3 RPCs:
 
 ```
