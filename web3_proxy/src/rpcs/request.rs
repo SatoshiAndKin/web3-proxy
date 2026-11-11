@@ -4,6 +4,7 @@ use crate::jsonrpc::{
     self, JsonRpcErrorData, JsonRpcResultData, ParsedResponse, ResponsePayload, ValidatedRequest,
 };
 use alloy::providers::Provider;
+use alloy::rpc::json_rpc::{Request as AlloyRequest, ResponsePayload as AlloyResponsePayload};
 use anyhow::Context;
 use derive_more::From;
 use reqwest::StatusCode;
@@ -140,7 +141,7 @@ struct BackendRequest {
     allow_unhealthy: bool,
 }
 
-/// Holds one physical backend request slot through the complete response body.
+/// Holds backend slots through the complete response body.
 #[derive(Debug)]
 pub(crate) struct ActiveRequestGuard {
     rpc: Arc<Web3Rpc>,
@@ -149,7 +150,8 @@ pub(crate) struct ActiveRequestGuard {
 
 impl ActiveRequestGuard {
     fn new(rpc: &Arc<Web3Rpc>, permit: OwnedSemaphorePermit) -> Self {
-        rpc.active_requests.fetch_add(1, atomic::Ordering::SeqCst);
+        rpc.active_requests
+            .fetch_add(permit.num_permits(), atomic::Ordering::SeqCst);
         Self {
             rpc: rpc.clone(),
             _permit: permit,
@@ -161,7 +163,7 @@ impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         self.rpc
             .active_requests
-            .fetch_sub(1, atomic::Ordering::SeqCst);
+            .fetch_sub(self._permit.num_permits(), atomic::Ordering::SeqCst);
     }
 }
 
@@ -319,6 +321,107 @@ impl BackendRequest {
             Err(anyhow::anyhow!("no provider configured!").into())
         };
         response
+    }
+
+    fn record_batch(&self, requests: &[Arc<ValidatedRequest>]) {
+        for item in requests {
+            item.response.lock().backend_rpcs.push(self.rpc.clone());
+        }
+        self.rpc
+            .total_requests
+            .fetch_add(requests.len(), atomic::Ordering::Relaxed);
+        self.rpc
+            .backend_batch_requests
+            .fetch_add(1, atomic::Ordering::Relaxed);
+    }
+
+    async fn ipc_batch(
+        &self,
+        requests: &[Arc<ValidatedRequest>],
+    ) -> Web3ProxyResult<Vec<ParsedResponse>> {
+        let pool = self
+            .rpc
+            .ipc_provider
+            .load_full()
+            .context("IPC provider is not connected")?;
+        let query = pool.query_weighted(requests.len());
+        let client = query.client();
+        let mut positions = hashbrown::HashMap::with_capacity(requests.len());
+        let mut calls = Vec::with_capacity(requests.len());
+        for (index, item) in requests.iter().enumerate() {
+            let request = item
+                .inner
+                .jsonrpc_request()
+                .context("batch item lacks JSON-RPC data")?;
+            let params =
+                serde_json::value::RawValue::from_string(sonic_rs::to_string(&request.params)?)
+                    .map_err(anyhow::Error::from)?;
+            let id = client.next_id();
+            positions.insert(id.clone(), index);
+            calls.push(
+                AlloyRequest::new(request.method.clone(), id, params)
+                    .serialize()
+                    .map_err(anyhow::Error::from)?,
+            );
+        }
+        let frontend = client
+            .pubsub_frontend()
+            .context("IPC pubsub service is not connected")?;
+        self.record_batch(requests);
+        let replies = frontend.send_wire_batch(calls).await?;
+        let mut ordered: Vec<Option<ParsedResponse>> = (0..requests.len()).map(|_| None).collect();
+        for reply in replies {
+            let index = positions
+                .remove(&reply.id)
+                .context("unknown or duplicate IPC reply ID")?;
+            let id = Default::default();
+            let parsed = match reply.payload {
+                AlloyResponsePayload::Success(result) => {
+                    ParsedResponse::from_result(sonic_rs::from_str(result.get())?, id)
+                }
+                AlloyResponsePayload::Failure(error) => ParsedResponse::from_error(
+                    JsonRpcErrorData {
+                        code: error.code,
+                        message: error.message,
+                        data: error
+                            .data
+                            .map(|value| sonic_rs::from_str(value.get()))
+                            .transpose()?,
+                    },
+                    id,
+                ),
+            };
+            ordered[index] = Some(parsed);
+        }
+        ordered
+            .into_iter()
+            .map(|item| item.context("missing IPC batch reply").map_err(Into::into))
+            .collect()
+    }
+
+    fn check_batch_responses(
+        &self,
+        responses: impl IntoIterator<Item = ParsedResponse>,
+        requests: &[Arc<ValidatedRequest>],
+        started_at: Instant,
+    ) -> Vec<Web3ProxyResult<ParsedResponse>> {
+        responses
+            .into_iter()
+            .zip(requests)
+            .map(|(mut response, item)| {
+                response.id = item.id();
+                let handle = BackendRequest {
+                    web3_request: item.clone(),
+                    error_handler: self.error_handler,
+                    rpc: self.rpc.clone(),
+                    allow_unhealthy: self.allow_unhealthy,
+                };
+                match handle.check_response(Ok(response.into()), started_at) {
+                    Ok(jsonrpc::SingleResponse::Parsed(response)) => Ok(response),
+                    Err(error) => Err(error),
+                }
+            })
+            .collect()
     }
 
     async fn pubsub_request<R: JsonRpcResultData>(
@@ -622,12 +725,21 @@ impl OpenRequestHandle {
     pub fn batch_capacity(&self) -> usize {
         self.request.rpc.request_permits.max_concurrent_requests()
     }
-    pub fn batch_size(&self) -> usize {
-        if self.supports_batch() {
-            self.request.rpc.request_permits.max_backend_batch_items()
-        } else {
-            1
+    pub fn reserve_batch_size(&mut self, desired: usize) -> usize {
+        if !self.supports_batch() {
+            return 1;
         }
+        let permits = &self.request.rpc.request_permits;
+        let size = desired.min(permits.max_backend_batch_items());
+        if !self.request.rpc.ipc_native_batches {
+            return size;
+        }
+        // Keep the IPC admission budget in logical calls even when several
+        // calls share a frame. A partial reservation can still be dispatched.
+        if let Some(additional) = permits.try_reserve_additional(size.saturating_sub(1)) {
+            self.permit.merge(additional);
+        }
+        self.permit.num_permits()
     }
     pub fn supports_batch(&self) -> bool {
         self.request.rpc.supports_batch()
@@ -667,10 +779,20 @@ impl OpenRequestHandle {
             .context("backend packet must contain requests")?;
         let Self {
             mut request,
-            permit,
+            mut permit,
         } = self;
         request.web3_request = requests[0].clone();
-        if !request.rpc.supports_batch() {
+        if request.rpc.ipc_native_batches {
+            let reserved = permit.num_permits();
+            if requests.len() > reserved {
+                return Err(Web3ProxyError::NoHandleReady);
+            }
+            if requests.len() < reserved {
+                drop(permit.split(reserved - requests.len()));
+            }
+        }
+        if !request.rpc.supports_batch() || (request.rpc.ipc_native_batches && requests.len() == 1)
+        {
             if requests.len() != 1 {
                 return Err(
                     anyhow::anyhow!("backend transport requires one call per request").into(),
@@ -695,6 +817,10 @@ impl OpenRequestHandle {
         let _active = ActiveRequestGuard::new(&request.rpc, permit);
         let started_at = Instant::now();
         let result = timeout_at(deadline, async {
+            if request.rpc.ipc_native_batches {
+                let responses = request.ipc_batch(requests).await?;
+                return Ok(request.check_batch_responses(responses, requests, started_at));
+            }
             let client = request
                 .rpc
                 .http_client
@@ -724,17 +850,7 @@ impl OpenRequestHandle {
                 })
                 .collect::<Vec<_>>();
             let body = sonic_rs::to_vec(&packet)?;
-            for item in requests {
-                item.response.lock().backend_rpcs.push(request.rpc.clone());
-            }
-            request
-                .rpc
-                .total_requests
-                .fetch_add(requests.len(), atomic::Ordering::Relaxed);
-            request
-                .rpc
-                .backend_batch_requests
-                .fetch_add(1, atomic::Ordering::Relaxed);
+            request.record_batch(requests);
             let response = client
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -765,24 +881,10 @@ impl OpenRequestHandle {
             if matched.iter().any(Option::is_none) {
                 return Err(anyhow::anyhow!("missing backend batch response ID").into());
             }
-            Ok(matched
+            let responses = matched
                 .into_iter()
-                .zip(requests)
-                .map(|(response, item)| {
-                    let mut response = response.expect("all IDs were matched");
-                    response.id = item.id();
-                    let handle = BackendRequest {
-                        web3_request: item.clone(),
-                        error_handler: request.error_handler,
-                        rpc: request.rpc.clone(),
-                        allow_unhealthy: request.allow_unhealthy,
-                    };
-                    match handle.check_response(Ok(response.into()), started_at) {
-                        Ok(jsonrpc::SingleResponse::Parsed(response)) => Ok(response),
-                        Err(error) => Err(error),
-                    }
-                })
-                .collect())
+                .map(|reply| reply.expect("all IDs were matched"));
+            Ok(request.check_batch_responses(responses, requests, started_at))
         })
         .await;
         let result = match result {
