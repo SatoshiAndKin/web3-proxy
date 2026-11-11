@@ -111,6 +111,9 @@ pub struct AppConfig {
     /// the stats page url for an anonymous user.
     pub redirect_public_url: Option<String>,
 
+    /// Optional Unix socket for HTTP from a same-host ingress.
+    pub frontend_unix_socket: Option<PathBuf>,
+
     /// optional script to run before shutting the frontend down.
     /// this is useful for keeping load balancers happy.
     pub shutdown_script: Option<String>,

@@ -1278,6 +1278,81 @@ mod tests {
         app.frontend_tasks.close();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frontend_serves_same_routes_over_tcp_and_unix() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::Builder::new()
+            .prefix("w3p")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join("rpc");
+        let mut app = app_with_no_backend().await;
+        Arc::get_mut(&mut app).unwrap().config.frontend_unix_socket = Some(path.clone());
+        let mut server = tokio::spawn(crate::frontend::serve(app.clone()));
+        let port = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let port = app.frontend_port.load(std::sync::atomic::Ordering::Acquire);
+                if port != 0 {
+                    break port;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let unix = reqwest::Client::builder()
+            .unix_socket(path.clone())
+            .build()
+            .unwrap();
+        let tcp = reqwest::Client::new();
+        for (client, address) in [
+            (&unix, "http://localhost".to_owned()),
+            (&tcp, format!("http://127.0.0.1:{port}")),
+        ] {
+            for route in ["/", "/fastest", "/versus"] {
+                let response = client
+                    .post(format!("{address}{route}"))
+                    .header("content-type", "application/json")
+                    .body(r#"{"jsonrpc":"2.0","id":7,"method":"eth_chainId","params":[]}"#)
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.json::<serde_json::Value>().await.unwrap(),
+                    serde_json::json!({"jsonrpc":"2.0","id":7,"result":"0x1"})
+                );
+            }
+        }
+
+        let mut upload = tokio::net::UnixStream::connect(&path).await.unwrap();
+        upload
+            .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 33554433\r\n\r\n")
+            .await
+            .unwrap();
+        let mut status = [0; 12];
+        tokio::time::timeout(Duration::from_secs(2), upload.read_exact(&mut status))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&status, b"HTTP/1.1 413");
+        drop(upload);
+        drop(unix);
+        drop(tcp);
+
+        app.frontend_shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), &mut server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+    }
+
     fn head(number: u64, hash: B256) -> BlockHeader {
         let mut header: Header = Header {
             hash,
