@@ -10,6 +10,8 @@ pub mod request_id;
 pub mod rpc_proxy_http;
 pub mod rpc_proxy_ws;
 pub mod status;
+#[cfg(unix)]
+mod unix;
 
 use crate::app::App;
 use crate::errors::Web3ProxyResult;
@@ -18,6 +20,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use futures::FutureExt;
 use http::Request;
 use request_id::RequestId;
 
@@ -170,7 +173,11 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
 
     // The frontend runs behind a trusted proxy. Client IP extraction uses the
     // rightmost address from X-Forwarded-For.
-    let make_service = router.into_make_service();
+    #[cfg(not(unix))]
+    if app.config.frontend_unix_socket.is_some() {
+        anyhow::bail!("a Unix frontend requires a Unix host");
+    }
+    let make_service = router.clone().into_make_service();
 
     let server = axum::serve(listener, make_service);
 
@@ -180,29 +187,47 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
     app.frontend_port.store(port, Ordering::SeqCst);
 
     let shutdown_app = app.clone();
-    let result = server
-        // TODO: option to use with_connect_info. we want it in dev, but not when running behind a proxy, but not
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_receiver.wait_for(|stopping| *stopping).await;
+    let shutdown = async move {
+        let _ = shutdown_receiver.wait_for(|stopping| *stopping).await;
 
-            if let Some(shutdown_script) = shutdown_app.config.shutdown_script.as_ref() {
-                let shutdown_script = Command::new(shutdown_script)
-                    .args(&shutdown_app.config.shutdown_script_args)
-                    .spawn()
-                    .expect("failed to execute script");
+        if let Some(shutdown_script) = shutdown_app.config.shutdown_script.as_ref() {
+            let shutdown_script = Command::new(shutdown_script)
+                .args(&shutdown_app.config.shutdown_script_args)
+                .spawn()
+                .expect("failed to execute script");
 
-                match shutdown_script.wait_with_output().await {
-                    Ok(x) => {
-                        info!(?x, "shutdown script finished");
-                    }
-                    Err(err) => {
-                        error!(?err, "shutdown script failed");
-                    }
+            match shutdown_script.wait_with_output().await {
+                Ok(x) => {
+                    info!(?x, "shutdown script finished");
+                }
+                Err(err) => {
+                    error!(?err, "shutdown script failed");
+                }
+            };
+        }
+    }
+    .shared();
+    let tcp = server.with_graceful_shutdown(shutdown.clone());
+    let result = async {
+        #[cfg(unix)]
+        if let Some(path) = &app.config.frontend_unix_socket {
+            let unix_server = async {
+                let Some((listener, _socket_path)) =
+                    unix::bind_when_available(path, app.frontend_shutdown.subscribe()).await?
+                else {
+                    return Ok(());
                 };
-            }
-        })
-        .await
-        .map_err(Into::into);
+                axum::serve(listener, router.into_make_service())
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            };
+            tokio::try_join!(async { tcp.await }, unix_server)?;
+            return Ok(());
+        }
+        tcp.await
+    }
+    .await
+    .map_err(Into::into);
     app.frontend_shutdown.send_replace(true);
     app.frontend_tasks.close();
     tokio::time::timeout(
