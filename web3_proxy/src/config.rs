@@ -281,10 +281,13 @@ pub struct Web3RpcConfig {
     /// All streams share this backend's request admission budget.
     #[serde_inline_default(DEFAULT_IPC_QUERY_CONNECTIONS)]
     pub ipc_query_connections: usize,
+    /// Permit JSON-RPC request arrays on this backend's IPC query streams.
+    #[serde(default)]
+    pub ipc_native_batches: bool,
     /// Restrict IPC to the modules available on the backend's public RPC endpoint.
     pub ipc_allowed_modules: Option<Vec<String>>,
-    /// Maximum number of physical requests sent concurrently to this backend.
-    /// Each batch packet occupies one slot, regardless of its item count.
+    /// Maximum concurrent backend slots. A native IPC batch uses one slot per call.
+    /// An HTTP batch uses one slot for its entire packet.
     #[serde_inline_default(448usize)]
     pub max_concurrent_requests: usize,
     /// maximum number of calls grouped into one backend JSON-RPC batch packet
@@ -322,6 +325,7 @@ impl fmt::Debug for Web3RpcConfig {
             .field("http_url", &self.http_url.as_ref().map(|_| "[REDACTED]"))
             .field("ipc_path", &self.ipc_path)
             .field("ipc_query_connections", &self.ipc_query_connections)
+            .field("ipc_native_batches", &self.ipc_native_batches)
             .field("ipc_allowed_modules", &self.ipc_allowed_modules)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("max_backend_batch_items", &self.max_backend_batch_items)
@@ -444,7 +448,7 @@ mod tests {
 
         assert_eq!(
             format!("{config:?}"),
-            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, ipc_query_connections: 2, ipc_allowed_modules: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
+            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, ipc_query_connections: 2, ipc_native_batches: false, ipc_allowed_modules: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
         );
     }
 

@@ -28,6 +28,7 @@ pub(super) struct PubSubProviderPool {
 pub(super) struct PubSubQuery<'a> {
     pool: &'a PubSubProviderPool,
     index: usize,
+    weight: usize,
 }
 
 impl std::ops::Deref for PubSubQuery<'_> {
@@ -40,7 +41,7 @@ impl std::ops::Deref for PubSubQuery<'_> {
 
 impl Drop for PubSubQuery<'_> {
     fn drop(&mut self) {
-        self.pool.active[self.index].fetch_sub(1, Ordering::Relaxed);
+        self.pool.active[self.index].fetch_sub(self.weight, Ordering::Relaxed);
     }
 }
 
@@ -61,6 +62,10 @@ impl PubSubProviderPool {
     }
 
     pub(super) fn query(&self) -> PubSubQuery<'_> {
+        self.query_weighted(1)
+    }
+
+    pub(super) fn query_weighted(&self, weight: usize) -> PubSubQuery<'_> {
         // These counters guide routing; they do not publish data or enforce the
         // logical backend's admission budget. ArcSwap publishes the immutable
         // pool. Rotate the starting point so equal-load streams share requests.
@@ -75,8 +80,12 @@ impl PubSubProviderPool {
                 least = load;
             }
         }
-        self.active[index].fetch_add(1, Ordering::Relaxed);
-        PubSubQuery { pool: self, index }
+        self.active[index].fetch_add(weight, Ordering::Relaxed);
+        PubSubQuery {
+            pool: self,
+            index,
+            weight,
+        }
     }
 
     pub(super) fn subscription(&self) -> Arc<RootProvider> {
@@ -117,12 +126,17 @@ impl PubSubProviderPool {
 pub(super) async fn connect_ipc_pool(
     path: PathBuf,
     connections: usize,
+    native_batches: bool,
 ) -> Web3ProxyResult<PubSubProviderPool> {
     if !(1..=crate::config::MAX_IPC_QUERY_CONNECTIONS).contains(&connections) {
         return Err(anyhow::anyhow!("IPC query pool size is outside its configured bounds").into());
     }
     let paths = vec![path.clone(); connections];
-    let queries = futures::future::try_join_all(paths.into_iter().map(connect_ipc));
+    let queries = futures::future::try_join_all(
+        paths
+            .into_iter()
+            .map(|path| connect_ipc_with_batches(path, native_batches)),
+    );
     let (providers, subscriptions) = tokio::try_join!(queries, connect_ipc(path))?;
     Ok(PubSubProviderPool::new(
         providers.into_iter().map(Arc::new),
@@ -161,8 +175,15 @@ pub fn connect_http(url: Url) -> Web3ProxyResult<AlloyHttpProvider> {
 }
 
 pub(super) async fn connect_ipc(path: PathBuf) -> Web3ProxyResult<AlloyIpcProvider> {
+    connect_ipc_with_batches(path, false).await
+}
+
+async fn connect_ipc_with_batches(
+    path: PathBuf,
+    native_batches: bool,
+) -> Web3ProxyResult<AlloyIpcProvider> {
     Ok(ProviderBuilder::default()
-        .connect_ipc(IpcConnect::new(path))
+        .connect_ipc(IpcConnect::new(path).with_wire_batches(native_batches))
         .await?)
 }
 

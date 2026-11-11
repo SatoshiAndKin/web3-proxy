@@ -69,6 +69,17 @@ impl RequestPermits {
         self.semaphore.clone().acquire_owned().await
     }
 
+    pub(super) fn try_reserve_additional(&self, count: usize) -> Option<OwnedSemaphorePermit> {
+        let count = count.min(self.semaphore.available_permits());
+        if count == 0 {
+            return None;
+        }
+        self.semaphore
+            .clone()
+            .try_acquire_many_owned(count.try_into().expect("IPC batch size is bounded"))
+            .ok()
+    }
+
     pub(super) fn has_capacity(&self) -> bool {
         self.semaphore.available_permits() > 0
     }
@@ -125,6 +136,7 @@ pub struct Web3Rpc {
     /// IPC takes precedence for local requests and subscriptions.
     pub(super) ipc_path: Option<PathBuf>,
     pub(super) ipc_query_connections: usize,
+    pub(super) ipc_native_batches: bool,
     pub(super) ipc_allowed_modules: Option<Vec<String>>,
     pub(super) ipc_provider: ArcSwapOption<PubSubProviderPool>,
     /// keep track of hard limits
@@ -232,6 +244,12 @@ impl Web3Rpc {
         if config.ipc_allowed_modules.is_some() && config.ipc_path.is_none() {
             return Err(anyhow!("ipc_allowed_modules requires ipc_path"));
         }
+        if config.ipc_native_batches
+            && (config.ipc_path.is_none()
+                || config.max_backend_batch_items > DEFAULT_MAX_BACKEND_BATCH_ITEMS)
+        {
+            return Err(anyhow!("ipc_native_batches requires IPC and at most {DEFAULT_MAX_BACKEND_BATCH_ITEMS} calls per packet"));
+        }
         if !(1..=MAX_IPC_QUERY_CONNECTIONS).contains(&config.ipc_query_connections) {
             return Err(anyhow!(
                 "ipc_query_connections must be between 1 and {MAX_IPC_QUERY_CONNECTIONS}"
@@ -307,6 +325,7 @@ impl Web3Rpc {
             http_client,
             ipc_path: config.ipc_path,
             ipc_query_connections: config.ipc_query_connections,
+            ipc_native_batches: config.ipc_native_batches,
             ipc_allowed_modules: config.ipc_allowed_modules,
             max_head_block_age,
             name,
@@ -1092,7 +1111,7 @@ impl Web3Rpc {
 
         if let Some(path) = self.ipc_path.clone() {
             self.ipc_provider.store(Some(Arc::new(
-                connect_ipc_pool(path, self.ipc_query_connections).await?,
+                connect_ipc_pool(path, self.ipc_query_connections, self.ipc_native_batches).await?,
             )));
         } else if let Some(url) = self.ws_url.clone() {
             trace!("starting websocket provider on {}", self);
@@ -1495,7 +1514,8 @@ impl Web3Rpc {
     }
 
     pub(crate) fn supports_batch(&self) -> bool {
-        self.ipc_path.is_none() && self.http_client.is_some() && self.http_url.is_some()
+        self.ipc_native_batches
+            || (self.ipc_path.is_none() && self.http_client.is_some() && self.http_url.is_some())
     }
 
     /// Recheck mutable backend state while holding the reserved slot.

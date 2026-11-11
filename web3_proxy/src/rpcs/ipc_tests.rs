@@ -38,14 +38,19 @@ async fn read_request<S: tokio::io::AsyncRead + Unpin>(
 }
 
 async fn rpc(path: &Path) -> Arc<Web3Rpc> {
-    rpc_with_connections(path, 2).await
+    rpc_with_connections(path, 2, false).await
 }
 
-async fn rpc_with_connections(path: &Path, connections: usize) -> Arc<Web3Rpc> {
+async fn rpc_with_connections(
+    path: &Path,
+    connections: usize,
+    ipc_native_batches: bool,
+) -> Arc<Web3Rpc> {
     let (hard_limit_until, _) = watch::channel(Instant::now());
     let rpc = Web3Rpc {
         name: "local-ipc".into(),
         ipc_path: Some(path.into()),
+        ipc_native_batches,
         // A configured HTTP alternative must not override IPC.
         http_url: Some("http://127.0.0.1:1".parse().unwrap()),
         http_client: Some(reqwest::Client::new()),
@@ -59,7 +64,9 @@ async fn rpc_with_connections(path: &Path, connections: usize) -> Arc<Web3Rpc> {
         ..Default::default()
     };
     rpc.ipc_provider.store(Some(Arc::new(
-        connect_ipc_pool(path.into(), connections).await.unwrap(),
+        connect_ipc_pool(path.into(), connections, ipc_native_batches)
+            .await
+            .unwrap(),
     )));
     Arc::new(rpc)
 }
@@ -460,7 +467,7 @@ async fn ipc_pool_shares_one_admission_budget_across_all_configured_streams() {
                 }
             }
         }));
-        let mut rpc = rpc_with_connections(&path, 4).await;
+        let mut rpc = rpc_with_connections(&path, 4, false).await;
         Arc::get_mut(&mut rpc).unwrap().request_permits = RequestPermits::new(2, 64);
         let a = rpc.clone();
         let a = test_support::spawn(async move { call::<u64>(&a, 10).await });
@@ -634,7 +641,7 @@ async fn ipc_pool_does_not_queue_fast_calls_behind_two_partial_responses() {
                 }
             }
         }));
-        let rpc = rpc_with_connections(&path, 4).await;
+        let rpc = rpc_with_connections(&path, 4, false).await;
         let slow_rpc = rpc.clone();
         let slow = test_support::spawn(async move { call::<u64>(&slow_rpc, 0).await });
         timeout(Duration::from_secs(2), partial.recv()).await.unwrap().unwrap();
@@ -762,7 +769,7 @@ async fn configured_ipc_pool_uses_each_query_stream_and_a_separate_subscription_
                     }
                 }
             }));
-            let pool = Arc::new(connect_ipc_pool(path, connections).await.unwrap());
+            let pool = Arc::new(connect_ipc_pool(path, connections, false).await.unwrap());
             assert_eq!(pool.size(), connections);
             let calls = (0..connections).map(|value| {
                 let pool = pool.clone();
@@ -798,7 +805,7 @@ async fn configured_ipc_pool_uses_each_query_stream_and_a_separate_subscription_
 #[tokio::test]
 async fn ipc_pool_rejects_zero_and_excessive_connections_before_connecting() {
     for connections in [0, crate::config::MAX_IPC_QUERY_CONNECTIONS + 1] {
-        let result = connect_ipc_pool("/not-an-ipc-socket".into(), connections).await;
+        let result = connect_ipc_pool("/not-an-ipc-socket".into(), connections, false).await;
         assert!(result.is_err_and(|error| error.to_string().contains("pool size")));
     }
 }
@@ -831,4 +838,71 @@ async fn startup_rejects_invalid_ipc_pool_sizes() {
             .to_string()
             .contains("ipc_query_connections must be between"));
     }
+}
+
+#[tokio::test]
+async fn native_ipc_batch_counts_each_call_against_the_existing_pool_budget() {
+    use super::{one::RequestPermits, request::OpenRequestResult};
+    use crate::jsonrpc::ValidatedRequest;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::{mpsc, Semaphore};
+
+    test_support::with_cleanup(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("batch.ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let server_gate = gate.clone();
+        let (seen, mut received) = mpsc::unbounded_channel();
+        let server = test_support::spawn(serve_pool(listener, move |mut socket| {
+            let gate = server_gate.clone();
+            let seen = seen.clone();
+            async move {
+                let mut buffer = Vec::new();
+                loop {
+                    let request = read_request(&mut socket, &mut buffer).await;
+                    let reply = if let Some(batch) = request.as_array() {
+                        assert_eq!(batch.len(), 2);
+                        assert_ne!(batch[0]["id"], batch[1]["id"]);
+                        seen.send(batch.len()).unwrap();
+                        gate.acquire().await.unwrap().forget();
+                        Value::Array(batch.iter().rev().map(|request| {
+                            json!({"jsonrpc":"2.0","id":request["id"],"result":request["params"][0]})
+                        }).collect())
+                    } else {
+                        seen.send(1).unwrap();
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":request["params"][0]})
+                    };
+                    socket.write_all(reply.to_string().as_bytes()).await.unwrap();
+                }
+            }
+        }));
+        let mut rpc = rpc_with_connections(&path, 2, true).await;
+        Arc::get_mut(&mut rpc).unwrap().request_permits = RequestPermits::new(2, 8);
+        let one = ValidatedRequest::new_internal("eth_call".into(), &json!([10]), None, None).await.unwrap();
+        let two = ValidatedRequest::new_internal("eth_call".into(), &json!([20]), None, None).await.unwrap();
+        let OpenRequestResult::Handle(mut handle) = rpc.try_request_handle(&one, None, true).await.unwrap() else {
+            panic!("batch admission failed");
+        };
+        assert_eq!(handle.reserve_batch_size(3), 2);
+        let batch = test_support::spawn(async move { handle.request_batch(&[one, two]).await.unwrap() });
+        assert_eq!(timeout(Duration::from_secs(2), received.recv()).await.unwrap(), Some(2));
+        assert_eq!(rpc.active_requests.load(Ordering::SeqCst), 2);
+        let single_rpc = rpc.clone();
+        let single = test_support::spawn(async move { call::<u64>(&single_rpc, 30).await });
+        assert!(timeout(Duration::from_millis(50), received.recv()).await.is_err());
+        gate.add_permits(1);
+        let replies = batch.await.unwrap();
+        let values: Vec<_> = replies.into_iter().map(|reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.id.as_u64(), Some(1));
+            reply.result().unwrap().as_u64().unwrap()
+        }).collect();
+        assert_eq!(values, [10, 20]);
+        assert_eq!(single.await.unwrap(), 30);
+        assert_eq!(rpc.backend_batch_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(rpc.active_requests.load(Ordering::SeqCst), 0);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }).await;
 }

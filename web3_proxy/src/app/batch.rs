@@ -315,7 +315,7 @@ impl App {
                 for (mut handle, mut remaining) in ready.drain(..).zip(lengths) {
                     let rpc = handle.clone_connection();
                     while remaining > 0 {
-                        let count = remaining.min(handle.batch_size());
+                        let count = handle.reserve_batch_size(remaining);
                         let indices = pending.take(count, |index| {
                             !calls[index].exhausted.contains(&rpc.name)
                                 && rpc.can_submit(&calls[index].request, false)
