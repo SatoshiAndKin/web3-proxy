@@ -101,29 +101,11 @@ impl AtomicRttEstimate {
         RttEstimate::from_pair(self.pair.load(Ordering::Relaxed), self.start_time)
     }
 
-    /// Fetches the value, and applies a function to it that returns an
-    /// new rtt. Returns the new RttEstimate with new update_at.
-    ///
-    /// Automatically updates the update_at with Instant::now(). This
-    /// method omits ordering arguments, defaulting to Relaxed since
-    /// all writes are serial and any reads may rely on slightly stale
-    /// data.
-    pub fn fetch_update<F>(&self, mut f: F) -> RttEstimate
-    where
-        F: FnMut(RttEstimate) -> Duration,
-    {
-        let mut update_at = Instant::now();
-        let mut rtt = Duration::ZERO;
+    /// The latency worker is the only writer. Readers load both fields
+    /// together from the atomic pair, which does not publish any other data.
+    pub(super) fn store(&self, estimate: RttEstimate) {
         self.pair
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pair| {
-                rtt = f(RttEstimate::from_pair(pair, self.start_time));
-                // Save the new update_at inside the function in case it
-                // is run multiple times
-                update_at = Instant::now();
-                Some(RttEstimate { rtt, update_at }.as_pair(self.start_time))
-            })
-            .expect("Should never Err");
-        RttEstimate { update_at, rtt }
+            .store(estimate.as_pair(self.start_time), Ordering::Relaxed);
     }
 }
 
@@ -153,16 +135,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_atomic_rtt_estimate_fetch_update() {
+    async fn test_atomic_rtt_estimate_store() {
         let start_time = Instant::now();
         let rtt = Duration::from_secs(1);
         let estimate = AtomicRttEstimate::new(rtt);
         time::advance(Duration::from_secs(1)).await;
-        let rv = estimate.fetch_update(|value| {
-            assert_eq!(start_time, value.update_at);
-            assert_eq!(rtt, value.rtt);
-            Duration::from_secs(2)
+        estimate.store(RttEstimate {
+            update_at: Instant::now(),
+            rtt: Duration::from_secs(2),
         });
+        let rv = estimate.load();
         assert_eq!(start_time + Duration::from_secs(1), rv.update_at);
         assert_eq!(Duration::from_secs(2), rv.rtt);
     }

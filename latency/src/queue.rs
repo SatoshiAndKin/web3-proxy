@@ -36,12 +36,14 @@ impl QueueMetrics {
             .then(Instant::now);
         Sample { value, queued_at }
     }
-    pub(crate) fn dropped<T>(&self, error: &mpsc::error::TrySendError<T>) {
+    /// Record a drop and return the cumulative count for its cause.
+    pub(crate) fn dropped<T>(&self, error: &mpsc::error::TrySendError<T>) -> u64 {
         match error {
             mpsc::error::TrySendError::Full(_) => &self.full,
             mpsc::error::TrySendError::Closed(_) => &self.closed,
         }
-        .fetch_add(1, Ordering::Relaxed);
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
     }
     pub(crate) fn snapshot<T>(&self, tx: &mpsc::Sender<T>) -> LatencyQueueStats {
         LatencyQueueStats {
