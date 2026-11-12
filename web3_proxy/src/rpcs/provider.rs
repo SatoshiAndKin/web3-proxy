@@ -144,10 +144,13 @@ pub(super) async fn connect_ipc_pool(
     ))
 }
 
-pub(super) async fn connect_query_ws_pool(url: Url) -> Web3ProxyResult<PubSubProviderPool> {
+pub(super) async fn connect_query_ws_pool(
+    url: Url,
+    native_batches: bool,
+) -> Web3ProxyResult<PubSubProviderPool> {
     let (first, second, subscriptions) = tokio::try_join!(
-        connect_query_ws(url.clone()),
-        connect_query_ws(url.clone()),
+        connect_query_ws(url.clone(), native_batches),
+        connect_query_ws(url.clone(), native_batches),
         connect_ws(url)
     )?;
     Ok(PubSubProviderPool::new(
@@ -188,23 +191,28 @@ async fn connect_ipc_with_batches(
 }
 
 pub async fn connect_ws(url: Url) -> Web3ProxyResult<AlloyWsProvider> {
-    connect_ws_configured(url, WebSocketConfig::default()).await
+    connect_ws_configured(url, WebSocketConfig::default(), false).await
 }
 
-pub(super) async fn connect_query_ws(url: Url) -> Web3ProxyResult<AlloyWsProvider> {
-    connect_ws_configured(url, query_ws_config()).await
+async fn connect_query_ws(url: Url, native_batches: bool) -> Web3ProxyResult<AlloyWsProvider> {
+    connect_ws_configured(url, query_ws_config(), native_batches).await
 }
 
 async fn connect_ws_configured(
     url: Url,
     config: WebSocketConfig,
+    native_batches: bool,
 ) -> Web3ProxyResult<AlloyWsProvider> {
     if !url.scheme().starts_with("ws") {
         return Err(anyhow::anyhow!("only WebSocket servers are supported: {url}").into());
     }
 
     let provider = ProviderBuilder::default()
-        .connect_ws(WsConnect::new(url.as_str()).with_config(config))
+        .connect_ws(
+            WsConnect::new(url.as_str())
+                .with_config(config)
+                .with_wire_batches(native_batches),
+        )
         .await?;
 
     Ok(provider)
@@ -348,7 +356,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let provider = connect_query_ws(format!("ws://{address}").parse().unwrap())
+        let provider = connect_query_ws(format!("ws://{address}").parse().unwrap(), false)
             .await
             .unwrap();
         let params = serde_json::value::RawValue::from_string("[]".into()).unwrap();
@@ -451,7 +459,7 @@ mod hol_tests {
                 }
                 while let Some(result) = handlers.join_next().await { result.unwrap(); }
             });
-            let pool = Arc::new(connect_query_ws_pool(format!("ws://{address}").parse().unwrap()).await.unwrap());
+            let pool = Arc::new(connect_query_ws_pool(format!("ws://{address}").parse().unwrap(), false).await.unwrap());
             let provider = pool.subscription();
             let subscription = provider.subscribe_pending_transactions().await.unwrap();
             let mut events = subscription.into_stream();

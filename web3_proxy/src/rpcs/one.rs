@@ -76,7 +76,7 @@ impl RequestPermits {
         }
         self.semaphore
             .clone()
-            .try_acquire_many_owned(count.try_into().expect("IPC batch size is bounded"))
+            .try_acquire_many_owned(count.try_into().expect("native batch size is bounded"))
             .ok()
     }
 
@@ -137,6 +137,7 @@ pub struct Web3Rpc {
     pub(super) ipc_path: Option<PathBuf>,
     pub(super) ipc_query_connections: usize,
     pub(super) ipc_native_batches: bool,
+    pub(super) ws_native_batches: bool,
     pub(super) ipc_allowed_modules: Option<Vec<String>>,
     pub(super) ipc_provider: ArcSwapOption<PubSubProviderPool>,
     /// keep track of hard limits
@@ -250,6 +251,14 @@ impl Web3Rpc {
         {
             return Err(anyhow!("ipc_native_batches requires IPC and at most {DEFAULT_MAX_BACKEND_BATCH_ITEMS} calls per packet"));
         }
+        if config.ws_native_batches
+            && (config.ws_url.is_none()
+                || config.ipc_path.is_some()
+                || config.http_url.is_some()
+                || config.max_backend_batch_items > DEFAULT_MAX_BACKEND_BATCH_ITEMS)
+        {
+            return Err(anyhow!("ws_native_batches requires a WebSocket-only backend and at most {DEFAULT_MAX_BACKEND_BATCH_ITEMS} calls per packet"));
+        }
         if !(1..=MAX_IPC_QUERY_CONNECTIONS).contains(&config.ipc_query_connections) {
             return Err(anyhow!(
                 "ipc_query_connections must be between 1 and {MAX_IPC_QUERY_CONNECTIONS}"
@@ -326,6 +335,7 @@ impl Web3Rpc {
             ipc_path: config.ipc_path,
             ipc_query_connections: config.ipc_query_connections,
             ipc_native_batches: config.ipc_native_batches,
+            ws_native_batches: config.ws_native_batches,
             ipc_allowed_modules: config.ipc_allowed_modules,
             max_head_block_age,
             name,
@@ -1119,7 +1129,7 @@ impl Web3Rpc {
             // A WebSocket-only backend carries complete RPC replies as well as
             // heads. Head-only consumers retain the existing frame budget.
             if self.http_url.is_none() {
-                let pool = Arc::new(connect_query_ws_pool(url).await?);
+                let pool = Arc::new(connect_query_ws_pool(url, self.ws_native_batches).await?);
                 self.ws_provider.store(Some(pool.subscription()));
                 self.ws_query_pool.store(Some(pool));
             } else {
@@ -1514,8 +1524,12 @@ impl Web3Rpc {
     }
 
     pub(crate) fn supports_batch(&self) -> bool {
-        self.ipc_native_batches
+        self.supports_native_batch()
             || (self.ipc_path.is_none() && self.http_client.is_some() && self.http_url.is_some())
+    }
+
+    pub(super) fn supports_native_batch(&self) -> bool {
+        self.ipc_native_batches || self.ws_native_batches
     }
 
     /// Recheck mutable backend state while holding the reserved slot.
@@ -1773,7 +1787,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("Web3Rpc", 25)?;
+        let mut state = serializer.serialize_struct("Web3Rpc", 26)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
         state.serialize_field("name", &self.name)?;
@@ -1801,6 +1815,7 @@ impl Serialize for Web3Rpc {
             "ws_subscription_connections",
             &usize::from(self.ws_provider.load().is_some()),
         )?;
+        state.serialize_field("ws_native_batches", &self.ws_native_batches)?;
         state.serialize_field(
             "ipc_query_inflight",
             &self
@@ -2142,7 +2157,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
+        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap(), false)
             .await
             .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
@@ -2632,7 +2647,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
+        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap(), false)
             .await
             .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
@@ -2834,7 +2849,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
+        let provider = connect_query_ws_pool(format!("ws://{address}").parse().unwrap(), false)
             .await
             .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
