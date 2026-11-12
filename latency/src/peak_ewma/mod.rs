@@ -83,16 +83,19 @@ impl PeakEwmaLatency {
 
     /// Report latency from a single request from the owning backend.
     pub fn report(&self, duration: Duration) {
-        match self.request_tx.try_send(self.queue.sample(duration)) {
-            Ok(()) => {}
-            Err(err) => {
-                self.queue.dropped(&err);
-                // We don't want to block if the channel is full, just
-                // report the error
-                error!("Latency report channel full. {}", err);
-                // TODO: could we spawn a new tokio task to report tthis later?
+        if let Err(error) = self.request_tx.try_send(self.queue.sample(duration)) {
+            let dropped_reports = self.queue.dropped(&error);
+            // Keep exact counters, but emit only logarithmically many events
+            // when producers outrun the consumer.
+            if dropped_reports.is_power_of_two() {
+                error!(
+                    queue_id = self.queue.id,
+                    dropped_reports,
+                    reason = %error,
+                    "Latency report dropped"
+                );
             }
-        };
+        }
     }
 }
 
@@ -138,7 +141,44 @@ impl PeakEwmaLatencyTask {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tokio::time::{self, Duration};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::{layer::Context, prelude::*, Layer};
+
+    struct CountErrors(Arc<AtomicUsize>);
+
+    impl<S: Subscriber> Layer<S> for CountErrors {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            if *event.metadata().level() == Level::ERROR {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_queue_counts_all_drops_and_bounds_error_events() {
+        let estimate =
+            super::PeakEwmaLatency::spawn(Duration::from_secs(1), 1, Duration::from_millis(10));
+        let errors = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountErrors(errors.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            // Keep the receiver from running on the current-thread runtime.
+            estimate.report(Duration::from_millis(10));
+            for _ in 0..10_000 {
+                estimate.report(Duration::from_millis(10));
+            }
+        });
+
+        let queue = estimate.queue_stats();
+        assert_eq!(queue.used_capacity, 1);
+        assert_eq!(queue.dropped_full, 10_000);
+        assert_eq!(queue.dropped_closed, 0);
+        assert_eq!(errors.load(Ordering::Relaxed), 14);
+    }
 
     /// The default RTT estimate decays, so that new nodes are considered if the
     /// default RTT is too high.
