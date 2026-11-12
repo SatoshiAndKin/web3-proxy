@@ -9,6 +9,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::{enabled, error, trace, Level};
 
+const RECEIVE_BATCH: usize = 128;
+const REPORTS_PER_TURN: usize = 1_024;
+
 /// Latency calculation using Peak EWMA algorithm
 ///
 /// Updates are done in a separate task to avoid locking or race
@@ -116,9 +119,27 @@ struct PeakEwmaLatencyTask {
 impl PeakEwmaLatencyTask {
     /// Run the loop for updating latency
     async fn run(mut self) {
-        while let Some(rtt) = self.request_rx.recv().await {
-            rtt.received(self.queue_id, "peak_ewma", self.request_rx.len());
-            self.update(rtt.value);
+        let mut reports = Vec::with_capacity(RECEIVE_BATCH);
+        let mut processed = 0;
+        loop {
+            let count = self.request_rx.recv_many(&mut reports, RECEIVE_BATCH).await;
+            if count == 0 {
+                break;
+            }
+            for (index, rtt) in reports.drain(..).enumerate() {
+                rtt.received(
+                    self.queue_id,
+                    "peak_ewma",
+                    self.request_rx.len() + count - index - 1,
+                );
+                self.update(rtt.value);
+            }
+            processed += count;
+            // Give other tasks a turn even if the receiver stays ready.
+            if processed >= REPORTS_PER_TURN {
+                processed = 0;
+                tokio::task::yield_now().await;
+            }
         }
         trace!("latency loop exited");
     }
@@ -178,6 +199,20 @@ mod tests {
         assert_eq!(queue.dropped_full, 10_000);
         assert_eq!(queue.dropped_closed, 0);
         assert_eq!(errors.load(Ordering::Relaxed), 14);
+    }
+
+    #[tokio::test]
+    async fn a_sparse_report_updates_the_estimate() {
+        let estimate =
+            super::PeakEwmaLatency::spawn(Duration::from_secs(1), 1, Duration::from_millis(1));
+        estimate.report(Duration::from_millis(100));
+        time::timeout(Duration::from_secs(2), async {
+            while estimate.latency() < Duration::from_millis(50) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     /// The default RTT estimate decays, so that new nodes are considered if the
