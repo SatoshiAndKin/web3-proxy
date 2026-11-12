@@ -155,8 +155,10 @@ impl PeakEwmaLatencyTask {
             self.update_at.duration_since(now).as_nanos(),
         );
 
-        self.rtt_estimate
-            .fetch_update(|mut rtt_estimate| rtt_estimate.update(rtt, self.decay_ns, now));
+        let mut estimate = self.rtt_estimate.load();
+        estimate.update(rtt, self.decay_ns, now);
+        estimate.update_at = Instant::now();
+        self.rtt_estimate.store(estimate);
     }
 }
 
