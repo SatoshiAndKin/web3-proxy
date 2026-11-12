@@ -265,10 +265,17 @@ impl App {
                     {
                         continue;
                     }
-                    match rpc
-                        .try_request_handle(&calls[index].request, None, false)
-                        .await
-                    {
+                    match rpc.try_batch_request_handle(&calls[index].request, || {
+                        pending
+                            .iter()
+                            .filter(|&&i| {
+                                !calls[i].exhausted.contains(&rpc.name)
+                                    && rpc.can_submit(&calls[i].request, false)
+                            })
+                            .take(2)
+                            .count()
+                            == 2
+                    }) {
                         Ok(OpenRequestResult::Handle(handle)) => {
                             found_backend = true;
                             ready.push(handle);
