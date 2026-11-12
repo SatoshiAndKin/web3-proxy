@@ -339,6 +339,10 @@ impl BackendRequest {
         &self,
         requests: &[Arc<ValidatedRequest>],
     ) -> Web3ProxyResult<Vec<ParsedResponse>> {
+        // The first call identifies the physical packet. Reuse its sample for
+        // each stage so the timings can be correlated without sampling per call.
+        let sample = self.web3_request.perf_sample;
+        let backend = &self.rpc.name;
         let pool = self
             .rpc
             .ipc_provider
@@ -346,6 +350,7 @@ impl BackendRequest {
             .context("IPC provider is not connected")?;
         let query = pool.query_weighted(requests.len());
         let client = query.client();
+        let mut encoding = crate::perf::Stage::new(sample, "ipc_batch_encode", backend);
         let mut positions = hashbrown::HashMap::with_capacity(requests.len());
         let mut calls = Vec::with_capacity(requests.len());
         for (index, item) in requests.iter().enumerate() {
@@ -364,11 +369,18 @@ impl BackendRequest {
                     .map_err(anyhow::Error::from)?,
             );
         }
+        encoding.finish();
+        drop(encoding);
         let frontend = client
             .pubsub_frontend()
             .context("IPC pubsub service is not connected")?;
         self.record_batch(requests);
-        let replies = frontend.send_wire_batch(calls).await?;
+        let mut exchange = crate::perf::Stage::new(sample, "ipc_batch_exchange", backend);
+        let replies = frontend.send_wire_batch(calls).await;
+        exchange.finish();
+        drop(exchange);
+        let replies = replies?;
+        let mut decoding = crate::perf::Stage::new(sample, "ipc_batch_decode", backend);
         let mut ordered: Vec<Option<ParsedResponse>> = (0..requests.len()).map(|_| None).collect();
         for reply in replies {
             let index = positions
@@ -393,10 +405,12 @@ impl BackendRequest {
             };
             ordered[index] = Some(parsed);
         }
-        ordered
+        let result = ordered
             .into_iter()
             .map(|item| item.context("missing IPC batch reply").map_err(Into::into))
-            .collect()
+            .collect();
+        decoding.finish();
+        result
     }
 
     fn check_batch_responses(
