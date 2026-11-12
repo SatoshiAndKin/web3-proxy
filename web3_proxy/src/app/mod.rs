@@ -1048,17 +1048,7 @@ impl App {
                 };
 
                 if try_archive {
-                    {
-                        let mut response_lock = web3_request.response.lock();
-
-                        // TODO: this is a hack. we don't usually want an archive
-                        // we probably just hit a bug where a server said it had a block but it dosn't yet have all the transactions
-                        response_lock
-                            .archive_request
-                            = true;
-                    }
-
-                    // TODO: if the transaction wasn't found, set archive_request back to false?
+                    web3_request.require_archive_history();
 
                     self
                         .balanced_rpcs

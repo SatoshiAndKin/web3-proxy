@@ -18,7 +18,10 @@ use std::time::Duration;
 use std::{borrow::Cow, sync::Arc};
 use std::{
     fmt::{self, Display},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
 };
 use tokio::time::Instant;
 
@@ -99,10 +102,6 @@ impl ResponseOrBytes<'_> {
 /// todo: better name.
 /// the inside bits for ValidatedRequest. It's usually in an Arc, so it's not mutable
 pub struct ValidatedResponse {
-    /// TODO: set archive_request during the new instead of after
-    /// TODO: this is more complex than "requires a block older than X height". different types of data can be pruned differently
-    pub archive_request: bool,
-
     /// RPC servers used by this request.
     pub backend_rpcs: Vec<Arc<Web3Rpc>>,
 
@@ -140,6 +139,10 @@ pub struct ValidatedRequest {
     pub head_block: Option<BlockHeader>,
 
     pub response: Mutex<ValidatedResponse>,
+
+    /// The transaction retry can require full history for this request.
+    /// This flag carries no other request or response state.
+    pub archive_request: AtomicBool,
 
     pub inner: RequestOrMethod,
 
@@ -191,7 +194,10 @@ impl Serialize for ValidatedRequest {
 
         let response_lock = self.response.lock();
 
-        state.serialize_field("archive_request", &response_lock.archive_request)?;
+        state.serialize_field(
+            "archive_request",
+            &self.archive_request.load(Ordering::Relaxed),
+        )?;
 
         {
             let backend_names = response_lock
@@ -261,6 +267,7 @@ impl ValidatedRequest {
 
         let x = Self {
             response: Mutex::new(Default::default()),
+            archive_request: AtomicBool::new(false),
             request_blocks,
             chain_id,
             connect_timeout,
@@ -383,20 +390,19 @@ impl ValidatedRequest {
 
     #[inline]
     pub fn min_block_needed(&self) -> Option<U64> {
-        let min_block_needed = self.request_blocks.from_block().map(|x| x.num());
+        self.request_blocks
+            .from_block()
+            .map(|block| block.num())
+            .or_else(|| {
+                self.archive_request
+                    .load(Ordering::Relaxed)
+                    .then_some(U64::ZERO)
+            })
+    }
 
-        match min_block_needed {
-            Some(x) => Some(x),
-            None => {
-                let response_lock = self.response.lock();
-
-                if response_lock.archive_request {
-                    Some(U64::ZERO)
-                } else {
-                    None
-                }
-            }
-        }
+    pub(crate) fn require_archive_history(&self) {
+        // The retry reads only this flag. Other response state stays in the mutex.
+        self.archive_request.store(true, Ordering::Relaxed);
     }
 
     #[inline]
@@ -462,4 +468,44 @@ impl ValidatedRequest {
     }
 
     // TODO: helper function to duplicate? needs to clear request_bytes, and all the atomics tho...
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ValidatedRequest;
+    use crate::block_number::{BlockNumOrHash, RequestBlocks};
+    use alloy::primitives::U64;
+
+    #[test]
+    fn archive_retry_keeps_the_requested_bounds() {
+        let point = ValidatedRequest {
+            request_blocks: RequestBlocks::Point {
+                block_needed: BlockNumOrHash::Num(U64::from(20)),
+            },
+            ..Default::default()
+        };
+        assert_eq!(point.min_block_needed(), None);
+        assert_eq!(
+            serde_json::to_value(&point).unwrap()["archive_request"],
+            false
+        );
+        point.require_archive_history();
+        assert_eq!(point.min_block_needed(), Some(U64::ZERO));
+        assert_eq!(point.max_block_needed(), Some(U64::from(20)));
+        assert_eq!(
+            serde_json::to_value(&point).unwrap()["archive_request"],
+            true
+        );
+
+        let range = ValidatedRequest {
+            request_blocks: RequestBlocks::Range {
+                from_block: BlockNumOrHash::Num(U64::from(10)),
+                to_block: BlockNumOrHash::Num(U64::from(20)),
+            },
+            ..Default::default()
+        };
+        range.require_archive_history();
+        assert_eq!(range.min_block_needed(), Some(U64::from(10)));
+        assert_eq!(range.max_block_needed(), Some(U64::from(20)));
+    }
 }
