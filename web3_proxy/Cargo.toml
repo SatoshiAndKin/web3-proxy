@@ -16,7 +16,7 @@ nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 # TODO: regex has several "perf" features that we might want to use
 anyhow = { version = "1.0.104", features = ["backtrace"] }
 # Keep the direct Alloy SDK types on the same release-based IPC transport revision.
-alloy = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "135f7488e3492ab68d9335816d021329db148f4b", default-features = false, features = [
+alloy = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "1a90f03fffcbd8e60404169aa607259135056e5d", default-features = false, features = [
     "consensus",
     "eips",
     "json-rpc",
@@ -33,8 +33,8 @@ alloy = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev
     "signer-local",
     "std",
 ] }
-alloy-rpc-types-beacon = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "135f7488e3492ab68d9335816d021329db148f4b", features = ["ssz"] }
-alloy-rpc-types-engine = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "135f7488e3492ab68d9335816d021329db148f4b", features = ["jwt-aws-lc-rs"] }
+alloy-rpc-types-beacon = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "1a90f03fffcbd8e60404169aa607259135056e5d", features = ["ssz"] }
+alloy-rpc-types-engine = { version = "2.5.0", git = "https://github.com/SatoshiAndKin/alloy", rev = "1a90f03fffcbd8e60404169aa607259135056e5d", features = ["jwt-aws-lc-rs"] }
 eventsource-stream = "0.2.3"
 arc-swap = { version = "1.9.3" }
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
