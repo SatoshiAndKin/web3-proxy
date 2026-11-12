@@ -65,8 +65,12 @@ impl RequestPermits {
         self.semaphore.clone().try_acquire_owned()
     }
 
-    pub(super) async fn acquire(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
-        self.semaphore.clone().acquire_owned().await
+    pub(super) async fn acquire(&self, count: u32) -> Result<OwnedSemaphorePermit, AcquireError> {
+        if count == 1 {
+            self.semaphore.clone().acquire_owned().await
+        } else {
+            self.semaphore.clone().acquire_many_owned(count).await
+        }
     }
 
     pub(super) fn try_reserve_additional(&self, count: usize) -> Option<OwnedSemaphorePermit> {
@@ -1552,6 +1556,24 @@ impl Web3Rpc {
         error_handler: Option<RequestErrorHandler>,
         allow_unhealthy: bool,
     ) -> Web3ProxyResult<OpenRequestResult> {
+        self.try_request_handle_with_wait(web3_request, error_handler, allow_unhealthy, || false)
+    }
+
+    pub(crate) fn try_batch_request_handle(
+        self: &Arc<Self>,
+        web3_request: &Arc<ValidatedRequest>,
+        has_pair: impl FnOnce() -> bool,
+    ) -> Web3ProxyResult<OpenRequestResult> {
+        self.try_request_handle_with_wait(web3_request, None, false, has_pair)
+    }
+
+    fn try_request_handle_with_wait(
+        self: &Arc<Self>,
+        web3_request: &Arc<ValidatedRequest>,
+        error_handler: Option<RequestErrorHandler>,
+        allow_unhealthy: bool,
+        has_pair: impl FnOnce() -> bool,
+    ) -> Web3ProxyResult<OpenRequestResult> {
         // TODO: if websocket is reconnecting, return an error?
 
         if !allow_unhealthy {
@@ -1673,12 +1695,24 @@ impl Web3Rpc {
             )
             .into()),
             Err(TryAcquireError::NoPermits) => {
+                // A saturated WebSocket queue hands released permits to FIFO
+                // waiters. Reserve a pair so it can send an array even when
+                // there are no free permits left to add after waking.
+                let count = if self.ws_native_batches
+                    && self.request_permits.max_concurrent_requests() >= 2
+                    && self.request_permits.max_backend_batch_items() >= 2
+                    && has_pair()
+                {
+                    2
+                } else {
+                    1
+                };
                 let rpc = self.clone();
                 let request = web3_request.clone();
                 Ok(OpenRequestResult::Busy(Box::pin(async move {
                     let mut timing =
                         crate::perf::Stage::new(request.perf_sample, "capacity_wait", &rpc.name);
-                    let permit = rpc.request_permits.acquire().await?;
+                    let permit = rpc.request_permits.acquire(count).await?;
                     timing.finish();
                     drop(timing);
                     Ok(OpenRequestHandle::new(

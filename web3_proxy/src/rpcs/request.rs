@@ -740,10 +740,11 @@ impl OpenRequestHandle {
         }
         // Keep the native transport admission budget in logical calls even when several
         // calls share a frame. A partial reservation can still be dispatched.
-        if let Some(additional) = permits.try_reserve_additional(size.saturating_sub(1)) {
+        let additional = size.saturating_sub(self.permit.num_permits());
+        if let Some(additional) = permits.try_reserve_additional(additional) {
             self.permit.merge(additional);
         }
-        self.permit.num_permits()
+        self.permit.num_permits().min(size)
     }
     pub fn supports_batch(&self) -> bool {
         self.request.rpc.supports_batch()

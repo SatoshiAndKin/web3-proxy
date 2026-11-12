@@ -922,6 +922,37 @@ async fn native_websocket_batches_share_one_logical_call_limit() {
 }
 
 #[tokio::test]
+async fn saturated_websocket_batch_reserves_a_pair_without_waiting_for_its_reply_to_admit_singles()
+{
+    super::test_support::with_cleanup(async {
+        let h = Harness::new(4, 64).await;
+        let mut ws = WebSocketHarness::with_batches(3, Some(4)).await;
+        h.app.balanced_rpcs.by_name.write().clear();
+        add_backend(&h.app, vec![ws.rpc.clone()]);
+        let first = ws.rpc.request_permits.try_acquire().unwrap();
+        let second = ws.rpc.request_permits.try_acquire().unwrap();
+        let third = ws.rpc.request_permits.try_acquire().unwrap();
+        let batch = h.start(2);
+        ws.quiet().await;
+        drop(first);
+        ws.quiet().await;
+        drop(second);
+        let packet = ws.next_packet().await;
+        assert_eq!(packet.body.as_array().unwrap().len(), 2);
+        assert_eq!(ws.rpc.active_requests.load(Ordering::SeqCst), 2);
+
+        let single = h.start(1);
+        drop(third);
+        ws.next().await.succeed();
+        assert_answers(single.await.unwrap(), 1);
+        packet.succeed();
+        assert_answers(batch.await.unwrap(), 2);
+        assert_eq!(ws.rpc.active_requests.load(Ordering::SeqCst), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn batch_ws_only_backend_uses_individual_forwarding() {
     super::test_support::with_cleanup(async {
         let mut h = Harness::new(4, 64).await;
