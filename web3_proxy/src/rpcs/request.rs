@@ -353,9 +353,9 @@ impl BackendRequest {
                 .inner
                 .jsonrpc_request()
                 .context("batch item lacks JSON-RPC data")?;
-            let params =
-                serde_json::value::RawValue::from_string(sonic_rs::to_string(&request.params)?)
-                    .map_err(anyhow::Error::from)?;
+            let encoded_params = sonic_rs::to_string(&request.params)?;
+            let params: &serde_json::value::RawValue =
+                serde_json::from_str(&encoded_params).map_err(anyhow::Error::from)?;
             let id = client.next_id();
             positions.insert(id.clone(), index);
             calls.push(
