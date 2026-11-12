@@ -465,13 +465,65 @@ async fn write_web3_socket(
         };
     }
     let _ = close_sender.send(true);
+    // The reader can exit with Tungstenite's close reply still buffered.
+    let _ = tokio::time::timeout(Duration::from_secs(1), ws_tx.flush()).await;
 
     // TODO: decrement counter for open websockets
 }
 
 #[cfg(test)]
 mod test {
+    use super::write_web3_socket;
+    use axum::{
+        extract::ws::{Message, WebSocketUpgrade},
+        routing::get,
+        Router,
+    };
+    use futures::{SinkExt, StreamExt};
     use sonic_rs::{OwnedLazyValue, Value};
+    use std::time::Duration;
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::{broadcast, mpsc},
+    };
+    use tokio_tungstenite::{client_async, tungstenite};
+
+    #[tokio::test]
+    async fn socket_writer_flushes_the_peer_close_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/",
+            get(|upgrade: WebSocketUpgrade| async {
+                upgrade.on_upgrade(|socket| async {
+                    let (writer, mut reader) = socket.split();
+                    let (responses, response_rx) = mpsc::channel(1);
+                    let (close, _) = broadcast::channel(1);
+                    assert_eq!(reader.next().await.unwrap().unwrap(), Message::Close(None));
+                    drop(responses);
+                    write_web3_socket(response_rx, writer, close).await;
+                })
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            let stream = TcpStream::connect(address).await.unwrap();
+            let (mut socket, _) = client_async(format!("ws://{address}/"), stream)
+                .await
+                .unwrap();
+            socket
+                .send(tungstenite::Message::Close(None))
+                .await
+                .unwrap();
+            socket.next().await
+        })
+        .await;
+        server.abort();
+        assert_eq!(
+            reply.unwrap().unwrap().unwrap(),
+            tungstenite::Message::Close(None)
+        );
+    }
 
     #[test]
     fn nulls_and_defaults() {
