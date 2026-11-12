@@ -376,7 +376,29 @@ impl BackendRequest {
             .context("IPC pubsub service is not connected")?;
         self.record_batch(requests);
         let mut exchange = crate::perf::Stage::new(sample, "ipc_batch_exchange", backend);
-        let replies = frontend.send_wire_batch(calls).await;
+        let replies = if let Some(sample) = sample {
+            let backend = backend.clone();
+            frontend
+                .send_wire_batch_observed(calls, move |queue, dispatch| {
+                    latency::record_request_stage(
+                        sample.get(),
+                        "ipc_batch_alloy_queue",
+                        &backend,
+                        queue,
+                        true,
+                    );
+                    latency::record_request_stage(
+                        sample.get(),
+                        "ipc_batch_alloy_dispatch",
+                        &backend,
+                        dispatch,
+                        true,
+                    );
+                })
+                .await
+        } else {
+            frontend.send_wire_batch(calls).await
+        };
         exchange.finish();
         drop(exchange);
         let replies = replies?;
