@@ -335,15 +335,16 @@ impl BackendRequest {
             .fetch_add(1, atomic::Ordering::Relaxed);
     }
 
-    async fn ipc_batch(
+    async fn pubsub_batch(
         &self,
         requests: &[Arc<ValidatedRequest>],
     ) -> Web3ProxyResult<Vec<ParsedResponse>> {
-        let pool = self
-            .rpc
-            .ipc_provider
-            .load_full()
-            .context("IPC provider is not connected")?;
+        let pool = if self.rpc.ipc_native_batches {
+            self.rpc.ipc_provider.load_full()
+        } else {
+            self.rpc.ws_query_pool.load_full()
+        }
+        .context("native batch query pool is not connected")?;
         let query = pool.query_weighted(requests.len());
         let client = query.client();
         let mut positions = hashbrown::HashMap::with_capacity(requests.len());
@@ -366,14 +367,14 @@ impl BackendRequest {
         }
         let frontend = client
             .pubsub_frontend()
-            .context("IPC pubsub service is not connected")?;
+            .context("batch pubsub service is not connected")?;
         self.record_batch(requests);
         let replies = frontend.send_wire_batch(calls).await?;
         let mut ordered: Vec<Option<ParsedResponse>> = (0..requests.len()).map(|_| None).collect();
         for reply in replies {
             let index = positions
                 .remove(&reply.id)
-                .context("unknown or duplicate IPC reply ID")?;
+                .context("unknown or duplicate native batch reply ID")?;
             let id = Default::default();
             let parsed = match reply.payload {
                 AlloyResponsePayload::Success(result) => {
@@ -395,7 +396,10 @@ impl BackendRequest {
         }
         ordered
             .into_iter()
-            .map(|item| item.context("missing IPC batch reply").map_err(Into::into))
+            .map(|item| {
+                item.context("missing native batch reply")
+                    .map_err(Into::into)
+            })
             .collect()
     }
 
@@ -731,10 +735,10 @@ impl OpenRequestHandle {
         }
         let permits = &self.request.rpc.request_permits;
         let size = desired.min(permits.max_backend_batch_items());
-        if !self.request.rpc.ipc_native_batches {
+        if !self.request.rpc.supports_native_batch() {
             return size;
         }
-        // Keep the IPC admission budget in logical calls even when several
+        // Keep the native transport admission budget in logical calls even when several
         // calls share a frame. A partial reservation can still be dispatched.
         if let Some(additional) = permits.try_reserve_additional(size.saturating_sub(1)) {
             self.permit.merge(additional);
@@ -782,7 +786,8 @@ impl OpenRequestHandle {
             mut permit,
         } = self;
         request.web3_request = requests[0].clone();
-        if request.rpc.ipc_native_batches {
+        let native_batch = request.rpc.supports_native_batch();
+        if native_batch {
             let reserved = permit.num_permits();
             if requests.len() > reserved {
                 return Err(Web3ProxyError::NoHandleReady);
@@ -791,8 +796,7 @@ impl OpenRequestHandle {
                 drop(permit.split(reserved - requests.len()));
             }
         }
-        if !request.rpc.supports_batch() || (request.rpc.ipc_native_batches && requests.len() == 1)
-        {
+        if !request.rpc.supports_batch() || (native_batch && requests.len() == 1) {
             if requests.len() != 1 {
                 return Err(
                     anyhow::anyhow!("backend transport requires one call per request").into(),
@@ -817,8 +821,8 @@ impl OpenRequestHandle {
         let _active = ActiveRequestGuard::new(&request.rpc, permit);
         let started_at = Instant::now();
         let result = timeout_at(deadline, async {
-            if request.rpc.ipc_native_batches {
-                let responses = request.ipc_batch(requests).await?;
+            if native_batch {
+                let responses = request.pubsub_batch(requests).await?;
                 return Ok(request.check_batch_responses(responses, requests, started_at));
             }
             let client = request

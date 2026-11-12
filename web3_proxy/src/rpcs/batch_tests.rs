@@ -800,6 +800,10 @@ impl Drop for WebSocketHarness {
 
 impl WebSocketHarness {
     pub(super) async fn new(concurrency: usize) -> Self {
+        Self::with_batches(concurrency, None).await
+    }
+
+    async fn with_batches(concurrency: usize, packet_size: Option<usize>) -> Self {
         let (sender, incoming) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
@@ -822,18 +826,21 @@ impl WebSocketHarness {
             tasks.close();
             tasks.wait().await;
         });
-        let provider =
-            super::provider::connect_query_ws_pool(format!("ws://{address}").parse().unwrap())
-                .await
-                .unwrap();
+        let provider = super::provider::connect_query_ws_pool(
+            format!("ws://{address}").parse().unwrap(),
+            packet_size.is_some(),
+        )
+        .await
+        .unwrap();
         let (hard_limit_until, _) = watch::channel(Instant::now());
         let rpc = Arc::new(Web3Rpc {
             name: "ws-only".into(),
             healthy: AtomicBool::new(true),
             ws_provider: ArcSwapOption::from(Some(provider.subscription())),
             ws_query_pool: ArcSwapOption::from(Some(Arc::new(provider))),
+            ws_native_batches: packet_size.is_some(),
             hard_limit_until: Some(hard_limit_until),
-            request_permits: RequestPermits::new(concurrency, 64),
+            request_permits: RequestPermits::new(concurrency, packet_size.unwrap_or(64)),
             peak_latency: Some(PeakEwmaLatency::spawn(
                 Duration::from_secs(15),
                 100,
@@ -849,11 +856,15 @@ impl WebSocketHarness {
         }
     }
 
-    pub(super) async fn next(&mut self) -> Incoming {
-        let call = timeout(Duration::from_secs(2), self.incoming.recv())
+    async fn next_packet(&mut self) -> Incoming {
+        timeout(Duration::from_secs(2), self.incoming.recv())
             .await
-            .expect("WebSocket fallback must start")
-            .unwrap();
+            .expect("WebSocket forwarding must start")
+            .unwrap()
+    }
+
+    pub(super) async fn next(&mut self) -> Incoming {
+        let call = self.next_packet().await;
         assert!(
             call.body.is_object(),
             "WebSocket forwarding must be individual"
@@ -876,6 +887,38 @@ impl WebSocketHarness {
         assert_eq!(self.rpc.backend_batch_requests.load(Ordering::Relaxed), 0);
         assert_eq!(self.rpc.active_requests.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn native_websocket_batches_share_one_logical_call_limit() {
+    super::test_support::with_cleanup(async {
+        let mut h = Harness::new(4, 64).await;
+        let mut ws = WebSocketHarness::with_batches(8, Some(4)).await;
+        h.app.balanced_rpcs.by_name.write().clear();
+        add_backend(&h.app, vec![ws.rpc.clone()]);
+        let task = h.start(10);
+        let first = ws.next_packet().await;
+        let second = ws.next_packet().await;
+        for packet in [&first, &second] {
+            let calls = packet.body.as_array().unwrap();
+            assert_eq!(calls.len(), 4);
+            assert!(calls.iter().all(|call| call["params"][1] == "0x2a"));
+        }
+        assert_eq!(ws.rpc.active_requests.load(Ordering::SeqCst), 8);
+        ws.quiet().await;
+        first.succeed();
+        let remaining = ws.next_packet().await;
+        assert_eq!(remaining.body.as_array().unwrap().len(), 2);
+        remaining.succeed();
+        second.succeed();
+        assert_answers(task.await.unwrap(), 10);
+        ws.quiet().await;
+        assert_eq!(ws.rpc.backend_batch_requests.load(Ordering::Relaxed), 3);
+        assert_eq!(ws.rpc.active_requests.load(Ordering::SeqCst), 0);
+        h.quiet().await;
+        h.idle();
+    })
+    .await;
 }
 
 #[tokio::test]

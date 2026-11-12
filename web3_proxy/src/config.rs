@@ -284,9 +284,12 @@ pub struct Web3RpcConfig {
     /// Permit JSON-RPC request arrays on this backend's IPC query streams.
     #[serde(default)]
     pub ipc_native_batches: bool,
+    /// Permit JSON-RPC request arrays on this backend's WebSocket query streams.
+    #[serde(default)]
+    pub ws_native_batches: bool,
     /// Restrict IPC to the modules available on the backend's public RPC endpoint.
     pub ipc_allowed_modules: Option<Vec<String>>,
-    /// Maximum concurrent backend slots. A native IPC batch uses one slot per call.
+    /// Maximum concurrent backend slots. A native IPC or WebSocket batch uses one slot per call.
     /// An HTTP batch uses one slot for its entire packet.
     #[serde_inline_default(448usize)]
     pub max_concurrent_requests: usize,
@@ -326,6 +329,7 @@ impl fmt::Debug for Web3RpcConfig {
             .field("ipc_path", &self.ipc_path)
             .field("ipc_query_connections", &self.ipc_query_connections)
             .field("ipc_native_batches", &self.ipc_native_batches)
+            .field("ws_native_batches", &self.ws_native_batches)
             .field("ipc_allowed_modules", &self.ipc_allowed_modules)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("max_backend_batch_items", &self.max_backend_batch_items)
@@ -448,7 +452,7 @@ mod tests {
 
         assert_eq!(
             format!("{config:?}"),
-            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, ipc_query_connections: 2, ipc_native_batches: false, ipc_allowed_modules: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
+            "Web3RpcConfig { backup: false, block_data_limit: Unknown, log_data_limit: Unknown, disabled: false, display_name: None, http_url: Some(\"[REDACTED]\"), ipc_path: None, ipc_query_connections: 2, ipc_native_batches: false, ws_native_batches: false, ipc_allowed_modules: None, max_concurrent_requests: 448, max_backend_batch_items: 64, soft_limit: 1, subscribe_txs: false, ws_url: Some(\"[REDACTED]\"), extra: {} }"
         );
     }
 
