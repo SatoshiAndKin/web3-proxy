@@ -1,6 +1,6 @@
 mod rtt_estimate;
 
-use self::rtt_estimate::AtomicRttEstimate;
+use self::rtt_estimate::{AtomicRttEstimate, RttEstimate};
 use crate::queue::{LatencyQueueStats, QueueMetrics, Sample};
 use crate::util::nanos::nanos;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ pub struct PeakEwmaLatency {
     /// Join handle for the latency calculation task
     pub join_handle: JoinHandle<()>,
     /// Send to update with each request duration
-    request_tx: mpsc::Sender<Sample<Duration>>,
+    request_tx: mpsc::Sender<Sample<Observation>>,
     queue: QueueMetrics,
     /// Latency average and last update time
     rtt_estimate: Arc<AtomicRttEstimate>,
@@ -40,13 +40,14 @@ impl PeakEwmaLatency {
         debug_assert!(decay_ns > 0.0, "decay_ns must be positive");
 
         let (request_tx, request_rx) = mpsc::channel(buf_size);
-        let rtt_estimate = Arc::new(AtomicRttEstimate::new(start_latency));
+        let estimate = RttEstimate::new(start_latency);
+        let rtt_estimate = Arc::new(AtomicRttEstimate::new(&estimate));
         let queue = QueueMetrics::new();
         let task = PeakEwmaLatencyTask {
             queue_id: queue.id,
             request_rx,
             rtt_estimate: rtt_estimate.clone(),
-            update_at: Instant::now(),
+            estimate,
             decay_ns,
         };
         let join_handle = tokio::spawn(task.run());
@@ -84,9 +85,18 @@ impl PeakEwmaLatency {
         self.queue.snapshot(&self.request_tx)
     }
 
-    /// Report latency from a single request from the owning backend.
+    /// Report a backend exchange observed now.
     pub fn report(&self, duration: Duration) {
-        if let Err(error) = self.request_tx.try_send(self.queue.sample(duration)) {
+        self.report_at(duration, Instant::now());
+    }
+
+    /// Report a backend exchange using its completion time for decay.
+    pub fn report_at(&self, duration: Duration, completed_at: Instant) {
+        let observation = Observation {
+            duration,
+            completed_at,
+        };
+        if let Err(error) = self.request_tx.try_send(self.queue.sample(observation)) {
             let dropped_reports = self.queue.dropped(&error);
             // Keep exact counters, but emit only logarithmically many events
             // when producers outrun the consumer.
@@ -102,16 +112,21 @@ impl PeakEwmaLatency {
     }
 }
 
+#[derive(Debug)]
+struct Observation {
+    duration: Duration,
+    completed_at: Instant,
+}
+
 /// Task to be spawned per-Web3Rpc for calculating the peak request latency
 #[derive(Debug)]
 struct PeakEwmaLatencyTask {
     /// Receive new request timings for update
-    request_rx: mpsc::Receiver<Sample<Duration>>,
+    request_rx: mpsc::Receiver<Sample<Observation>>,
     queue_id: u64,
     /// Current estimate and update time
     rtt_estimate: Arc<AtomicRttEstimate>,
-    /// Last update time, used for decay calculation
-    update_at: Instant,
+    estimate: RttEstimate,
     /// Decay time
     decay_ns: f64,
 }
@@ -132,8 +147,14 @@ impl PeakEwmaLatencyTask {
                     "peak_ewma",
                     self.request_rx.len() + count - index - 1,
                 );
-                self.update(rtt.value);
+                let observation = rtt.value;
+                self.estimate.update(
+                    nanos(observation.duration),
+                    self.decay_ns,
+                    observation.completed_at,
+                );
             }
+            self.rtt_estimate.store(&self.estimate);
             processed += count;
             // Give other tasks a turn even if the receiver stays ready.
             if processed >= REPORTS_PER_TURN {
@@ -142,23 +163,6 @@ impl PeakEwmaLatencyTask {
             }
         }
         trace!("latency loop exited");
-    }
-
-    /// Update the estimate object atomically.
-    fn update(&self, rtt: Duration) {
-        let rtt = nanos(rtt);
-
-        let now = Instant::now();
-        assert!(
-            self.update_at <= now,
-            "update_at is {}ns in the future",
-            self.update_at.duration_since(now).as_nanos(),
-        );
-
-        let mut estimate = self.rtt_estimate.load();
-        estimate.update(rtt, self.decay_ns, now);
-        estimate.update_at = Instant::now();
-        self.rtt_estimate.store(estimate);
     }
 }
 
@@ -215,6 +219,21 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backlog_uses_completion_intervals_for_decay() {
+        let estimator =
+            super::PeakEwmaLatency::spawn(Duration::from_secs(1), 8, Duration::from_millis(10));
+        let start = time::Instant::now();
+        time::advance(Duration::from_secs(3)).await;
+
+        estimator.report_at(Duration::from_millis(100), start + Duration::from_secs(1));
+        estimator.report_at(Duration::from_millis(20), start + Duration::from_secs(2));
+        tokio::task::yield_now().await;
+
+        let latency = estimator.latency();
+        assert!(Duration::from_millis(18) < latency && latency < Duration::from_millis(19));
     }
 
     /// The default RTT estimate decays, so that new nodes are considered if the
