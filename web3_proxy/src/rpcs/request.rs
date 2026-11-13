@@ -431,11 +431,15 @@ impl BackendRequest {
         // Every item shares the same backend exchange. Feed its RTT to
         // Peak EWMA once, while keeping the median weighted by successful calls.
         if any_success {
+            let sample = requests.iter().find_map(|item| item.perf_sample);
+            let mut timing =
+                crate::perf::Stage::new(sample, "batch_peak_ewma_enqueue", &self.rpc.name);
             self.rpc
                 .peak_latency
                 .as_ref()
                 .unwrap()
                 .report_at(completed_at.duration_since(started_at), completed_at);
+            timing.finish();
         }
         results
     }
@@ -1193,6 +1197,18 @@ mod tests {
 
     #[tokio::test]
     async fn peak_ewma_records_one_sample_per_successful_batch_exchange() {
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         let rpc = Arc::new(Web3Rpc {
             peak_latency: Some(latency::PeakEwmaLatency::spawn(
                 Duration::from_secs(15),
@@ -1205,7 +1221,15 @@ mod tests {
         let request = ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
             .await
             .unwrap();
-        let requests = [request.clone(), request.clone()];
+        let mut requests = vec![request.clone()];
+        for id in [10, 11] {
+            let mut item =
+                ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+                    .await
+                    .unwrap();
+            Arc::get_mut(&mut item).unwrap().perf_sample = std::num::NonZeroU64::new(id);
+            requests.push(item);
+        }
         let backend = super::BackendRequest {
             web3_request: request.clone(),
             error_handler: Default::default(),
@@ -1219,14 +1243,25 @@ mod tests {
             )
         };
 
-        let responses =
-            backend.check_batch_responses([success(), success()], &requests, Instant::now());
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let responses = backend.check_batch_responses(
+            [success(), success(), success()],
+            &requests,
+            Instant::now(),
+        );
         assert!(responses.iter().all(Result::is_ok));
         let peak = rpc.peak_latency.as_ref().unwrap().queue_stats();
         assert_eq!(peak.used_capacity, 1);
         assert_eq!(peak.dropped_full, 0);
         let median = rpc.median_latency.as_ref().unwrap().queue_stats();
-        assert_eq!(median.used_capacity, 2);
+        assert_eq!(median.used_capacity, 3);
 
         let revert = || {
             crate::jsonrpc::ParsedResponse::from_error(
@@ -1238,8 +1273,11 @@ mod tests {
                 request.id(),
             )
         };
-        let responses =
-            backend.check_batch_responses([revert(), revert()], &requests, Instant::now());
+        let responses = backend.check_batch_responses(
+            [revert(), revert(), revert()],
+            &requests,
+            Instant::now(),
+        );
         assert!(responses.iter().all(Result::is_ok));
         let peak = rpc.peak_latency.as_ref().unwrap().queue_stats();
         assert_eq!(peak.used_capacity, 1);
@@ -1250,8 +1288,18 @@ mod tests {
                 .unwrap()
                 .queue_stats()
                 .used_capacity,
-            2
+            3
         );
+        assert!(latency::flush_diagnostics(Duration::from_secs(2)));
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let mut shared = output
+            .lines()
+            .filter(|line| line.contains("batch_peak_ewma_enqueue"));
+        let event = shared
+            .next()
+            .expect("sampled batch must time its shared enqueue");
+        assert!(event.contains("sample=10") && event.contains("complete=true"));
+        assert!(shared.next().is_none());
     }
 
     #[tokio::test]
