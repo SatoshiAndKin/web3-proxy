@@ -11,6 +11,7 @@ use sentry::types::Dsn;
 use serde::{de, Deserialize, Deserializer};
 use serde_inline_default::serde_inline_default;
 use std::fmt;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -111,6 +112,9 @@ pub struct AppConfig {
     /// the stats page url for an anonymous user.
     pub redirect_public_url: Option<String>,
 
+    /// IPv4 address for the HTTP and WebSocket listener. Defaults to 0.0.0.0.
+    pub frontend_bind_ip: Option<Ipv4Addr>,
+
     /// Optional Unix socket for HTTP from a same-host ingress.
     /// Its directory and socket path are owned by this proxy.
     pub frontend_unix_socket: Option<PathBuf>,
@@ -146,6 +150,10 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub(crate) fn frontend_tcp_addr(&self, port: u16) -> SocketAddr {
+        SocketAddr::from((self.frontend_bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED), port))
+    }
+
     /// TODO: this should probably be part of Deserialize
     fn clean(&mut self) {
         if !self.extra.is_empty() {
