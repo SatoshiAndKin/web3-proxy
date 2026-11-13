@@ -17,6 +17,9 @@ impl RttEstimate {
     /// Update the estimate with a new rtt value. Use rtt=0.0 for simply
     /// decaying the current value.
     pub fn update(&mut self, rtt: f64, decay_ns: f64, now: Instant) -> Duration {
+        // Reports can arrive out of order across producers. Keep the peak
+        // from a late report, without rewinding the estimator clock.
+        let now = now.max(self.update_at);
         let ewma = nanos(self.rtt);
         self.rtt = if ewma < rtt {
             // For Peak-EWMA, always use the worst-case (peak) value as the estimate for
@@ -45,11 +48,12 @@ impl RttEstimate {
             Duration::from_nanos(next_estimate as u64)
         };
 
+        self.update_at = now;
         self.rtt
     }
 
     /// Build a new estimate object using current time.
-    fn new(start_duration: Duration) -> Self {
+    pub(super) fn new(start_duration: Duration) -> Self {
         Self {
             update_at: Instant::now(),
             rtt: start_duration,
@@ -85,8 +89,7 @@ pub struct AtomicRttEstimate {
 
 impl AtomicRttEstimate {
     /// Creates a new atomic rtt estimate.
-    pub fn new(start_duration: Duration) -> Self {
-        let estimate = RttEstimate::new(start_duration);
+    pub(super) fn new(estimate: &RttEstimate) -> Self {
         Self {
             pair: AtomicF32Pair::new(estimate.as_pair(estimate.update_at)),
             start_time: estimate.update_at,
@@ -103,7 +106,7 @@ impl AtomicRttEstimate {
 
     /// The latency worker is the only writer. Readers load both fields
     /// together from the atomic pair, which does not publish any other data.
-    pub(super) fn store(&self, estimate: RttEstimate) {
+    pub(super) fn store(&self, estimate: &RttEstimate) {
         self.pair
             .store(estimate.as_pair(self.start_time), Ordering::Relaxed);
     }
@@ -126,9 +129,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn late_peak_does_not_rewind_the_clock() {
+        let mut estimate = RttEstimate::new(Duration::from_millis(10));
+        let start = estimate.update_at;
+        let newer = start + Duration::from_secs(2);
+        estimate.update(20_000_000.0, 1e9, newer);
+        estimate.update(100_000_000.0, 1e9, start + Duration::from_secs(1));
+        assert_eq!(estimate.update_at, newer);
+        assert_eq!(estimate.rtt, Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_atomic_rtt_estimate_load() {
         let rtt = Duration::from_secs(1);
-        let estimate = AtomicRttEstimate::new(rtt);
+        let estimate = AtomicRttEstimate::new(&RttEstimate::new(rtt));
         let actual = estimate.load();
         assert_eq!(Instant::now(), actual.update_at);
         assert_eq!(rtt, actual.rtt);
@@ -138,9 +152,9 @@ mod tests {
     async fn test_atomic_rtt_estimate_store() {
         let start_time = Instant::now();
         let rtt = Duration::from_secs(1);
-        let estimate = AtomicRttEstimate::new(rtt);
+        let estimate = AtomicRttEstimate::new(&RttEstimate::new(rtt));
         time::advance(Duration::from_secs(1)).await;
-        estimate.store(RttEstimate {
+        estimate.store(&RttEstimate {
             update_at: Instant::now(),
             rtt: Duration::from_secs(2),
         });

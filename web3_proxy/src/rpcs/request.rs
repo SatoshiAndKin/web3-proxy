@@ -405,7 +405,9 @@ impl BackendRequest {
         requests: &[Arc<ValidatedRequest>],
         started_at: Instant,
     ) -> Vec<Web3ProxyResult<ParsedResponse>> {
-        responses
+        let completed_at = Instant::now();
+        let mut any_success = false;
+        let results = responses
             .into_iter()
             .zip(requests)
             .map(|(mut response, item)| {
@@ -416,12 +418,30 @@ impl BackendRequest {
                     rpc: self.rpc.clone(),
                     allow_unhealthy: self.allow_unhealthy,
                 };
-                match handle.check_response(Ok(response.into()), started_at) {
-                    Ok(jsonrpc::SingleResponse::Parsed(response)) => Ok(response),
+                match handle.check_response(Ok(response.into()), started_at, completed_at, false) {
+                    Ok(jsonrpc::SingleResponse::Parsed(response)) => {
+                        any_success |= matches!(response.payload, ResponsePayload::Success { .. });
+                        Ok(response)
+                    }
                     Err(error) => Err(error),
                 }
             })
-            .collect()
+            .collect();
+
+        // Every item shares the same backend exchange. Feed its RTT to
+        // Peak EWMA once, while keeping the median weighted by successful calls.
+        if any_success {
+            let sample = requests.iter().find_map(|item| item.perf_sample);
+            let mut timing =
+                crate::perf::Stage::new(sample, "batch_peak_ewma_enqueue", &self.rpc.name);
+            self.rpc
+                .peak_latency
+                .as_ref()
+                .unwrap()
+                .report_at(completed_at.duration_since(started_at), completed_at);
+            timing.finish();
+        }
+        results
     }
 
     async fn pubsub_request<R: JsonRpcResultData>(
@@ -480,6 +500,8 @@ impl BackendRequest {
         &self,
         mut response: Web3ProxyResult<jsonrpc::SingleResponse<R>>,
         start: Instant,
+        completed_at: Instant,
+        report_peak: bool,
     ) -> Web3ProxyResult<jsonrpc::SingleResponse<R>> {
         if let Err(error) = &response {
             self.check_transport_error(error, start);
@@ -498,7 +520,7 @@ impl BackendRequest {
         if self.web3_request.expired() {
             return Err(Web3ProxyError::Timeout(None));
         }
-        let latency = start.elapsed();
+        let latency = completed_at.duration_since(start);
 
         trace!(
             "response from {} for {}: {:?}",
@@ -525,7 +547,13 @@ impl BackendRequest {
                 "latency_report_enqueue",
                 &self.rpc.name,
             );
-            self.rpc.peak_latency.as_ref().unwrap().report(latency);
+            if report_peak {
+                self.rpc
+                    .peak_latency
+                    .as_ref()
+                    .unwrap()
+                    .report_at(latency, completed_at);
+            }
             self.rpc.median_latency.as_ref().unwrap().record(latency);
             timing.finish();
         } else {
@@ -761,7 +789,7 @@ impl OpenRequestHandle {
         let response = timeout_at(request.web3_request.expire_at(), request._request())
             .await
             .unwrap_or_else(|error| Err(error.into()));
-        let result = request.check_response(response, start);
+        let result = request.check_response(response, start, Instant::now(), true);
         timing.finish();
         result
     }
@@ -1146,7 +1174,7 @@ mod tests {
                 backend.web3_request.id(),
             );
             backend
-                .check_response(Ok(response.into()), Instant::now())
+                .check_response(Ok(response.into()), Instant::now(), Instant::now(), true)
                 .unwrap();
         }
         let mismatch = crate::jsonrpc::ParsedResponse::from_result(
@@ -1154,7 +1182,7 @@ mod tests {
             sonic_rs::to_lazyvalue(&"wrong-id").unwrap(),
         );
         assert!(backend
-            .check_response(Ok(mismatch.into()), Instant::now())
+            .check_response(Ok(mismatch.into()), Instant::now(), Instant::now(), true)
             .is_err());
         let peak = rpc.peak_latency.as_ref().unwrap().queue_stats();
         assert_eq!(peak.used_capacity, 1);
@@ -1165,6 +1193,113 @@ mod tests {
         assert_eq!(median.used_capacity, 2);
         assert_eq!(median.dropped_full, 0);
         assert_eq!(median.dropped_closed, 0);
+    }
+
+    #[tokio::test]
+    async fn peak_ewma_records_one_sample_per_successful_batch_exchange() {
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let rpc = Arc::new(Web3Rpc {
+            peak_latency: Some(latency::PeakEwmaLatency::spawn(
+                Duration::from_secs(15),
+                1,
+                Duration::from_secs(1),
+            )),
+            median_latency: Some(latency::RollingQuantileLatency::spawn_median(8).await),
+            ..Default::default()
+        });
+        let request = ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+            .await
+            .unwrap();
+        let mut requests = vec![request.clone()];
+        for id in [10, 11] {
+            let mut item =
+                ValidatedRequest::new_internal("eth_call".into(), &json!([]), None, None)
+                    .await
+                    .unwrap();
+            Arc::get_mut(&mut item).unwrap().perf_sample = std::num::NonZeroU64::new(id);
+            requests.push(item);
+        }
+        let backend = super::BackendRequest {
+            web3_request: request.clone(),
+            error_handler: Default::default(),
+            rpc: rpc.clone(),
+            allow_unhealthy: false,
+        };
+        let success = || {
+            crate::jsonrpc::ParsedResponse::from_result(
+                Arc::new(sonic_rs::to_lazyvalue(&"0x1").unwrap()),
+                request.id(),
+            )
+        };
+
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let responses = backend.check_batch_responses(
+            [success(), success(), success()],
+            &requests,
+            Instant::now(),
+        );
+        assert!(responses.iter().all(Result::is_ok));
+        let peak = rpc.peak_latency.as_ref().unwrap().queue_stats();
+        assert_eq!(peak.used_capacity, 1);
+        assert_eq!(peak.dropped_full, 0);
+        let median = rpc.median_latency.as_ref().unwrap().queue_stats();
+        assert_eq!(median.used_capacity, 3);
+
+        let revert = || {
+            crate::jsonrpc::ParsedResponse::from_error(
+                JsonRpcErrorData {
+                    code: 3,
+                    message: "execution reverted".into(),
+                    data: None,
+                },
+                request.id(),
+            )
+        };
+        let responses = backend.check_batch_responses(
+            [revert(), revert(), revert()],
+            &requests,
+            Instant::now(),
+        );
+        assert!(responses.iter().all(Result::is_ok));
+        let peak = rpc.peak_latency.as_ref().unwrap().queue_stats();
+        assert_eq!(peak.used_capacity, 1);
+        assert_eq!(peak.dropped_full, 0);
+        assert_eq!(
+            rpc.median_latency
+                .as_ref()
+                .unwrap()
+                .queue_stats()
+                .used_capacity,
+            3
+        );
+        assert!(latency::flush_diagnostics(Duration::from_secs(2)));
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let mut shared = output
+            .lines()
+            .filter(|line| line.contains("batch_peak_ewma_enqueue"));
+        let event = shared
+            .next()
+            .expect("sampled batch must time its shared enqueue");
+        assert!(event.contains("sample=10") && event.contains("complete=true"));
+        assert!(shared.next().is_none());
     }
 
     #[tokio::test]
