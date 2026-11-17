@@ -10,6 +10,12 @@ records their immutable digest. Use the digest in private Compose files. Do not
 use a moving tag for production or rollback. The image uses portable x86-64
 instructions, a non-root user, and an exec-form entrypoint.
 
+A manual run on main reuses a previously validated production image when the
+successful push build for that commit recorded the same manifest digest that
+the registry serves now. The workflow builds and validates a new image when the
+record is missing or the digest changed. Use the normal manual run to request a
+new deployment of the selected image.
+
 The build context allows only source, manifests, the toolchain, and public test
 fixtures. It excludes endpoint lists, `.env`, credentials, and Git metadata.
 Supply runtime configuration and JWT files through read-only mounts. Give each

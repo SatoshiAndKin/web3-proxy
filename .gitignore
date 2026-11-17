@@ -9,4 +9,4 @@ perf.data.old
 /data
 /target
 
-/docker/tests/__pycache__/
+/docker/**/__pycache__/

@@ -17,19 +17,28 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Look for the validated image from the main push
+        if: github.event_name == 'workflow_dispatch' && github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
+        id: reuse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 docker/reuse_production_image.py
       - name: Check fresh-process APT retries
+        if: steps.reuse.outputs.digest == ''
         run: python3 -m unittest discover -s docker/tests -v
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         id: buildx
       # The GHA layer exporter does not include RUN cache mounts. Restore Cargo's
       # dependency and compiler caches separately; Cargo still checks fingerprints.
       - name: Restore Cargo build caches
+        if: steps.reuse.outputs.digest == ''
         id: cargo-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -38,7 +47,7 @@ jobs:
           restore-keys: |
             cargo-production-amd64-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'docker/production.Dockerfile', 'docker/cargo-cache.Dockerfile') }}-
       - name: Restore Cargo cache mounts
-        if: steps.cargo-cache.outputs.cache-hit != ''
+        if: steps.reuse.outputs.digest == '' && steps.cargo-cache.outputs.cache-hit != ''
         env:
           BUILDER: ${{ steps.buildx.outputs.name }}
         run: |
@@ -55,6 +64,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Validate, build, and publish
+        if: steps.reuse.outputs.digest == ''
         id: image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -71,7 +81,7 @@ jobs:
           provenance: true
           sbom: true
       - name: Export Cargo cache mounts
-        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        if: steps.reuse.outputs.digest == '' && steps.cargo-cache.outputs.cache-hit != 'true'
         env:
           BUILDER: ${{ steps.buildx.outputs.name }}
         run: |
@@ -89,7 +99,7 @@ jobs:
       - name: Publish latest for the successful current-main build
         if: github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
         env:
-          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_DIGEST: ${{ steps.reuse.outputs.digest || steps.image.outputs.digest }}
           COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -101,8 +111,21 @@ jobs:
       - name: Record immutable deployment reference
         if: github.repository == 'SatoshiAndKin/web3-proxy'
         env:
-          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_DIGEST: ${{ steps.reuse.outputs.digest || steps.image.outputs.digest }}
         run: printf 'Deploy ghcr.io/satoshiandkin/web3-proxy@%s\n' "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save the exact validated manifest
+        if: github.event_name == 'push' && github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: printf '%s\n' "$IMAGE_DIGEST" > "$RUNNER_TEMP/production-image.txt"
+      - name: Retain the production build record
+        if: github.event_name == 'push' && github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-image-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/production-image.txt
+          if-no-files-found: error
 
   deploy:
     name: Request production deployment
