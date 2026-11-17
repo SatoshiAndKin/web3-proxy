@@ -104,8 +104,8 @@ async fn normalize_block_selector(
         // it might be a Map like `{"blockHash": String("0xa5626dc20d3a0a209b1de85521717a3e859698de8ce98bca1b16822b7501f74b")}`
         match obj.get(&"blockHash").cloned() {
             Some(block_hash) => {
-                let block_hash: B256 =
-                    sonic_rs::from_value(&block_hash).context("decoding blockHash")?;
+                let block_hash: B256 = sonic_rs::from_value(&block_hash)
+                    .map_err(|_| Web3ProxyError::BadRequest("invalid blockHash".into()))?;
 
                 if block_hash == *head_block.hash() {
                     (head_block.into(), false)
@@ -124,7 +124,7 @@ async fn normalize_block_selector(
                 }
             }
             _ => {
-                return Err(anyhow::anyhow!("blockHash missing").into());
+                return Err(Web3ProxyError::BadRequest("blockHash missing".into()));
             }
         }
     } else {
@@ -154,10 +154,9 @@ async fn normalize_block_selector(
                 );
             }
         } else {
-            return Err(anyhow::anyhow!(
-                "param not a block identifier, block number, or block hash"
-            )
-            .into());
+            return Err(Web3ProxyError::BadRequest(
+                "expected a block tag, number, or hash".into(),
+            ));
         };
 
         let head_block_num = head_block.number();
@@ -212,6 +211,14 @@ async fn call_many_block(
     }
     // The simulation context wraps the selector and may carry a transaction index.
     if context.get("blockHash").is_some() {
+        if context
+            .get("blockNumber")
+            .is_some_and(|number| !number.is_null())
+        {
+            return Err(Web3ProxyError::BadRequest(
+                "eth_callMany block context specifies both a number and a hash".into(),
+            ));
+        }
         return normalize_block_selector(context, head_block, app).await;
     }
     match context
@@ -801,6 +808,22 @@ mod test {
             Err(Web3ProxyError::UnknownBlockNumber { .. })
         ));
         assert_eq!(request.params, params);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn call_many_rejects_malformed_block_context_as_bad_request() {
+        let head = BlockHeader::new(Arc::new(block(100)));
+        for context in [
+            json!("invalid context"),
+            json!({"blockNumber": "invalid selector"}),
+            json!({"blockNumber": {"blockHash": "invalid hash", "requireCanonical": true}}),
+            json!({"blockNumber": "0x40", "blockHash": head.hash()}),
+        ] {
+            let mut request =
+                SingleRequest::new(7.into(), "eth_callMany".into(), json!([[], context])).unwrap();
+            let result = RequestBlocks::new(&mut request, Some(&head), None).await;
+            assert!(matches!(result, Err(Web3ProxyError::BadRequest(_))));
+        }
     }
 
     #[test]
