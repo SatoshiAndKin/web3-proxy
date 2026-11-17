@@ -11,7 +11,7 @@ use anyhow::Context;
 use derive_more::From;
 use serde::Serialize;
 use sonic_rs::{json, JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value};
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 pub fn block_number_to_u64(block_num: BlockNumberOrTag, latest_block: U64) -> (U64, bool) {
     match block_num {
@@ -90,108 +90,136 @@ pub async fn clean_block_number<'a>(
                     ))
                 }
             }
-            Some(x) => {
-                // dig into the json value to find a BlockNumber or similar block identifier
-                trace!(?x, "inspecting");
-
-                let (block, change) = if let Some(obj) = x.as_object_mut() {
-                    // it might be a Map like `{"blockHash": String("0xa5626dc20d3a0a209b1de85521717a3e859698de8ce98bca1b16822b7501f74b")}`
-                    match obj.get(&"blockHash").cloned() {
-                        Some(block_hash) => {
-                            let block_hash: B256 =
-                                sonic_rs::from_value(&block_hash).context("decoding blockHash")?;
-
-                            if block_hash == *head_block.hash() {
-                                (head_block.into(), false)
-                            } else if let Some(app) = app {
-                                let block = app
-                                    .balanced_rpcs
-                                    .block_header_by_hash(block_hash)
-                                    .await
-                                    .context("fetching block number from hash")?;
-
-                                (BlockNumOrHash::from(&block), false)
-                            } else {
-                                return Err(anyhow::anyhow!(
-                                    "app missing. cannot find block number from hash"
-                                )
-                                .into());
-                            }
-                        }
-                        _ => {
-                            return Err(anyhow::anyhow!("blockHash missing").into());
-                        }
-                    }
-                } else {
-                    // it might be a string like "latest" or a block number or a block hash
-                    // TODO: "BlockNumber" needs a better name
-                    // TODO: move this to a helper function?
-                    let (block_num, changed) = if let Some(block_num) = x.as_u64() {
-                        (U64::from(block_num), false)
-                    } else if let Ok(block_num) = sonic_rs::from_value::<U64>(x) {
-                        (block_num, false)
-                    } else if let Ok(block_number) = sonic_rs::from_value::<BlockNumberOrTag>(x) {
-                        block_number_to_u64(block_number, head_block.number())
-                    } else if let Ok(block_hash) = sonic_rs::from_value::<B256>(x) {
-                        if block_hash == *head_block.hash() {
-                            (head_block.number(), false)
-                        } else if let Some(app) = app {
-                            let block = app
-                                .balanced_rpcs
-                                .block_header_by_hash(block_hash)
-                                .await
-                                .context("fetching block number from hash")?;
-
-                            (block.number(), false)
-                        } else {
-                            return Err(anyhow::anyhow!(
-                                "app missing. cannot find block number from hash"
-                            )
-                            .into());
-                        }
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "param not a block identifier, block number, or block hash"
-                        )
-                        .into());
-                    };
-
-                    let head_block_num = head_block.number();
-
-                    if block_num > head_block_num {
-                        // todo!(option to wait for the block here)
-                        return Err(Web3ProxyError::UnknownBlockNumber {
-                            known: head_block_num,
-                            unknown: block_num,
-                        });
-                    }
-
-                    if block_num == head_block_num {
-                        (head_block.into(), changed)
-                    } else if let Some(app) = app {
-                        // TODO: make a jsonrpc query here? cache rates will be better but it adds a network request
-                        if let Some(block_hash) =
-                            app.balanced_rpcs.blocks_by_number.get(&block_num).await
-                        {
-                            (BlockNumAndHash(block_num, block_hash).into(), changed)
-                        } else {
-                            (BlockNumOrHash::Num(block_num), changed)
-                        }
-                    } else {
-                        (BlockNumOrHash::Num(block_num), changed)
-                    }
-                };
-
-                // if we changed "latest" to an actual block, update the params to match
-                // TODO: should we do hash or number? some functions work with either, but others need a number :cry:
-                if change {
-                    trace!(old=%x, new=%block.num(), "changing block number");
-                    *x = json!(block.num());
-                }
-
-                Ok(block)
-            }
+            Some(selector) => normalize_block_selector(selector, head_block, app).await,
         },
+    }
+}
+
+async fn normalize_block_selector(
+    x: &mut Value,
+    head_block: &BlockHeader,
+    app: Option<&App>,
+) -> Web3ProxyResult<BlockNumOrHash> {
+    let (block, change) = if let Some(obj) = x.as_object_mut() {
+        // it might be a Map like `{"blockHash": String("0xa5626dc20d3a0a209b1de85521717a3e859698de8ce98bca1b16822b7501f74b")}`
+        match obj.get(&"blockHash").cloned() {
+            Some(block_hash) => {
+                let block_hash: B256 =
+                    sonic_rs::from_value(&block_hash).context("decoding blockHash")?;
+
+                if block_hash == *head_block.hash() {
+                    (head_block.into(), false)
+                } else if let Some(app) = app {
+                    let block = app
+                        .balanced_rpcs
+                        .block_header_by_hash(block_hash)
+                        .await
+                        .context("fetching block number from hash")?;
+
+                    (BlockNumOrHash::from(&block), false)
+                } else {
+                    return Err(
+                        anyhow::anyhow!("app missing. cannot find block number from hash").into(),
+                    );
+                }
+            }
+            _ => {
+                return Err(anyhow::anyhow!("blockHash missing").into());
+            }
+        }
+    } else {
+        // it might be a string like "latest" or a block number or a block hash
+        // TODO: "BlockNumber" needs a better name
+        // TODO: move this to a helper function?
+        let (block_num, changed) = if let Some(block_num) = x.as_u64() {
+            (U64::from(block_num), false)
+        } else if let Ok(block_num) = sonic_rs::from_value::<U64>(x) {
+            (block_num, false)
+        } else if let Ok(block_number) = sonic_rs::from_value::<BlockNumberOrTag>(x) {
+            block_number_to_u64(block_number, head_block.number())
+        } else if let Ok(block_hash) = sonic_rs::from_value::<B256>(x) {
+            if block_hash == *head_block.hash() {
+                (head_block.number(), false)
+            } else if let Some(app) = app {
+                let block = app
+                    .balanced_rpcs
+                    .block_header_by_hash(block_hash)
+                    .await
+                    .context("fetching block number from hash")?;
+
+                (block.number(), false)
+            } else {
+                return Err(
+                    anyhow::anyhow!("app missing. cannot find block number from hash").into(),
+                );
+            }
+        } else {
+            return Err(anyhow::anyhow!(
+                "param not a block identifier, block number, or block hash"
+            )
+            .into());
+        };
+
+        let head_block_num = head_block.number();
+
+        if block_num > head_block_num {
+            // todo!(option to wait for the block here)
+            return Err(Web3ProxyError::UnknownBlockNumber {
+                known: head_block_num,
+                unknown: block_num,
+            });
+        }
+
+        if block_num == head_block_num {
+            (head_block.into(), changed)
+        } else if let Some(app) = app {
+            // TODO: make a jsonrpc query here? cache rates will be better but it adds a network request
+            if let Some(block_hash) = app.balanced_rpcs.blocks_by_number.get(&block_num).await {
+                (BlockNumAndHash(block_num, block_hash).into(), changed)
+            } else {
+                (BlockNumOrHash::Num(block_num), changed)
+            }
+        } else {
+            (BlockNumOrHash::Num(block_num), changed)
+        }
+    };
+
+    // if we changed "latest" to an actual block, update the params to match
+    // TODO: should we do hash or number? some functions work with either, but others need a number :cry:
+    if change {
+        trace!(block = %block.num(), "pinning block selector to head");
+        *x = json!(block.num());
+    }
+
+    Ok(block)
+}
+
+async fn call_many_block(
+    params: &mut Value,
+    head_block: &BlockHeader,
+    app: Option<&App>,
+) -> Web3ProxyResult<BlockNumOrHash> {
+    let params = params
+        .as_array_mut()
+        .ok_or_else(|| Web3ProxyError::BadRequest("expected eth_callMany params array".into()))?;
+    let Some(context) = params.get_mut(1).filter(|context| !context.is_null()) else {
+        return Ok(head_block.into());
+    };
+    if !context.is_object() {
+        return Err(Web3ProxyError::BadRequest(
+            "expected eth_callMany block context".into(),
+        ));
+    }
+    // The simulation context wraps the selector and may carry a transaction index.
+    if context.get("blockHash").is_some() {
+        return normalize_block_selector(context, head_block, app).await;
+    }
+    match context
+        .get_mut("blockNumber")
+        .filter(|selector| !selector.is_null())
+    {
+        Some(selector) => normalize_block_selector(selector, head_block, app).await,
+        None => Ok(head_block.into()),
     }
 }
 
@@ -272,22 +300,17 @@ impl RequestBlocks {
     ) -> Web3ProxyResult<Self> {
         match Self::try_new(request, head_block, app).await {
             x @ Ok(_) => return x,
+            Err(Web3ProxyError::UnhandledMethod(_)) => {
+                debug!(method = %request.method, "RPC method has no block routing rule");
+            }
+            err @ Err(_) if request.method.as_ref() == "eth_callMany" => return err,
             Err(Web3ProxyError::NoBlocksKnown) => {
-                warn!(
-                    method = %request.method,
-                    params = ?request.params,
-                    "no servers available to get block from params"
-                );
+                warn!(method = %request.method, "no servers available to resolve the block");
             }
             err @ Err(Web3ProxyError::RangeTooLarge(..)) => return err,
             err @ Err(Web3ProxyError::RangeInvalid { .. }) => return err,
-            Err(err) => {
-                error!(
-                    method = %request.method,
-                    params = ?request.params,
-                    ?err,
-                    "could not get block from params"
-                );
+            Err(_) => {
+                error!(method = %request.method, "could not resolve RPC block selector");
             }
         }
 
@@ -333,6 +356,9 @@ impl RequestBlocks {
         }
 
         match request.method.as_ref() {
+            "eth_callMany" => Ok(Self::Point {
+                block_needed: call_many_block(params, head_block, app).await?,
+            }),
             "trace_transaction" | "debug_traceTransaction" => {
                 // These methods identify a transaction by hash.
                 Ok(Self::None)
@@ -737,6 +763,44 @@ mod test {
             }
         );
         assert_eq!(request.params.get(1), Some(&json!(head_block.number())));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn call_many_resolves_nested_block_context() {
+        let head = BlockHeader::new(Arc::new(block(100)));
+        for (context, block_needed) in [
+            (
+                json!({"blockNumber": {"blockHash": head.hash(), "requireCanonical": true}, "transactionIndex": 1}),
+                (&head).into(),
+            ),
+            (
+                json!({"blockNumber": "0x40", "transactionIndex": 1}),
+                BlockNumOrHash::Num(U64::from(64)),
+            ),
+        ] {
+            let params = json!([[{"transactions": [{"data": "0x1234"}]}], context, {}, 5000]);
+            let mut request =
+                SingleRequest::new(7.into(), "eth_callMany".into(), params.clone()).unwrap();
+            let blocks = RequestBlocks::try_new(&mut request, Some(&head), None)
+                .await
+                .unwrap();
+            assert_eq!(blocks, RequestBlocks::Point { block_needed });
+            assert_eq!(request.params, params);
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn call_many_rejects_an_invalid_explicit_block() {
+        let head = BlockHeader::new(Arc::new(block(100)));
+        let params = json!([[], {"blockNumber": "0xff", "transactionIndex": 3}]);
+        let mut request =
+            SingleRequest::new(7.into(), "eth_callMany".into(), params.clone()).unwrap();
+        let result = RequestBlocks::new(&mut request, Some(&head), None).await;
+        assert!(matches!(
+            result,
+            Err(Web3ProxyError::UnknownBlockNumber { .. })
+        ));
+        assert_eq!(request.params, params);
     }
 
     #[test]
