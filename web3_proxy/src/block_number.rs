@@ -7,7 +7,6 @@ use crate::{
 };
 use alloy::primitives::{B256, U64};
 use alloy::rpc::types::BlockNumberOrTag;
-use anyhow::Context;
 use derive_more::From;
 use serde::Serialize;
 use sonic_rs::{json, JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value};
@@ -110,11 +109,7 @@ async fn normalize_block_selector(
                 if block_hash == *head_block.hash() {
                     (head_block.into(), false)
                 } else if let Some(app) = app {
-                    let block = app
-                        .balanced_rpcs
-                        .block_header_by_hash(block_hash)
-                        .await
-                        .context("fetching block number from hash")?;
+                    let block = app.balanced_rpcs.block_header_by_hash(block_hash).await?;
 
                     (BlockNumOrHash::from(&block), false)
                 } else {
@@ -141,11 +136,7 @@ async fn normalize_block_selector(
             if block_hash == *head_block.hash() {
                 (head_block.number(), false)
             } else if let Some(app) = app {
-                let block = app
-                    .balanced_rpcs
-                    .block_header_by_hash(block_hash)
-                    .await
-                    .context("fetching block number from hash")?;
+                let block = app.balanced_rpcs.block_header_by_hash(block_hash).await?;
 
                 (block.number(), false)
             } else {
