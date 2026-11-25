@@ -40,13 +40,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::{
     cmp::Ordering,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 use tokio::select;
 use tokio::sync::{watch, AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
+
+const HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub(super) struct RequestPermits {
     semaphore: Arc<Semaphore>,
@@ -170,6 +172,8 @@ pub struct Web3Rpc {
     pub(super) head_delay: RwLock<EwmaLatency>,
     /// false if a health check has failed
     pub(super) healthy: AtomicBool,
+    // Keep outage reporting bounded across subscription reconnects.
+    pub(super) health_reported_at: Mutex<Option<Instant>>,
     /// Track peak request latency
     /// peak_latency is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) peak_latency: Option<PeakEwmaLatency>,
@@ -206,6 +210,35 @@ pub(super) const TRACE_METHODS: [&str; 9] = [
 ];
 
 impl Web3Rpc {
+    fn observe_health_check(&self, result: Web3ProxyResult<()>, now: Instant) -> bool {
+        let mut last_report = self
+            .health_reported_at
+            .lock()
+            .expect("health report lock poisoned");
+        match result {
+            Err(err) => {
+                if last_report.is_none_or(|last| now.duration_since(last) >= HEALTH_REPORT_INTERVAL)
+                {
+                    *last_report = Some(now);
+                    if self.backup {
+                        warn!(?err, rpc = %self, "RPC backend health check failed");
+                    } else {
+                        error!(?err, rpc = %self, "RPC backend health check failed");
+                    }
+                } else {
+                    debug!(?err, rpc = %self, "RPC backend health check still failing");
+                }
+                false
+            }
+            Ok(()) => {
+                if last_report.take().is_some() {
+                    info!(rpc = %self, "RPC backend health check recovered");
+                }
+                true
+            }
+        }
+    }
+
     /// Connect to a web3 rpc
     // TODO: have this take a builder (which will have channels attached). or maybe just take the config and give the config public fields
     #[allow(clippy::too_many_arguments)]
@@ -1168,6 +1201,13 @@ impl Web3Rpc {
             let health_sleep_seconds = 10;
             let block_data_limit_refresh_interval = Duration::from_secs(60);
 
+            let initial_check = self.observe_health_check(
+                self.check_health(false, error_handler).await,
+                Instant::now(),
+            );
+            self.healthy
+                .store(self.health_status(initial_check), atomic::Ordering::SeqCst);
+
             // health check loop
             let f = async move {
                 // // TODO: benchmark this and lock contention
@@ -1191,21 +1231,10 @@ impl Web3Rpc {
                     let detailed_healthcheck = false;
 
                     // TODO: if this fails too many times, reset the connection
-                    let provider_health_check_passed =
-                        match rpc.check_health(detailed_healthcheck, error_handler).await {
-                            Err(err) => {
-                                // TODO: different level depending on the error handler
-                                // TODO: if rate limit error, set "retry_at"
-                                if rpc.backup {
-                                    warn!(?err, "health check on {} failed", rpc);
-                                } else {
-                                    error!(?err, "health check on {} failed", rpc);
-                                }
-
-                                false
-                            }
-                            Ok(()) => true,
-                        };
+                    let provider_health_check_passed = rpc.observe_health_check(
+                        rpc.check_health(detailed_healthcheck, error_handler).await,
+                        Instant::now(),
+                    );
 
                     if rpc.automatic_block_limit
                         && rpc.block_data_limit.load(atomic::Ordering::SeqCst) == 0
@@ -1245,23 +1274,6 @@ impl Web3Rpc {
                 Ok(())
             };
 
-            // TODO: log quick_check lik
-            let initial_check = match self.check_health(false, error_handler).await {
-                Err(err) => {
-                    if self.backup {
-                        warn!(?err, "initial health check on {} failed", self);
-                    } else {
-                        error!(?err, "initial health check on {} failed", self);
-                    }
-
-                    false
-                }
-                _ => true,
-            };
-
-            self.healthy
-                .store(self.health_status(initial_check), atomic::Ordering::SeqCst);
-
             tokio::spawn(f)
         } else {
             let rpc = self.clone();
@@ -1275,21 +1287,9 @@ impl Web3Rpc {
                     }
 
                     // TODO: if this fails too many times, reset the connection
-                    match rpc.check_provider().await {
-                        Err(err) => {
-                            rpc.healthy.store(false, atomic::Ordering::SeqCst);
-
-                            // TODO: if rate limit error, set "retry_at"
-                            if rpc.backup {
-                                warn!(?err, "provider check on {} failed", rpc);
-                            } else {
-                                error!(?err, "provider check on {} failed", rpc);
-                            }
-                        }
-                        _ => {
-                            rpc.healthy.store(true, atomic::Ordering::SeqCst);
-                        }
-                    }
+                    let passed =
+                        rpc.observe_health_check(rpc.check_provider().await, Instant::now());
+                    rpc.healthy.store(passed, atomic::Ordering::SeqCst);
 
                     sleep(Duration::from_secs(health_sleep_seconds)).await;
                 }
@@ -2020,9 +2020,60 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::{routing::get, Router};
     use futures::SinkExt;
+    use sentry::test::with_captured_envelopes_options;
     use std::sync::Mutex;
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, Notify, Semaphore};
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+
+    #[test]
+    fn health_failures_report_once_then_remind_and_reset_on_recovery() {
+        let now = Instant::now();
+        let envelopes = with_captured_envelopes_options(
+            || {
+                tracing::subscriber::with_default(
+                    tracing_subscriber::registry().with(
+                        sentry_tracing::ErrorLayer::new()
+                            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                    ),
+                    || {
+                        for backup in [false, true] {
+                            let rpc = Arc::new(Web3Rpc {
+                                backup,
+                                ..Default::default()
+                            });
+                            let reconnected = rpc.clone();
+                            for elapsed in [
+                                Duration::ZERO,
+                                Duration::from_secs(10),
+                                HEALTH_REPORT_INTERVAL - Duration::from_secs(1),
+                                HEALTH_REPORT_INTERVAL,
+                            ] {
+                                assert!(!reconnected.observe_health_check(
+                                    Err(anyhow!("backend unavailable").into()),
+                                    now + elapsed
+                                ));
+                            }
+                            assert!(rpc.observe_health_check(
+                                Ok(()),
+                                now + HEALTH_REPORT_INTERVAL + Duration::from_secs(1)
+                            ));
+                            assert!(!reconnected.observe_health_check(
+                                Err(anyhow!("new outage").into()),
+                                now + HEALTH_REPORT_INTERVAL + Duration::from_secs(2)
+                            ));
+                        }
+                    },
+                )
+            },
+            sentry::ClientOptions::default(),
+        );
+        assert_eq!(
+            envelopes.len(),
+            6,
+            "each backend reports first failure, hourly reminder and new outage"
+        );
+    }
 
     #[derive(Clone)]
     struct WebSocketStubState {
