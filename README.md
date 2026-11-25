@@ -132,6 +132,10 @@ rejects spans before its callbacks run, including the HTTP request span.
 Panic reporting remains enabled. DEBUG performance diagnostics use the separate
 sampled output described above and do not become Sentry breadcrumbs.
 
+Sentry uploads use verified HTTPS, reject redirects, and have a two-second total
+request timeout. A Sentry-only asynchronous resolver bounds shutdown during DNS
+stalls. Ordinary RPC and API clients keep their existing DNS behavior.
+
 ## Quick development
 
 1. Copy `.env.example` to `.env` and set local secrets.

@@ -1,3 +1,5 @@
+mod sentry_dns;
+
 use web3_proxy::prelude::*;
 
 use anyhow::Context;
@@ -124,6 +126,7 @@ fn initialize_sentry(configured_dsn: Option<Dsn>) -> Option<ClientInitGuard> {
         return None;
     }
     let client = reqwest::Client::builder()
+        .dns_resolver(Arc::new(sentry_dns::SentryDns::default()))
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .tls_danger_accept_invalid_certs(false)
