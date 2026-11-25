@@ -1,4 +1,7 @@
-use hickory_resolver::TokioResolver;
+use hickory_resolver::{
+    net::{runtime::TokioRuntimeProvider, NetError},
+    ResolverBuilder, TokioResolver,
+};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::OnceCell;
 use web3_proxy::prelude::{reqwest, tokio};
@@ -12,7 +15,7 @@ impl reqwest::dns::Resolve for SentryDns {
         let state = self.0.clone();
         Box::pin(async move {
             let resolver = state
-                .get_or_try_init(|| async { TokioResolver::builder_tokio()?.build() })
+                .get_or_try_init(|| async { build_resolver(TokioResolver::builder_tokio()?) })
                 .await?;
             let lookup = resolver.lookup_ip(name.as_str()).await?;
             let addresses: reqwest::dns::Addrs = Box::new(
@@ -25,6 +28,15 @@ impl reqwest::dns::Resolve for SentryDns {
             Ok(addresses)
         })
     }
+}
+
+fn build_resolver(
+    mut builder: ResolverBuilder<TokioRuntimeProvider>,
+) -> Result<TokioResolver, NetError> {
+    // A silent family must leave room inside the existing HTTP request deadline.
+    builder.options_mut().timeout = std::time::Duration::from_millis(250);
+    builder.options_mut().attempts = 1;
+    builder.build()
 }
 
 #[cfg(test)]
@@ -118,23 +130,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sentry_resolver_keeps_both_a_and_aaaa_addresses() {
+    fn resolved_families(only: Option<RecordType>) -> Vec<SocketAddr> {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let dns = UdpSocket::bind("127.0.0.1:0").unwrap();
-        dns.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        dns.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
         let address = dns.local_addr().unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let seen = observed.clone();
+        let (stop, stopped) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
             let mut packet = [0; 2048];
-            for _ in 0..2 {
-                let (length, peer) = dns.recv_from(&mut packet).unwrap();
+            while Instant::now() < deadline && stopped.try_recv().is_err() {
+                let (length, peer) = match dns.recv_from(&mut packet) {
+                    Ok(packet) => packet,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => panic!("Offline DNS collector failed: {error}"),
+                };
                 let request = Message::from_vec(&packet[..length]).unwrap();
                 let query = request.queries[0].clone();
-                let value = match query.query_type() {
-                    RecordType::A => RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
-                    RecordType::AAAA => RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
+                let (flag, value) = match query.query_type() {
+                    RecordType::A => (1, RData::A(A(std::net::Ipv4Addr::LOCALHOST))),
+                    RecordType::AAAA => (2, RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST))),
                     kind => panic!("Unexpected offline DNS question: {kind:?}"),
                 };
+                seen.fetch_or(flag, Ordering::SeqCst);
+                if only.is_some_and(|available| available != query.query_type()) {
+                    continue;
+                }
                 let mut response = Message::response(request.metadata.id, request.metadata.op_code);
                 response.metadata.authoritative = true;
                 response.edns = request.edns.clone();
@@ -148,24 +179,60 @@ mod tests {
             let _entered = runtime.enter();
             let mut nameserver = NameServerConfig::udp(address.ip());
             nameserver.connections[0].port = address.port();
-            TokioResolver::builder_with_config(
+            build_resolver(TokioResolver::builder_with_config(
                 ResolverConfig::from_name_servers(vec![nameserver]),
                 TokioRuntimeProvider::default(),
-            )
-            .build()
+            ))
             .unwrap()
         };
         let dns = SentryDns(Arc::new(OnceCell::new_with(Some(resolver))));
-        let addresses = runtime
-            .block_on(reqwest::dns::Resolve::resolve(
-                &dns,
-                "dualstack.fixture".parse().unwrap(),
-            ))
+        let started = Instant::now();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(1500),
+                reqwest::dns::Resolve::resolve(&dns, "families.fixture".parse().unwrap()),
+            )
+            .await
+        });
+        let _ = stop.send(());
+        server.join().unwrap();
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            3,
+            "Both DNS question families must be observed"
+        );
+        let addresses = result
+            .expect("Usable DNS answers must fit inside the HTTP deadline")
             .unwrap()
             .collect::<Vec<_>>();
-        server.join().unwrap();
+        if only.is_some() {
+            assert!(
+                started.elapsed() >= Duration::from_millis(200),
+                "Missing family must remain a real unanswered lookup"
+            );
+        }
+        addresses
+    }
+
+    #[test]
+    fn sentry_resolver_keeps_both_a_and_aaaa_addresses() {
+        let addresses = resolved_families(None);
         assert!(addresses.iter().any(SocketAddr::is_ipv4));
         assert!(addresses.iter().any(SocketAddr::is_ipv6));
+    }
+
+    #[test]
+    fn sentry_resolver_uses_a_when_aaaa_is_silent() {
+        let addresses = resolved_families(Some(RecordType::A));
+        assert!(addresses.iter().any(SocketAddr::is_ipv4));
+        assert!(addresses.iter().all(SocketAddr::is_ipv4));
+    }
+
+    #[test]
+    fn sentry_resolver_uses_aaaa_when_a_is_silent() {
+        let addresses = resolved_families(Some(RecordType::AAAA));
+        assert!(addresses.iter().any(SocketAddr::is_ipv6));
+        assert!(addresses.iter().all(SocketAddr::is_ipv6));
     }
 
     struct ApplicationDns(SocketAddr, Arc<AtomicUsize>);
