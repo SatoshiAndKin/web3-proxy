@@ -1,0 +1,30 @@
+name: web3-proxy-funnel
+on:
+  pull_request:
+    paths:
+      - docker/funnel-gateway/**
+      - .github/workflows/web3-proxy-funnel.yml
+  push:
+    branches: [main]
+    paths:
+      - docker/funnel-gateway/**
+      - .github/workflows/web3-proxy-funnel.yml
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check Compose template
+        env:
+          RPC_UPSTREAM: http://host.docker.internal:8545
+        run: docker compose -f docker/funnel-gateway/compose.yaml config --quiet
+      - name: Build the gateway image
+        run: docker build -t rpc-funnel-ci docker/funnel-gateway
+      - name: Run local integration tests in the image
+        run: |
+          docker run --rm --network none \
+            -v "$PWD/docker/funnel-gateway/gateway.test.mjs:/app/gateway.test.mjs:ro" \
+            rpc-funnel-ci node --test gateway.test.mjs

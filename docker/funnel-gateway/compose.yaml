@@ -1,0 +1,30 @@
+services:
+  rpc-funnel-gateway:
+    build: .
+    init: true
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      RPC_BIND_HOST: "0.0.0.0"
+      RPC_UPSTREAM: "${RPC_UPSTREAM:?set RPC_UPSTREAM to your private HTTP JSON-RPC endpoint}"
+      RPC_TOKEN_FILE: /run/secrets/rpc_token_hashes
+      RPC_RATE_UNITS_PER_MINUTE: "${RPC_RATE_UNITS_PER_MINUTE:-120}"
+      RPC_BURST_UNITS: "${RPC_BURST_UNITS:-48}"
+      RPC_MAX_INFLIGHT: "${RPC_MAX_INFLIGHT:-8}"
+      RPC_ORIGINS: "${RPC_ORIGINS:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    secrets:
+      - rpc_token_hashes
+    ports:
+      - "127.0.0.1:${RPC_HOST_PORT:-18745}:8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+secrets:
+  rpc_token_hashes:
+    file: "${RPC_TOKEN_FILE_PATH:-./rpc-token-hashes.json}"
