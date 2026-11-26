@@ -1,8 +1,9 @@
 name: Production image
 
 on:
+  pull_request:
   push:
-    branches: ["**"]
+    branches: ["**", "!dependabot/**"]
   workflow_dispatch:
 
 concurrency:
@@ -14,6 +15,13 @@ permissions:
 
 jobs:
   image:
+    # The read-only build supplies the stable required PR check: image / image.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    uses: SatoshiAndKin/web3-proxy/.github/workflows/validate-image-reviewed-linux.yml@b8f37b3ac1b07f19324852fff3373965e753b54d
+  publish:
+    if: github.event_name != 'pull_request'
     permissions:
       actions: read
       contents: read
@@ -22,8 +30,8 @@ jobs:
     uses: SatoshiAndKin/web3-proxy/.github/workflows/production-image-reviewed-linux.yml@3d4d1ecce833a5c5b879d2ae04b7f3b204b82db2
 
   deploy:
-    needs: image
-    if: github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
+    needs: publish
+    if: github.event_name != 'pull_request' && github.repository == 'SatoshiAndKin/web3-proxy' && github.ref == 'refs/heads/main'
     uses: SatoshiAndKin/web3-proxy/.github/workflows/production-deploy-reviewed-linux.yml@bee8e9c338e02794aedc09cb5adf187a207f802a
     secrets:
       webhook_secret: ${{ secrets.WEBHOOK_SECRET }}

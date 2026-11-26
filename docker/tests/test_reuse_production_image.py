@@ -54,6 +54,10 @@ class ReuseProductionImage(unittest.TestCase):
     def test_reuses_matching_digest(self):
         self.assertEqual(self.select(), (self.digest, 2))
 
+    def test_accepts_the_current_production_job_name(self):
+        self.job["name"] = "publish / image"
+        self.assertEqual(self.select(), (self.digest, 2))
+
     def test_same_revision_with_a_different_manifest_requires_a_build(self):
         self.assertEqual(self.select(registry="sha256:" + "3" * 64), (None, 2))
 

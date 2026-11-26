@@ -47,7 +47,7 @@ def reuse_digest(revision: str) -> str | None:
             "jobs"
         ]
         if not any(
-            job["name"] in {"image", "image / image"}
+            job["name"] in {"image", "image / image", "publish / image"}
             and job["conclusion"] == "success"
             and job["head_sha"] == revision
             and job["run_attempt"] == attempt

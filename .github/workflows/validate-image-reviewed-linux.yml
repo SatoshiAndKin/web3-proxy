@@ -1,0 +1,72 @@
+name: Reviewed Linux pull request image
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on:
+      group: ski-ci-public-linux
+      labels: ski-kvm-public-build
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check the exact pull request merge
+        shell: bash
+        env:
+          EXPECTED_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = pull_request
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_REF" = "$EXPECTED_REF"
+          test "$(git cat-file -p HEAD | sed -n '/^$/q; /^parent /p' | wc -l)" -eq 2
+          test "$(git rev-parse HEAD^2)" = "$HEAD_SHA"
+      - name: Select the Debian snapshots
+        id: apt
+        run: python3 -m docker.select_apt_snapshot
+      - name: Check APT and image reuse helpers
+        run: python3 -m unittest discover -s docker/tests -v
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        id: buildx
+      - name: Restore Cargo build caches
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo-cache
+          key: cargo-production-amd64-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'docker/production.Dockerfile', 'docker/cargo-cache.Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-production-amd64-v2-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', 'docker/production.Dockerfile', 'docker/cargo-cache.Dockerfile') }}-
+      - name: Restore Cargo cache mounts
+        if: steps.cargo-cache.outputs.cache-hit != ''
+        env:
+          BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          set -euo pipefail
+          docker buildx build --builder "$BUILDER" --platform linux/amd64 \
+            --build-arg "CACHE_TRANSFER_NONCE=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-restore" \
+            --progress plain --file docker/cargo-cache.Dockerfile --target restore --output type=cacheonly "$RUNNER_TEMP/cargo-cache"
+      - name: Validate the production image
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/production.Dockerfile
+          platforms: linux/amd64
+          push: false
+          outputs: type=cacheonly
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            DEBIAN_ARCHIVE_SNAPSHOT=${{ steps.apt.outputs.archive }}
+            DEBIAN_SECURITY_SNAPSHOT=${{ steps.apt.outputs.security }}
+            CARGO_CACHE_SEED=${{ steps.cargo-cache.outputs.cache-hit == '' && format('{0}-{1}', github.run_id, github.run_attempt) || '' }}
+          cache-from: type=gha,scope=production-amd64
