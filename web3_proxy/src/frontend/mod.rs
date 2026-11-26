@@ -146,30 +146,33 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
     let mut shutdown_receiver = app.frontend_shutdown.subscribe();
     // TODO: read config for if fastest/versus should be available publicly. default off
     let router = make_router(app.clone());
+    let addr = app
+        .config
+        .frontend_tcp_addr(app.frontend_port.load(Ordering::SeqCst));
 
     // TODO: https://docs.rs/tower-http/latest/tower_http/propagate_header/index.html
 
     #[cfg(feature = "listenfd")]
     let listener = if let Some(listener) = ListenFd::from_env().take_tcp_listener(0)? {
         // use systemd socket magic for no downtime deploys
-        let addr = listener.local_addr()?;
+        let activated_addr = listener.local_addr()?;
+        if app.config.frontend_bind_ip.is_some() && activated_addr.ip() != addr.ip() {
+            return Err(anyhow::anyhow!(
+                "activated TCP listener IP {activated_addr} differs from configured IP {}",
+                addr.ip()
+            )
+            .into());
+        }
 
-        info!("listening with fd at {}", addr);
+        info!("listening with fd at {}", activated_addr);
 
         listener.set_nonblocking(true)?;
         TcpListener::from_std(listener)?
     } else {
-        // TODO: allow only listening on localhost? top_config.app.host.parse()?
-        let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
-
         bind_tcp_listener(addr)?
     };
     #[cfg(not(feature = "listenfd"))]
-    let listener = {
-        let addr = SocketAddr::from(([0, 0, 0, 0], app.frontend_port.load(Ordering::SeqCst)));
-
-        bind_tcp_listener(addr)?
-    };
+    let listener = bind_tcp_listener(addr)?;
 
     // The frontend runs behind a trusted proxy. Client IP extraction uses the
     // rightmost address from X-Forwarded-For.
@@ -241,7 +244,7 @@ pub async fn serve(app: Arc<App>) -> Web3ProxyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::bind_tcp_listener;
-    use std::net::SocketAddr;
+    use crate::config::AppConfig;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
@@ -249,8 +252,12 @@ mod tests {
 
     #[tokio::test]
     async fn bound_tcp_listener_accepts_connections() {
-        let listener = bind_tcp_listener(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let default_addr = AppConfig::default().frontend_tcp_addr(0);
+        assert!(default_addr.ip().is_unspecified());
+        let config: AppConfig = toml::from_str("frontend_bind_ip = '127.0.0.1'").unwrap();
+        let listener = bind_tcp_listener(config.frontend_tcp_addr(0)).unwrap();
         let addr = listener.local_addr().unwrap();
+        assert!(addr.ip().is_loopback());
 
         let mut client = TcpStream::connect(addr)
             .await
